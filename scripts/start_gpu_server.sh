@@ -9,8 +9,18 @@ if [[ ! -d .venv ]]; then
 fi
 
 source .venv/bin/activate
-pip install -q --upgrade pip
-pip install -q -r server/requirements.txt
+REQ_HASH_FILE=".venv/.server_requirements.sha256"
+CURRENT_REQ_HASH="$(sha256sum server/requirements.txt | awk '{print $1}')"
+SAVED_REQ_HASH=""
+if [[ -f "$REQ_HASH_FILE" ]]; then
+  SAVED_REQ_HASH="$(cat "$REQ_HASH_FILE")"
+fi
+
+if [[ "$CURRENT_REQ_HASH" != "$SAVED_REQ_HASH" ]]; then
+  pip install -q --upgrade pip
+  pip install -q -r server/requirements.txt
+  echo "$CURRENT_REQ_HASH" > "$REQ_HASH_FILE"
+fi
 
 # RunPod images can miss shared libs required by OpenCV (cv2).
 # Install once if needed and if apt-get is available.
