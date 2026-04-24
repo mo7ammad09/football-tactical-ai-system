@@ -83,6 +83,17 @@ class MultipartListPartsRequest(BaseModel):
     object_key: str
 
 
+class StorageObjectExistsRequest(BaseModel):
+    """Check whether an object key exists in object storage."""
+    object_key: str
+
+
+class StorageDirectUploadRequest(BaseModel):
+    """Request pre-signed URL for direct single-part upload."""
+    file_name: str
+    file_kind: str = "video"
+
+
 class MultipartPart(BaseModel):
     """Completed part metadata."""
     part_number: int = Field(..., ge=1)
@@ -507,6 +518,46 @@ async def storage_multipart_complete(payload: MultipartCompleteRequest):
     return response
 
 
+@app.post("/storage/object_exists")
+async def storage_object_exists(payload: StorageObjectExistsRequest):
+    """Return whether object exists in storage."""
+    if not _is_object_storage_enabled():
+        raise _storage_error()
+    try:
+        _get_s3_client().head_object(Bucket=OBJECT_STORAGE_BUCKET, Key=payload.object_key)
+        return {"exists": True}
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return {"exists": False}
+        raise HTTPException(status_code=400, detail=f"Cannot check object key: {exc}") from exc
+
+
+@app.post("/storage/direct_upload_url")
+async def storage_direct_upload_url(payload: StorageDirectUploadRequest):
+    """Return pre-signed URL for direct (single-part) upload."""
+    if not _is_object_storage_enabled():
+        raise _storage_error()
+    if payload.file_kind not in {"video", "model"}:
+        raise HTTPException(status_code=400, detail="file_kind must be 'video' or 'model'")
+
+    object_key = _object_key(payload.file_kind, payload.file_name)
+    try:
+        url = _get_s3_client().generate_presigned_url(
+            ClientMethod="put_object",
+            Params={"Bucket": OBJECT_STORAGE_BUCKET, "Key": object_key},
+            ExpiresIn=OBJECT_STORAGE_URL_EXPIRES,
+        )
+    except ClientError as exc:
+        raise HTTPException(status_code=400, detail=f"Cannot generate direct upload URL: {exc}") from exc
+
+    return {
+        "object_key": object_key,
+        "upload_url": url,
+        "expires_in": OBJECT_STORAGE_URL_EXPIRES,
+    }
+
+
 @app.post("/jobs/from_storage")
 async def start_job_from_storage(
     payload: StartFromStorageRequest,
@@ -579,7 +630,9 @@ async def get_video(job_id: str):
     if not video_path or not os.path.exists(video_path):
         raise HTTPException(status_code=404, detail="Video not found")
 
-    return FileResponse(video_path, media_type="video/avi", filename=f"{job_id}_analyzed.avi")
+    ext = Path(video_path).suffix.lower() or ".mp4"
+    media_type = "video/mp4" if ext == ".mp4" else "video/x-msvideo"
+    return FileResponse(video_path, media_type=media_type, filename=f"{job_id}_analyzed{ext}")
 
 
 @app.get("/health")
@@ -717,7 +770,7 @@ def process_video(job_id: str) -> None:
 
         output_dir = Path("outputs")
         output_dir.mkdir(exist_ok=True)
-        output_path = output_dir / f"{job_id}_output.avi"
+        output_path = output_dir / f"{job_id}_output.mp4"
         save_video(output_frames, str(output_path), fps=analysis_fps)
 
         total_possession = len(team_ball_control_np)

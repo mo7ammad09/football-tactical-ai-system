@@ -31,9 +31,11 @@ class ServerClient(AnalysisClient):
     BACKOFF_BASE_SECONDS = 1.5
 
     STORAGE_PART_SIZE_BYTES = 8 * 1024 * 1024
+    STORAGE_DIRECT_UPLOAD_THRESHOLD_BYTES = 32 * 1024 * 1024
     STORAGE_MAX_WORKERS = 4
     STORAGE_HEALTH_TTL_SECONDS = 120
     STORAGE_STATE_FILE = Path("temp/.object_storage_upload_state.json")
+    STORAGE_MODEL_CACHE_KEY = "__model_object_cache__"
 
     def __init__(self, server_url: str, api_key: Optional[str] = None):
         self.server_url = server_url.rstrip("/")
@@ -127,6 +129,69 @@ class ServerClient(AnalysisClient):
         tmp.write_text(json.dumps(state, ensure_ascii=True), encoding="utf-8")
         tmp.replace(self.STORAGE_STATE_FILE)
 
+    def _file_sha256(self, file_path: str) -> str:
+        """Compute SHA256 for a file path."""
+        h = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            while True:
+                chunk = f.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _get_cached_model_object_key(self, model_file_path: str) -> Optional[str]:
+        """Return cached object key for model file, if present."""
+        state = self._load_storage_state()
+        cache = state.get(self.STORAGE_MODEL_CACHE_KEY, {})
+        if not isinstance(cache, dict):
+            return None
+
+        fp = self._file_sha256(model_file_path)
+        entry = cache.get(fp)
+        if isinstance(entry, str):
+            return entry
+        if isinstance(entry, dict):
+            value = entry.get("object_key")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _set_cached_model_object_key(self, model_file_path: str, object_key: str) -> None:
+        """Save model object key in local cache."""
+        state = self._load_storage_state()
+        cache = state.get(self.STORAGE_MODEL_CACHE_KEY)
+        if not isinstance(cache, dict):
+            cache = {}
+
+        fp = self._file_sha256(model_file_path)
+        cache[fp] = {
+            "object_key": object_key,
+            "updated_at": int(time.time()),
+        }
+        state[self.STORAGE_MODEL_CACHE_KEY] = cache
+        self._save_storage_state(state)
+
+    def _storage_object_exists(self, object_key: str) -> bool:
+        """Check whether storage object key exists on server."""
+        payload = {"object_key": object_key}
+        try:
+            resp = self._request_with_retry(
+                "POST",
+                f"{self.server_url}/storage/object_exists",
+                max_retries=2,
+                retry_label="Storage object_exists",
+                raise_for_status=False,
+                json=payload,
+                headers=self.headers,
+                timeout=20,
+            )
+            if not resp.ok:
+                return False
+            return bool(resp.json().get("exists"))
+        except Exception:
+            return False
+
     def _resume_key(self, file_path: str, file_kind: str) -> str:
         """Stable key used for resumable multipart state."""
         stat = os.stat(file_path)
@@ -150,6 +215,23 @@ class ServerClient(AnalysisClient):
             f"{self.server_url}/storage/multipart/init",
             max_retries=self.REQUEST_MAX_RETRIES,
             retry_label=f"Init storage upload ({file_kind})",
+            json=payload,
+            headers=self.headers,
+            timeout=30,
+        )
+        return resp.json()
+
+    def _storage_get_direct_upload_url(self, file_path: str, file_kind: str) -> Dict[str, Any]:
+        """Get pre-signed direct-upload URL for small files."""
+        payload = {
+            "file_name": os.path.basename(file_path),
+            "file_kind": file_kind,
+        }
+        resp = self._request_with_retry(
+            "POST",
+            f"{self.server_url}/storage/direct_upload_url",
+            max_retries=self.REQUEST_MAX_RETRIES,
+            retry_label=f"Direct upload URL ({file_kind})",
             json=payload,
             headers=self.headers,
             timeout=30,
@@ -253,6 +335,16 @@ class ServerClient(AnalysisClient):
         file_size = os.path.getsize(file_path)
         if file_size <= 0:
             raise ValueError(f"File is empty: {file_path}")
+
+        if file_size <= self.STORAGE_DIRECT_UPLOAD_THRESHOLD_BYTES:
+            info = self._storage_get_direct_upload_url(file_path=file_path, file_kind=file_kind)
+            put_url = info["upload_url"]
+            with open(file_path, "rb") as f:
+                put_resp = requests.put(put_url, data=f, timeout=300)
+            put_resp.raise_for_status()
+            if progress_callback is not None:
+                progress_callback(progress_end)
+            return info["object_key"]
 
         state = self._load_storage_state()
         key = self._resume_key(file_path, file_kind)
@@ -454,13 +546,20 @@ class ServerClient(AnalysisClient):
 
         model_object_key = None
         if model_file_path:
-            model_object_key = self._upload_file_to_object_storage(
-                file_path=model_file_path,
-                file_kind="model",
-                progress_callback=progress_callback,
-                progress_start=75,
-                progress_end=90,
-            )
+            cached_model_key = self._get_cached_model_object_key(model_file_path)
+            if cached_model_key and self._storage_object_exists(cached_model_key):
+                model_object_key = cached_model_key
+                if progress_callback is not None:
+                    progress_callback(90)
+            else:
+                model_object_key = self._upload_file_to_object_storage(
+                    file_path=model_file_path,
+                    file_kind="model",
+                    progress_callback=progress_callback,
+                    progress_start=75,
+                    progress_end=90,
+                )
+                self._set_cached_model_object_key(model_file_path, model_object_key)
 
         payload: Dict[str, Any] = {
             "video_object_key": video_object_key,

@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import cv2
@@ -170,10 +171,26 @@ def save_video(
     if not output_video_frames:
         return
 
-    fourcc = cv2.VideoWriter_fourcc(*"XVID")
-    height, width = output_video_frames[0].shape[:2]
+    output_ext = Path(output_video_path).suffix.lower()
+    if output_ext == ".mp4":
+        codec_candidates = ["avc1", "mp4v", "H264"]
+    else:
+        codec_candidates = ["XVID", "MJPG", "mp4v"]
 
-    out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
+    height, width = output_video_frames[0].shape[:2]
+    target_fps = max(1.0, float(fps))
+
+    out = None
+    for codec in codec_candidates:
+        fourcc = cv2.VideoWriter_fourcc(*codec)
+        writer = cv2.VideoWriter(output_video_path, fourcc, target_fps, (width, height))
+        if writer.isOpened():
+            out = writer
+            break
+        writer.release()
+
+    if out is None:
+        raise ValueError(f"Could not initialize video writer for: {output_video_path}")
 
     for frame in output_video_frames:
         out.write(frame)
