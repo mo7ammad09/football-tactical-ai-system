@@ -235,23 +235,43 @@ if uploaded_file:
 
     remote_model_file = None
     remote_model_path = None
+    remote_model_mode = None
     if use_remote_gpu:
         st.markdown("---")
         st.subheader("🧠 " + ("الموديل على السيرفر GPU" if lang == "ar" else "Model on GPU Server"))
         remote_model_mode = st.radio(
             "طريقة تحديد الموديل" if lang == "ar" else "Model Source",
-            ["Model path on server", "Upload model file (.pt)"],
-            index=0
+            [
+                "Use selected app model (recommended)",
+                "Upload model file (.pt)",
+                "Model path on server",
+            ],
+            index=0,
         )
-        if remote_model_mode == "Model path on server":
+        if remote_model_mode == "Use selected app model (recommended)":
+            if use_real_model and model_path and os.path.exists(model_path):
+                st.success(
+                    f"✅ {'سيتم رفع الموديل المحدد تلقائياً' if lang == 'ar' else 'Selected model will be uploaded automatically'}: {os.path.basename(model_path)}"
+                )
+            else:
+                st.warning(
+                    "⚠️ "
+                    + (
+                        "الموديل المحدد غير متاح محلياً. اختر Upload model file أو Model path on server."
+                        if lang == "ar"
+                        else "Selected model is not available locally. Choose Upload model file or Model path on server."
+                    )
+                )
+        elif remote_model_mode == "Model path on server":
             remote_model_path = st.text_input(
                 "مسار الموديل على السيرفر" if lang == "ar" else "Model path on server",
-                value="models/abdullah_yolov5.pt"
+                value="",
+                placeholder="e.g. /workspace/models/abdullah_yolov5.pt",
             )
         else:
             remote_model_file = st.file_uploader(
                 "ارفع ملف الموديل (.pt)" if lang == "ar" else "Upload model file (.pt)",
-                type=["pt"]
+                type=["pt"],
             )
     
     # Analysis button
@@ -278,28 +298,45 @@ if uploaded_file:
                 if use_remote_gpu:
                     if not remote_server_url.strip():
                         raise ValueError("يرجى إدخال رابط سيرفر GPU" if lang == "ar" else "Please provide GPU server URL")
-                    if remote_model_file is None and (remote_model_path is None or not remote_model_path.strip()):
-                        raise ValueError(
-                            "حدد مسار موديل على السيرفر أو ارفع ملف موديل .pt"
-                            if lang == "ar"
-                            else "Provide model path on server or upload a .pt model file"
-                        )
-
-                    status_text.info("☁️ رفع الفيديو إلى سيرفر GPU..." if lang == "ar" else "☁️ Uploading video to GPU server...")
-                    progress_bar.progress(5)
 
                     model_file_path = None
-                    if remote_model_file is not None:
+                    model_path_for_server = None
+                    if remote_model_mode == "Use selected app model (recommended)":
+                        if not use_real_model or not model_path or not os.path.exists(model_path):
+                            raise ValueError(
+                                "الموديل المحدد غير موجود محلياً. اختر Upload model file (.pt) أو أدخل مسار صحيح على السيرفر."
+                                if lang == "ar"
+                                else "Selected model is not available locally. Choose Upload model file (.pt) or provide a valid server model path."
+                            )
+                        model_file_path = model_path
+                    elif remote_model_mode == "Upload model file (.pt)":
+                        if remote_model_file is None:
+                            raise ValueError(
+                                "ارفع ملف موديل (.pt) أولاً."
+                                if lang == "ar"
+                                else "Please upload a model file (.pt) first."
+                            )
                         os.makedirs("temp", exist_ok=True)
                         model_file_path = f"temp/{remote_model_file.name}"
                         with open(model_file_path, "wb") as mf:
                             mf.write(remote_model_file.getbuffer())
+                    else:
+                        if remote_model_path is None or not remote_model_path.strip():
+                            raise ValueError(
+                                "أدخل مسار الموديل على السيرفر."
+                                if lang == "ar"
+                                else "Please provide model path on server."
+                            )
+                        model_path_for_server = remote_model_path.strip()
+
+                    status_text.info("☁️ رفع الفيديو إلى سيرفر GPU..." if lang == "ar" else "☁️ Uploading video to GPU server...")
+                    progress_bar.progress(5)
 
                     client = ServerClient(server_url=remote_server_url, api_key=remote_api_key or None)
                     job_id = client.upload_video(
                         video_path=video_path,
                         progress_callback=lambda p: progress_bar.progress(max(5, min(int(p), 95))),
-                        model_path=remote_model_path,
+                        model_path=model_path_for_server,
                         model_file_path=model_file_path,
                         analysis_fps=float(analysis_fps_remote),
                         max_frames=int(max_frames_remote),

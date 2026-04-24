@@ -595,6 +595,15 @@ def process_video(job_id: str) -> None:
             job["progress"] = 4
             _download_from_object_storage(model_object_key, Path(model_path))
 
+        if not os.path.exists(video_path) or os.path.getsize(video_path) <= 0:
+            raise ValueError(f"Video file is missing or empty: {video_path}")
+
+        if not model_path or not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"Model file not found on GPU server: {model_path}. "
+                "Upload a model file or provide a valid model path."
+            )
+
         job["status"] = "processing"
         job["message"] = "Reading video"
         job["progress"] = 5
@@ -607,7 +616,10 @@ def process_video(job_id: str) -> None:
         )
 
         if not video_frames:
-            raise ValueError("Could not read video")
+            raise ValueError(
+                f"Could not read video: {video_path}. "
+                "Try MP4 (H.264) or re-upload the file."
+            )
 
         job["message"] = "Initializing tracker"
         job["progress"] = 12
