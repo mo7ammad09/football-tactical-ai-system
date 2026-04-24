@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 import uuid
 from typing import Dict, Optional, Callable
 
@@ -17,8 +18,12 @@ from src.api.client import AnalysisClient
 class ServerClient(AnalysisClient):
     """Client for custom GPU server."""
 
-    CHUNK_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB (safer with strict proxy limits)
+    CHUNK_SIZE_BYTES = 2 * 1024 * 1024  # 2 MB (more resilient to proxy resets)
     CHUNK_UPLOAD_THRESHOLD_BYTES = 80 * 1024 * 1024  # 80 MB
+    RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
+    CHUNK_MAX_RETRIES = 8
+    REQUEST_MAX_RETRIES = 5
+    BACKOFF_BASE_SECONDS = 1.5
 
     def __init__(self, server_url: str, api_key: Optional[str] = None):
         self.server_url = server_url.rstrip("/")
@@ -26,6 +31,40 @@ class ServerClient(AnalysisClient):
         self.headers = {}
         if api_key:
             self.headers["Authorization"] = f"Bearer {api_key}"
+
+    def _request_with_retry(
+        self,
+        method: str,
+        url: str,
+        *,
+        max_retries: int,
+        retry_label: str,
+        raise_for_status: bool = True,
+        **kwargs,
+    ) -> requests.Response:
+        """Send HTTP request with retry for transient network/proxy failures."""
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(max_retries):
+            try:
+                response = requests.request(method=method, url=url, **kwargs)
+                if response.status_code in self.RETRYABLE_STATUS_CODES and attempt < max_retries - 1:
+                    wait_s = self.BACKOFF_BASE_SECONDS * (2 ** attempt)
+                    time.sleep(wait_s)
+                    continue
+                if raise_for_status:
+                    response.raise_for_status()
+                return response
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                last_exc = exc
+                if attempt >= max_retries - 1:
+                    break
+                wait_s = self.BACKOFF_BASE_SECONDS * (2 ** attempt)
+                time.sleep(wait_s)
+
+        if last_exc is not None:
+            raise requests.ConnectionError(f"{retry_label} failed after {max_retries} attempts: {last_exc}") from last_exc
+        raise RuntimeError(f"{retry_label} failed after {max_retries} attempts")
 
     def upload_video(
         self,
@@ -67,8 +106,12 @@ class ServerClient(AnalysisClient):
                 files["model_file"] = model_file
 
             try:
-                response = requests.post(
+                response = self._request_with_retry(
+                    "POST",
                     f"{self.server_url}/upload",
+                    max_retries=self.REQUEST_MAX_RETRIES,
+                    retry_label="Direct upload",
+                    raise_for_status=False,
                     files=files,
                     data=data,
                     headers=self.headers,
@@ -114,14 +157,16 @@ class ServerClient(AnalysisClient):
                     "chunk_index": str(idx),
                     "total_chunks": str(total_chunks),
                 }
-                resp = requests.post(
+                self._request_with_retry(
+                    "POST",
                     f"{self.server_url}/upload_chunk",
+                    max_retries=self.CHUNK_MAX_RETRIES,
+                    retry_label=f"{file_kind} chunk {idx + 1}/{total_chunks}",
                     files=files,
                     data=data,
                     headers=self.headers,
                     timeout=300,
                 )
-                resp.raise_for_status()
 
                 if progress_callback is not None:
                     ratio = (idx + 1) / total_chunks
@@ -180,36 +225,42 @@ class ServerClient(AnalysisClient):
         if model_file_name:
             data["model_file_name"] = model_file_name
 
-        resp = requests.post(
+        resp = self._request_with_retry(
+            "POST",
             f"{self.server_url}/upload_finalize",
+            max_retries=self.REQUEST_MAX_RETRIES,
+            retry_label="Finalize upload",
             data=data,
             headers=self.headers,
             timeout=600,
         )
-        resp.raise_for_status()
 
         if progress_callback is not None:
             progress_callback(95)
         return resp.json()["job_id"]
 
     def get_status(self, job_id: str) -> Dict:
-        response = requests.get(
+        response = self._request_with_retry(
+            "GET",
             f"{self.server_url}/status/{job_id}",
+            max_retries=self.REQUEST_MAX_RETRIES,
+            retry_label=f"Status for job {job_id}",
             headers=self.headers,
             timeout=30,
         )
-        response.raise_for_status()
         payload = response.json()
         payload["done"] = payload.get("status") in {"completed", "failed"}
         return payload
 
     def get_results(self, job_id: str) -> Dict:
-        response = requests.get(
+        response = self._request_with_retry(
+            "GET",
             f"{self.server_url}/results/{job_id}",
+            max_retries=self.REQUEST_MAX_RETRIES,
+            retry_label=f"Results for job {job_id}",
             headers=self.headers,
             timeout=30,
         )
-        response.raise_for_status()
         return response.json()
 
     def get_video_url(self, job_id: str) -> str:
