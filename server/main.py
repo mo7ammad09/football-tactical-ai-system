@@ -6,6 +6,7 @@ This runs on the GPU server and processes videos.
 from __future__ import annotations
 
 import os
+import shutil
 import uuid
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -40,6 +41,7 @@ jobs: Dict[str, Dict[str, Any]] = {}
 
 # Default model path
 DEFAULT_MODEL_PATH = os.environ.get("MODEL_PATH", "models/best.pt")
+CHUNK_ROOT = Path("uploads") / "_chunked"
 
 
 class JobStatus(BaseModel):
@@ -50,42 +52,48 @@ class JobStatus(BaseModel):
     message: str
 
 
-@app.post("/upload")
-async def upload_video(
+def _safe_name(filename: str, fallback: str) -> str:
+    """Return a safe basename."""
+    safe_name = Path(filename or fallback).name
+    return safe_name if safe_name else fallback
+
+
+async def _save_upload_file(upload: UploadFile, dest_path: Path) -> None:
+    """Save UploadFile to disk in streaming mode."""
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(dest_path, "wb") as f:
+        while True:
+            chunk = await upload.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+
+
+def _assemble_chunks(chunk_dir: Path, total_chunks: int, output_path: Path) -> None:
+    """Assemble chunk files into a single output file."""
+    if total_chunks < 1:
+        raise ValueError("total_chunks must be >= 1")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "wb") as out_f:
+        for idx in range(total_chunks):
+            part_path = chunk_dir / f"{idx:06d}.part"
+            if not part_path.exists():
+                raise FileNotFoundError(f"Missing chunk {idx} in {chunk_dir}")
+            with open(part_path, "rb") as in_f:
+                shutil.copyfileobj(in_f, out_f)
+
+
+def _create_job(
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    model_path: Optional[str] = Form(default=None),
-    analysis_fps: float = Form(default=1.0),
-    max_frames: int = Form(default=5400),
-    resize_width: int = Form(default=960),
-    model_file: Optional[UploadFile] = File(default=None),
-):
-    """Upload video for analysis.
-
-    Supports either:
-    - model_path: existing model on GPU server
-    - model_file: uploaded model file (.pt)
-    """
+    video_path: Path,
+    chosen_model_path: str,
+    analysis_fps: float,
+    max_frames: int,
+    resize_width: int,
+) -> Dict[str, str]:
+    """Create and enqueue a processing job."""
     job_id = str(uuid.uuid4())
-
-    upload_dir = Path("uploads")
-    upload_dir.mkdir(exist_ok=True)
-    video_path = upload_dir / f"{job_id}_{file.filename}"
-
-    with open(video_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
-
-    chosen_model_path = model_path or DEFAULT_MODEL_PATH
-
-    if model_file is not None and model_file.filename:
-        model_dir = Path("uploaded_models")
-        model_dir.mkdir(exist_ok=True)
-        safe_name = Path(model_file.filename).name
-        saved_model_path = model_dir / f"{job_id}_{safe_name}"
-        with open(saved_model_path, "wb") as mf:
-            mf.write(await model_file.read())
-        chosen_model_path = str(saved_model_path)
 
     jobs[job_id] = {
         "status": "pending",
@@ -104,6 +112,129 @@ async def upload_video(
 
     background_tasks.add_task(process_video, job_id)
     return {"job_id": job_id, "status": "pending"}
+
+
+@app.post("/upload")
+async def upload_video(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    model_path: Optional[str] = Form(default=None),
+    analysis_fps: float = Form(default=1.0),
+    max_frames: int = Form(default=5400),
+    resize_width: int = Form(default=960),
+    model_file: Optional[UploadFile] = File(default=None),
+):
+    """Upload video for analysis.
+
+    Supports either:
+    - model_path: existing model on GPU server
+    - model_file: uploaded model file (.pt)
+    """
+    upload_dir = Path("uploads")
+    upload_dir.mkdir(exist_ok=True)
+    safe_video_name = _safe_name(file.filename or "video.mp4", "video.mp4")
+    video_path = upload_dir / f"{uuid.uuid4()}_{safe_video_name}"
+    await _save_upload_file(file, video_path)
+
+    chosen_model_path = model_path or DEFAULT_MODEL_PATH
+
+    if model_file is not None and model_file.filename:
+        model_dir = Path("uploaded_models")
+        model_dir.mkdir(exist_ok=True)
+        safe_name = _safe_name(model_file.filename, "model.pt")
+        saved_model_path = model_dir / f"{uuid.uuid4()}_{safe_name}"
+        await _save_upload_file(model_file, saved_model_path)
+        chosen_model_path = str(saved_model_path)
+
+    return _create_job(
+        background_tasks=background_tasks,
+        video_path=video_path,
+        chosen_model_path=chosen_model_path,
+        analysis_fps=analysis_fps,
+        max_frames=max_frames,
+        resize_width=resize_width,
+    )
+
+
+@app.post("/upload_chunk")
+async def upload_chunk(
+    upload_id: str = Form(...),
+    file_kind: str = Form(...),  # "video" or "model"
+    chunk_index: int = Form(...),
+    total_chunks: int = Form(...),
+    chunk: UploadFile = File(...),
+):
+    """Upload one chunk for a large file."""
+    if file_kind not in {"video", "model"}:
+        raise HTTPException(status_code=400, detail="file_kind must be 'video' or 'model'")
+    if chunk_index < 0 or total_chunks < 1 or chunk_index >= total_chunks:
+        raise HTTPException(status_code=400, detail="Invalid chunk_index/total_chunks")
+
+    chunk_dir = CHUNK_ROOT / upload_id / file_kind
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    chunk_path = chunk_dir / f"{chunk_index:06d}.part"
+    await _save_upload_file(chunk, chunk_path)
+
+    return {"ok": True, "chunk_index": chunk_index, "total_chunks": total_chunks}
+
+
+@app.post("/upload_finalize")
+async def upload_finalize(
+    background_tasks: BackgroundTasks,
+    upload_id: str = Form(...),
+    video_file_name: str = Form(...),
+    video_total_chunks: int = Form(...),
+    model_path: Optional[str] = Form(default=None),
+    model_file_name: Optional[str] = Form(default=None),
+    model_total_chunks: int = Form(default=0),
+    analysis_fps: float = Form(default=1.0),
+    max_frames: int = Form(default=5400),
+    resize_width: int = Form(default=960),
+):
+    """Finalize chunked upload, assemble files, and start processing."""
+    chunk_root = CHUNK_ROOT / upload_id
+    video_chunk_dir = chunk_root / "video"
+
+    if not video_chunk_dir.exists():
+        raise HTTPException(status_code=400, detail="Video chunks not found")
+
+    try:
+        upload_dir = Path("uploads")
+        upload_dir.mkdir(exist_ok=True)
+        safe_video_name = _safe_name(video_file_name, "video.mp4")
+        video_path = upload_dir / f"{uuid.uuid4()}_{safe_video_name}"
+        _assemble_chunks(video_chunk_dir, int(video_total_chunks), video_path)
+
+        chosen_model_path = model_path or DEFAULT_MODEL_PATH
+
+        if model_total_chunks > 0:
+            model_chunk_dir = chunk_root / "model"
+            if not model_file_name:
+                raise HTTPException(status_code=400, detail="model_file_name is required when model_total_chunks > 0")
+            if not model_chunk_dir.exists():
+                raise HTTPException(status_code=400, detail="Model chunks not found")
+
+            model_dir = Path("uploaded_models")
+            model_dir.mkdir(exist_ok=True)
+            safe_model_name = _safe_name(model_file_name, "model.pt")
+            model_path_out = model_dir / f"{uuid.uuid4()}_{safe_model_name}"
+            _assemble_chunks(model_chunk_dir, int(model_total_chunks), model_path_out)
+            chosen_model_path = str(model_path_out)
+
+        return _create_job(
+            background_tasks=background_tasks,
+            video_path=video_path,
+            chosen_model_path=chosen_model_path,
+            analysis_fps=analysis_fps,
+            max_frames=max_frames,
+            resize_width=resize_width,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to finalize upload: {exc}") from exc
+    finally:
+        shutil.rmtree(chunk_root, ignore_errors=True)
 
 
 @app.get("/status/{job_id}", response_model=JobStatus)
