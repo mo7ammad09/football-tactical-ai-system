@@ -8,14 +8,18 @@ from __future__ import annotations
 import os
 import shutil
 import uuid
+from functools import lru_cache
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
+import boto3
 import numpy as np
 import uvicorn
+from botocore.config import Config as BotoConfig
+from botocore.exceptions import ClientError
 from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Import our analysis modules
 import sys
@@ -42,6 +46,12 @@ jobs: Dict[str, Dict[str, Any]] = {}
 # Default model path
 DEFAULT_MODEL_PATH = os.environ.get("MODEL_PATH", "models/best.pt")
 CHUNK_ROOT = Path("uploads") / "_chunked"
+OBJECT_STORAGE_BUCKET = os.environ.get("OBJECT_STORAGE_BUCKET", "").strip()
+OBJECT_STORAGE_REGION = os.environ.get("OBJECT_STORAGE_REGION", "us-east-1").strip() or "us-east-1"
+OBJECT_STORAGE_ENDPOINT_URL = os.environ.get("OBJECT_STORAGE_ENDPOINT_URL", "").strip() or None
+OBJECT_STORAGE_PREFIX = os.environ.get("OBJECT_STORAGE_PREFIX", "football-ai").strip().strip("/")
+OBJECT_STORAGE_URL_EXPIRES = int(os.environ.get("OBJECT_STORAGE_URL_EXPIRES", "3600"))
+OBJECT_STORAGE_PUBLIC_BASE_URL = os.environ.get("OBJECT_STORAGE_PUBLIC_BASE_URL", "").strip().rstrip("/")
 
 
 class JobStatus(BaseModel):
@@ -50,6 +60,103 @@ class JobStatus(BaseModel):
     status: str
     progress: int
     message: str
+
+
+class MultipartInitRequest(BaseModel):
+    """Request to start multipart upload in object storage."""
+    file_name: str
+    file_kind: str = "video"
+    content_type: Optional[str] = None
+    part_size_mb: int = 8
+
+
+class MultipartPresignPartRequest(BaseModel):
+    """Request a pre-signed URL for uploading one part."""
+    upload_id: str
+    object_key: str
+    part_number: int
+
+
+class MultipartListPartsRequest(BaseModel):
+    """Request uploaded parts list for resume support."""
+    upload_id: str
+    object_key: str
+
+
+class MultipartPart(BaseModel):
+    """Completed part metadata."""
+    part_number: int = Field(..., ge=1)
+    etag: str
+
+
+class MultipartCompleteRequest(BaseModel):
+    """Complete multipart upload."""
+    upload_id: str
+    object_key: str
+    parts: List[MultipartPart]
+
+
+class StartFromStorageRequest(BaseModel):
+    """Start a job from object storage keys."""
+    video_object_key: str
+    model_object_key: Optional[str] = None
+    model_path: Optional[str] = None
+    analysis_fps: float = 1.0
+    max_frames: int = 5400
+    resize_width: int = 960
+
+
+def _is_object_storage_enabled() -> bool:
+    """Return True when object storage has minimum config."""
+    return bool(OBJECT_STORAGE_BUCKET)
+
+
+def _storage_error() -> HTTPException:
+    """Standard error for missing object storage config."""
+    return HTTPException(
+        status_code=503,
+        detail=(
+            "Object storage is not configured. Set OBJECT_STORAGE_BUCKET "
+            "(and credentials / endpoint vars) on the GPU server."
+        ),
+    )
+
+
+@lru_cache(maxsize=1)
+def _get_s3_client():
+    """Create and cache S3-compatible client."""
+    if not _is_object_storage_enabled():
+        raise RuntimeError("Object storage is not configured")
+
+    access_key = os.environ.get("OBJECT_STORAGE_ACCESS_KEY_ID") or os.environ.get("AWS_ACCESS_KEY_ID")
+    secret_key = os.environ.get("OBJECT_STORAGE_SECRET_ACCESS_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY")
+    session_token = os.environ.get("OBJECT_STORAGE_SESSION_TOKEN") or os.environ.get("AWS_SESSION_TOKEN")
+
+    client_kwargs: Dict[str, Any] = {
+        "service_name": "s3",
+        "region_name": OBJECT_STORAGE_REGION,
+        "endpoint_url": OBJECT_STORAGE_ENDPOINT_URL,
+        "config": BotoConfig(signature_version="s3v4"),
+    }
+    if access_key and secret_key:
+        client_kwargs["aws_access_key_id"] = access_key
+        client_kwargs["aws_secret_access_key"] = secret_key
+    if session_token:
+        client_kwargs["aws_session_token"] = session_token
+
+    return boto3.client(**client_kwargs)
+
+
+def _object_key(file_kind: str, file_name: str) -> str:
+    """Build canonical object key."""
+    safe_name = _safe_name(file_name, "upload.bin")
+    return f"{OBJECT_STORAGE_PREFIX}/{file_kind}/{uuid.uuid4()}_{safe_name}"
+
+
+def _download_from_object_storage(object_key: str, local_path: Path) -> None:
+    """Download object to local path."""
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    _get_s3_client().download_file(OBJECT_STORAGE_BUCKET, object_key, str(local_path))
 
 
 def _safe_name(filename: str, fallback: str) -> str:
@@ -91,6 +198,8 @@ def _create_job(
     analysis_fps: float,
     max_frames: int,
     resize_width: int,
+    video_object_key: Optional[str] = None,
+    model_object_key: Optional[str] = None,
 ) -> Dict[str, str]:
     """Create and enqueue a processing job."""
     job_id = str(uuid.uuid4())
@@ -107,6 +216,8 @@ def _create_job(
             "analysis_fps": max(0.1, float(analysis_fps)),
             "max_frames": max(1, int(max_frames)),
             "resize_width": max(256, int(resize_width)),
+            "video_object_key": video_object_key,
+            "model_object_key": model_object_key,
         },
     }
 
@@ -237,6 +348,173 @@ async def upload_finalize(
         shutil.rmtree(chunk_root, ignore_errors=True)
 
 
+@app.get("/storage/health")
+async def storage_health():
+    """Object storage readiness."""
+    return {
+        "enabled": _is_object_storage_enabled(),
+        "bucket": OBJECT_STORAGE_BUCKET or None,
+        "endpoint": OBJECT_STORAGE_ENDPOINT_URL,
+        "prefix": OBJECT_STORAGE_PREFIX,
+    }
+
+
+@app.post("/storage/multipart/init")
+async def storage_multipart_init(payload: MultipartInitRequest):
+    """Initialize multipart upload and return upload metadata."""
+    if not _is_object_storage_enabled():
+        raise _storage_error()
+
+    if payload.file_kind not in {"video", "model"}:
+        raise HTTPException(status_code=400, detail="file_kind must be 'video' or 'model'")
+
+    part_size_mb = min(max(int(payload.part_size_mb), 2), 64)
+    key = _object_key(payload.file_kind, payload.file_name)
+    extra_args: Dict[str, Any] = {}
+    if payload.content_type:
+        extra_args["ContentType"] = payload.content_type
+
+    resp = _get_s3_client().create_multipart_upload(
+        Bucket=OBJECT_STORAGE_BUCKET,
+        Key=key,
+        **extra_args,
+    )
+    return {
+        "upload_id": resp["UploadId"],
+        "object_key": key,
+        "bucket": OBJECT_STORAGE_BUCKET,
+        "part_size_bytes": part_size_mb * 1024 * 1024,
+    }
+
+
+@app.post("/storage/multipart/presign_part")
+async def storage_multipart_presign_part(payload: MultipartPresignPartRequest):
+    """Generate pre-signed URL for one upload part."""
+    if not _is_object_storage_enabled():
+        raise _storage_error()
+    if payload.part_number < 1:
+        raise HTTPException(status_code=400, detail="part_number must be >= 1")
+
+    url = _get_s3_client().generate_presigned_url(
+        ClientMethod="upload_part",
+        Params={
+            "Bucket": OBJECT_STORAGE_BUCKET,
+            "Key": payload.object_key,
+            "UploadId": payload.upload_id,
+            "PartNumber": payload.part_number,
+        },
+        ExpiresIn=OBJECT_STORAGE_URL_EXPIRES,
+    )
+    return {"url": url, "part_number": payload.part_number}
+
+
+@app.post("/storage/multipart/list_parts")
+async def storage_multipart_list_parts(payload: MultipartListPartsRequest):
+    """List already-uploaded parts to support resume."""
+    if not _is_object_storage_enabled():
+        raise _storage_error()
+
+    s3 = _get_s3_client()
+    try:
+        parts: List[Dict[str, Any]] = []
+        marker = 0
+        while True:
+            resp = s3.list_parts(
+                Bucket=OBJECT_STORAGE_BUCKET,
+                Key=payload.object_key,
+                UploadId=payload.upload_id,
+                PartNumberMarker=marker,
+                MaxParts=1000,
+            )
+            for part in resp.get("Parts", []):
+                parts.append(
+                    {
+                        "part_number": int(part["PartNumber"]),
+                        "etag": str(part["ETag"]).strip('"'),
+                    }
+                )
+
+            if not resp.get("IsTruncated"):
+                break
+            marker = int(resp.get("NextPartNumberMarker", 0))
+
+        return {"parts": parts}
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code in {"NoSuchUpload", "404"}:
+            raise HTTPException(status_code=404, detail="Upload session not found") from exc
+        raise HTTPException(status_code=400, detail=f"Cannot list uploaded parts: {exc}") from exc
+
+
+@app.post("/storage/multipart/complete")
+async def storage_multipart_complete(payload: MultipartCompleteRequest):
+    """Complete multipart upload and return object reference."""
+    if not _is_object_storage_enabled():
+        raise _storage_error()
+    if not payload.parts:
+        raise HTTPException(status_code=400, detail="parts is required")
+
+    parts = sorted(
+        [
+            {
+                "PartNumber": int(part.part_number),
+                "ETag": part.etag if part.etag.startswith('"') and part.etag.endswith('"') else f'"{part.etag}"',
+            }
+            for part in payload.parts
+        ],
+        key=lambda p: p["PartNumber"],
+    )
+
+    try:
+        _get_s3_client().complete_multipart_upload(
+            Bucket=OBJECT_STORAGE_BUCKET,
+            Key=payload.object_key,
+            UploadId=payload.upload_id,
+            MultipartUpload={"Parts": parts},
+        )
+    except ClientError as exc:
+        raise HTTPException(status_code=400, detail=f"Cannot complete multipart upload: {exc}") from exc
+
+    response = {
+        "object_key": payload.object_key,
+        "object_uri": f"s3://{OBJECT_STORAGE_BUCKET}/{payload.object_key}",
+    }
+    if OBJECT_STORAGE_PUBLIC_BASE_URL:
+        response["public_url"] = f"{OBJECT_STORAGE_PUBLIC_BASE_URL}/{payload.object_key}"
+    return response
+
+
+@app.post("/jobs/from_storage")
+async def start_job_from_storage(
+    payload: StartFromStorageRequest,
+    background_tasks: BackgroundTasks,
+):
+    """Create job using video/model objects from storage."""
+    if not _is_object_storage_enabled():
+        raise _storage_error()
+
+    video_name = Path(payload.video_object_key).name or "video.mp4"
+    local_video_path = Path("uploads") / f"{uuid.uuid4()}_{video_name}"
+
+    chosen_model_path = payload.model_path or DEFAULT_MODEL_PATH
+    model_object_key = payload.model_object_key
+    if model_object_key:
+        model_name = Path(model_object_key).name or "model.pt"
+        local_model_path = Path("uploaded_models") / f"{uuid.uuid4()}_{model_name}"
+        chosen_model_path = str(local_model_path)
+
+    return _create_job(
+        background_tasks=background_tasks,
+        video_path=local_video_path,
+        chosen_model_path=chosen_model_path,
+        analysis_fps=payload.analysis_fps,
+        max_frames=payload.max_frames,
+        resize_width=payload.resize_width,
+        video_object_key=payload.video_object_key,
+        model_object_key=model_object_key,
+    )
+
+
 @app.get("/status/{job_id}", response_model=JobStatus)
 async def get_status(job_id: str):
     """Get processing status."""
@@ -283,7 +561,11 @@ async def get_video(job_id: str):
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy", "default_model_exists": os.path.exists(DEFAULT_MODEL_PATH)}
+    return {
+        "status": "healthy",
+        "default_model_exists": os.path.exists(DEFAULT_MODEL_PATH),
+        "object_storage_enabled": _is_object_storage_enabled(),
+    }
 
 
 def process_video(job_id: str) -> None:
@@ -295,9 +577,23 @@ def process_video(job_id: str) -> None:
         settings = job["settings"]
 
         model_path = settings["model_path"]
+        video_object_key = settings.get("video_object_key")
+        model_object_key = settings.get("model_object_key")
         analysis_fps = settings["analysis_fps"]
         max_frames = settings["max_frames"]
         resize_width = settings["resize_width"]
+
+        if video_object_key:
+            job["status"] = "processing"
+            job["message"] = "Downloading video from object storage"
+            job["progress"] = 2
+            _download_from_object_storage(video_object_key, Path(video_path))
+
+        if model_object_key:
+            job["status"] = "processing"
+            job["message"] = "Downloading model from object storage"
+            job["progress"] = 4
+            _download_from_object_storage(model_object_key, Path(model_path))
 
         job["status"] = "processing"
         job["message"] = "Reading video"

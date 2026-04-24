@@ -11,6 +11,16 @@
 - **Remote GPU**: FastAPI server (`server/main.py`) deployed on GPU VM/Pod.
 - UI sends video + optional model to remote server `/upload`.
 
+## New upload mode (recommended)
+- The system now supports **Object Storage multipart upload** with:
+  - Parallel parts
+  - Resume support
+  - Retry/backoff
+- Flow:
+  1. UI uploads video/model to object storage via signed URLs.
+  2. GPU server downloads from storage and starts analysis.
+  3. This avoids common proxy upload failures/timeouts for large files.
+
 ## H100 note (important)
 - You are not wrong: H100 is powerful.
 - But for this pipeline, H100 can be **overkill/costly** unless you need very high throughput.
@@ -35,3 +45,21 @@ uvicorn server.main:app --host 0.0.0.0 --port 8000
   - `Processing Mode = Remote GPU`
   - `Server URL = http://<GPU_IP>:8000`
 - Upload video + choose model path or upload `.pt` model.
+
+## Object storage environment variables (on GPU server)
+Set these on the pod/endpoint before starting `server.main`:
+
+```bash
+OBJECT_STORAGE_BUCKET=your-bucket
+OBJECT_STORAGE_REGION=us-east-1
+OBJECT_STORAGE_ENDPOINT_URL=https://<s3-compatible-endpoint>
+OBJECT_STORAGE_ACCESS_KEY_ID=<key>
+OBJECT_STORAGE_SECRET_ACCESS_KEY=<secret>
+OBJECT_STORAGE_PREFIX=football-ai
+OBJECT_STORAGE_URL_EXPIRES=3600
+```
+
+Optional:
+```bash
+OBJECT_STORAGE_PUBLIC_BASE_URL=https://public-cdn.example.com
+```

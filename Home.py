@@ -298,6 +298,7 @@ if uploaded_file:
                     client = ServerClient(server_url=remote_server_url, api_key=remote_api_key or None)
                     job_id = client.upload_video(
                         video_path=video_path,
+                        progress_callback=lambda p: progress_bar.progress(max(5, min(int(p), 95))),
                         model_path=remote_model_path,
                         model_file_path=model_file_path,
                         analysis_fps=float(analysis_fps_remote),
