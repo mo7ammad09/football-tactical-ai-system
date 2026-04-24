@@ -374,6 +374,9 @@ if uploaded_file:
                         st.markdown("---")
                         st.subheader("🎬 " + ("الفيديو المعلّم (GPU)" if lang == "ar" else "Annotated Video (GPU)"))
                         st.video(video_url)
+                        st.markdown(
+                            f"[⬇️ {'تحميل الفيديو الناتج' if lang == 'ar' else 'Download output video'}]({video_url})"
+                        )
 
                 elif use_real_model:
                     # ===== REAL MODEL ANALYSIS =====
@@ -601,6 +604,24 @@ if st.session_state.analysis_done and st.session_state.analysis_results:
     st.markdown("---")
     
     results = st.session_state.analysis_results
+    output_video = results.get("output_video")
+
+    if output_video:
+        st.subheader("🎬 " + ("الفيديو الناتج" if lang == "ar" else "Output Video"))
+        st.video(output_video)
+        if isinstance(output_video, str) and output_video.startswith(("http://", "https://")):
+            st.markdown(
+                f"[⬇️ {'تحميل الفيديو الناتج' if lang == 'ar' else 'Download output video'}]({output_video})"
+            )
+        elif os.path.exists(output_video):
+            with open(output_video, "rb") as out_f:
+                st.download_button(
+                    "⬇️ " + ("تحميل الفيديو الناتج" if lang == "ar" else "Download output video"),
+                    data=out_f.read(),
+                    file_name=os.path.basename(output_video),
+                    mime="video/mp4",
+                    use_container_width=True,
+                )
     
     # Tabs
     tab_labels = ["📊 إحصائيات", "🎯 لوحة تكتيكية", "👥 لاعبين", "🤖 تحليل AI"] if lang == "ar" else ["📊 Stats", "🎯 Tactical", "👥 Players", "🤖 AI"]
