@@ -12,10 +12,27 @@ source .venv/bin/activate
 pip install -q --upgrade pip
 pip install -q -r server/requirements.txt
 
+# RunPod images can miss shared libs required by OpenCV (cv2).
+# Install once if needed and if apt-get is available.
+if command -v apt-get >/dev/null 2>&1; then
+  if ! python -c "import cv2" >/dev/null 2>&1; then
+    echo "Installing missing system libraries for OpenCV..."
+    apt-get update -y
+    apt-get install -y \
+      libgl1 \
+      libglib2.0-0 \
+      libsm6 \
+      libxrender1 \
+      libxext6 \
+      libxcb1
+  fi
+fi
+
 mkdir -p uploads outputs stubs uploaded_models
 
 # You can override MODEL_PATH when running this script.
 # Example: MODEL_PATH=models/abdullah_yolov5.pt bash scripts/start_gpu_server.sh
 export MODEL_PATH="${MODEL_PATH:-models/abdullah_yolov5.pt}"
+export YOLO_CONFIG_DIR="${YOLO_CONFIG_DIR:-/tmp/Ultralytics}"
 
 uvicorn server.main:app --host 0.0.0.0 --port 8000
