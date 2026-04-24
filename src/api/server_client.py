@@ -17,7 +17,7 @@ from src.api.client import AnalysisClient
 class ServerClient(AnalysisClient):
     """Client for custom GPU server."""
 
-    CHUNK_SIZE_BYTES = 24 * 1024 * 1024  # 24 MB
+    CHUNK_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB (safer with strict proxy limits)
     CHUNK_UPLOAD_THRESHOLD_BYTES = 80 * 1024 * 1024  # 80 MB
 
     def __init__(self, server_url: str, api_key: Optional[str] = None):
