@@ -1,0 +1,124 @@
+"""
+دوال مساعدة لقراءة وكتابة الفيديو.
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List, Optional
+
+import cv2
+import numpy as np
+
+
+def read_video(video_path: str) -> List[np.ndarray]:
+    """Read full video into a list of frames.
+
+    Args:
+        video_path: مسار ملف الفيديو.
+
+    Returns:
+        قائمة بالفريمات.
+    """
+    return read_video_sampled(video_path)
+
+
+def read_video_sampled(
+    video_path: str,
+    target_fps: Optional[float] = None,
+    max_frames: Optional[int] = None,
+    resize_width: Optional[int] = None
+) -> List[np.ndarray]:
+    """Read video frames with optional FPS sampling and frame cap.
+
+    Args:
+        video_path: Path to input video.
+        target_fps: Target FPS for sampling (None = full FPS).
+        max_frames: Maximum number of frames to return.
+        resize_width: Resize output frames to this width while preserving aspect ratio.
+
+    Returns:
+        List of sampled frames.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return []
+
+    source_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    if target_fps and source_fps > 0:
+        step = max(1, int(round(source_fps / target_fps)))
+    else:
+        step = 1
+
+    frames: List[np.ndarray] = []
+    frame_idx = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        if frame_idx % step == 0:
+            if resize_width and frame.shape[1] > resize_width:
+                scale = resize_width / frame.shape[1]
+                resized_height = int(frame.shape[0] * scale)
+                frame = cv2.resize(frame, (resize_width, resized_height), interpolation=cv2.INTER_AREA)
+            frames.append(frame)
+            if max_frames is not None and len(frames) >= max_frames:
+                break
+
+        frame_idx += 1
+
+    cap.release()
+    return frames
+
+
+def save_video(
+    output_video_frames: List[np.ndarray],
+    output_video_path: str,
+    fps: float = 24.0
+) -> None:
+    """Save frames to video file.
+
+    Args:
+        output_video_frames: قائمة الفريمات.
+        output_video_path: مسار حفظ الفيديو.
+        fps: معدل الإطارات.
+    """
+    if not output_video_frames:
+        return
+
+    fourcc = cv2.VideoWriter_fourcc(*"XVID")
+    height, width = output_video_frames[0].shape[:2]
+
+    out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
+
+    for frame in output_video_frames:
+        out.write(frame)
+
+    out.release()
+
+
+def get_video_properties(video_path: str) -> Dict:
+    """Get video properties.
+
+    Args:
+        video_path: مسار الفيديو.
+
+    Returns:
+        قاموس بالخصائص.
+    """
+    cap = cv2.VideoCapture(video_path)
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    properties = {
+        "fps": fps,
+        "frame_count": frame_count,
+        "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+        "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        "duration_seconds": int(frame_count / fps) if fps else 0,
+    }
+
+    cap.release()
+    return properties

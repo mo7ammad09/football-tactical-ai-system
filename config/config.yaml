@@ -1,0 +1,80 @@
+# Football Tactical AI System - Configuration
+
+# Video Processing
+video:
+  input_path: "input_videos/"
+  output_path: "output_videos/"
+  input_file: "input_videos/test.mp4"
+  output_file: "output_videos/output_video.avi"
+  target_resolution: [1920, 1080]
+  fps: 30
+  batch_size: 20
+  analysis_fps: 10
+  max_frames: 3000
+
+# Object Detection
+detection:
+  model_path: "models/yolov8m.pt"
+  confidence_threshold: 0.5
+  iou_threshold: 0.45
+  classes:
+    player: 0
+    goalkeeper: 1
+    referee: 2
+    ball: 3
+
+# Tracking
+tracking:
+  tracker_type: "bytetrack"
+  max_age: 30
+  min_hits: 3
+  iou_threshold: 0.3
+
+# Team Assignment
+team:
+  cluster_method: "kmeans"
+  n_clusters: 2
+  jersey_crop_ratio: [0.3, 0.6, 0.2, 0.5]  # [y_start, y_end, x_start, x_end]
+  color_space: "hsv"
+
+# Field Transformation
+field:
+  width_meters: 105.0
+  height_meters: 68.0
+  keypoints:
+    - [0, 0]       # Top-left corner
+    - [105, 0]     # Top-right corner
+    - [105, 68]    # Bottom-right corner
+    - [0, 68]      # Bottom-left corner
+
+# Ball Assignment
+ball:
+  max_distance_meters: 2.0
+  interpolation_window: 5
+
+# Speed & Distance
+metrics:
+  fps: 30
+  pixels_per_meter: 10.0  # Will be calculated from field transform
+  max_speed_kmh: 40.0
+
+# Tactical Analysis
+tactical:
+  pitch_control_grid: [50, 32]
+  pass_distance_threshold: 30.0  # meters
+  defensive_line_threshold: 35.0  # meters from own goal
+  pressing_radius: 10.0  # meters
+
+# AI Analysis
+ai:
+  model: "gemini-pro"
+  temperature: 0.3
+  max_tokens: 2048
+  language: "ar"  # ar or en
+
+# Output
+output:
+  save_video: true
+  save_data: true
+  data_format: "json"  # json or csv
+  show_tactical_board: true
