@@ -4,6 +4,10 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import subprocess
+import tempfile
 from typing import Dict, List, Optional
 
 import cv2
@@ -20,6 +24,91 @@ def read_video(video_path: str) -> List[np.ndarray]:
         قائمة بالفريمات.
     """
     return read_video_sampled(video_path)
+
+
+def _read_video_with_opencv(
+    video_path: str,
+    target_fps: Optional[float] = None,
+    max_frames: Optional[int] = None,
+    resize_width: Optional[int] = None,
+) -> List[np.ndarray]:
+    """Read frames using OpenCV only."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return []
+
+    source_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    if target_fps and source_fps > 0:
+        step = max(1, int(round(source_fps / target_fps)))
+    else:
+        step = 1
+
+    frames: List[np.ndarray] = []
+    frame_idx = 0
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_idx % step == 0:
+                if resize_width and frame.shape[1] > resize_width:
+                    scale = resize_width / frame.shape[1]
+                    resized_height = int(frame.shape[0] * scale)
+                    frame = cv2.resize(frame, (resize_width, resized_height), interpolation=cv2.INTER_AREA)
+                frames.append(frame)
+                if max_frames is not None and len(frames) >= max_frames:
+                    break
+
+            frame_idx += 1
+    finally:
+        cap.release()
+
+    return frames
+
+
+def _transcode_to_h264_mp4(video_path: str) -> Optional[str]:
+    """Transcode to a broadly-compatible MP4 using ffmpeg when available."""
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if ffmpeg_bin is None:
+        return None
+
+    fd, output_path = tempfile.mkstemp(prefix="football_transcoded_", suffix=".mp4")
+    os.close(fd)
+
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        video_path,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "20",
+        "-pix_fmt",
+        "yuv420p",
+        "-an",
+        output_path,
+    ]
+
+    try:
+        subprocess.run(
+            cmd,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1800,
+        )
+        return output_path
+    except Exception:
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        return None
 
 
 def read_video_sampled(
@@ -39,36 +128,30 @@ def read_video_sampled(
     Returns:
         List of sampled frames.
     """
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
+    frames = _read_video_with_opencv(
+        video_path=video_path,
+        target_fps=target_fps,
+        max_frames=max_frames,
+        resize_width=resize_width,
+    )
+    if frames:
+        return frames
+
+    transcoded_path = _transcode_to_h264_mp4(video_path)
+    if not transcoded_path:
         return []
 
-    source_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
-    if target_fps and source_fps > 0:
-        step = max(1, int(round(source_fps / target_fps)))
-    else:
-        step = 1
+    try:
+        frames = _read_video_with_opencv(
+            video_path=transcoded_path,
+            target_fps=target_fps,
+            max_frames=max_frames,
+            resize_width=resize_width,
+        )
+    finally:
+        if os.path.exists(transcoded_path):
+            os.remove(transcoded_path)
 
-    frames: List[np.ndarray] = []
-    frame_idx = 0
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        if frame_idx % step == 0:
-            if resize_width and frame.shape[1] > resize_width:
-                scale = resize_width / frame.shape[1]
-                resized_height = int(frame.shape[0] * scale)
-                frame = cv2.resize(frame, (resize_width, resized_height), interpolation=cv2.INTER_AREA)
-            frames.append(frame)
-            if max_frames is not None and len(frames) >= max_frames:
-                break
-
-        frame_idx += 1
-
-    cap.release()
     return frames
 
 

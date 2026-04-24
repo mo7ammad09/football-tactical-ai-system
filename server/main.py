@@ -165,6 +165,29 @@ def _safe_name(filename: str, fallback: str) -> str:
     return safe_name if safe_name else fallback
 
 
+def _resolve_existing_model_path(requested_model_path: Optional[str]) -> str:
+    """Resolve model path or raise a clear HTTP 400 before creating the job."""
+    candidate = (requested_model_path or "").strip()
+    if candidate:
+        if not os.path.exists(candidate):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model path does not exist on GPU server: {candidate}",
+            )
+        return candidate
+
+    if os.path.exists(DEFAULT_MODEL_PATH):
+        return DEFAULT_MODEL_PATH
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "No model available on GPU server. "
+            "Upload a .pt model file or provide a valid model_path."
+        ),
+    )
+
+
 async def _save_upload_file(upload: UploadFile, dest_path: Path) -> None:
     """Save UploadFile to disk in streaming mode."""
     dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -247,8 +270,6 @@ async def upload_video(
     video_path = upload_dir / f"{uuid.uuid4()}_{safe_video_name}"
     await _save_upload_file(file, video_path)
 
-    chosen_model_path = model_path or DEFAULT_MODEL_PATH
-
     if model_file is not None and model_file.filename:
         model_dir = Path("uploaded_models")
         model_dir.mkdir(exist_ok=True)
@@ -256,6 +277,8 @@ async def upload_video(
         saved_model_path = model_dir / f"{uuid.uuid4()}_{safe_name}"
         await _save_upload_file(model_file, saved_model_path)
         chosen_model_path = str(saved_model_path)
+    else:
+        chosen_model_path = _resolve_existing_model_path(model_path)
 
     return _create_job(
         background_tasks=background_tasks,
@@ -316,8 +339,6 @@ async def upload_finalize(
         video_path = upload_dir / f"{uuid.uuid4()}_{safe_video_name}"
         _assemble_chunks(video_chunk_dir, int(video_total_chunks), video_path)
 
-        chosen_model_path = model_path or DEFAULT_MODEL_PATH
-
         if model_total_chunks > 0:
             model_chunk_dir = chunk_root / "model"
             if not model_file_name:
@@ -331,6 +352,8 @@ async def upload_finalize(
             model_path_out = model_dir / f"{uuid.uuid4()}_{safe_model_name}"
             _assemble_chunks(model_chunk_dir, int(model_total_chunks), model_path_out)
             chosen_model_path = str(model_path_out)
+        else:
+            chosen_model_path = _resolve_existing_model_path(model_path)
 
         return _create_job(
             background_tasks=background_tasks,
@@ -496,12 +519,13 @@ async def start_job_from_storage(
     video_name = Path(payload.video_object_key).name or "video.mp4"
     local_video_path = Path("uploads") / f"{uuid.uuid4()}_{video_name}"
 
-    chosen_model_path = payload.model_path or DEFAULT_MODEL_PATH
     model_object_key = payload.model_object_key
     if model_object_key:
         model_name = Path(model_object_key).name or "model.pt"
         local_model_path = Path("uploaded_models") / f"{uuid.uuid4()}_{model_name}"
         chosen_model_path = str(local_model_path)
+    else:
+        chosen_model_path = _resolve_existing_model_path(payload.model_path)
 
     return _create_job(
         background_tasks=background_tasks,

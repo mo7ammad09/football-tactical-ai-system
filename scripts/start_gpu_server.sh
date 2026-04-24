@@ -22,19 +22,31 @@ if [[ "$CURRENT_REQ_HASH" != "$SAVED_REQ_HASH" ]]; then
   echo "$CURRENT_REQ_HASH" > "$REQ_HASH_FILE"
 fi
 
-# RunPod images can miss shared libs required by OpenCV (cv2).
+# RunPod images can miss shared libs required by OpenCV (cv2) and ffmpeg.
 # Install once if needed and if apt-get is available.
 if command -v apt-get >/dev/null 2>&1; then
+  packages=()
+
   if ! python -c "import cv2" >/dev/null 2>&1; then
     echo "Installing missing system libraries for OpenCV..."
-    apt-get update -y
-    apt-get install -y \
-      libgl1 \
-      libglib2.0-0 \
-      libsm6 \
-      libxrender1 \
-      libxext6 \
+    packages+=(
+      libgl1
+      libglib2.0-0
+      libsm6
+      libxrender1
+      libxext6
       libxcb1
+    )
+  fi
+
+  if ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "Installing ffmpeg for broader video codec support..."
+    packages+=(ffmpeg)
+  fi
+
+  if [[ ${#packages[@]} -gt 0 ]]; then
+    apt-get update -y
+    apt-get install -y "${packages[@]}"
   fi
 fi
 
