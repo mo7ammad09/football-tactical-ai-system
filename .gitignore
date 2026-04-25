@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv/
+
+# Video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+input_videos/
+output_videos/
+temp/
+
+# Models
+models/
+models/*.pt
+models/*.pth
+models/*.onnx
+runpod/models/
+runpod/src/
+
+# Stubs / Cache
+stubs/
+*.pkl
+*.pkl
+uploads/
+uploaded_models/
+outputs/
+jobs.sqlite3
+jobs.sqlite3-*
+
+# Data
+data/*.csv
+data/*.json
+
+# IDE
+.vscode/
+.idea/
+.claude/
+.kimi/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+.env.local
+.streamlit/secrets.toml
+
+# Logs
+*.log
+
+# Legacy deployment variants / local experiments
+replicate_abdullah/
+replicate_model/
+test_real_model.py
+test_replicate*.py
+train_custom_model.py

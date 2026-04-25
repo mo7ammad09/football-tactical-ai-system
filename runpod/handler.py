@@ -1,187 +1,137 @@
-"""
-RunPod Serverless Handler for Football Tactical AI.
-"""
+"""RunPod Serverless handler for automatic GPU analysis."""
 
 from __future__ import annotations
 
+import os
 import sys
+import uuid
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-import numpy as np
-import requests
-import runpod
+try:
+    import runpod
+except ImportError:  # pragma: no cover - local tests may not install runpod
+    runpod = None
 
-# Ensure local imports work inside worker image
-sys.path.append(str(Path(__file__).parent.parent))
+# Ensure official src imports work in both the repo and the worker image.
+HANDLER_DIR = Path(__file__).resolve().parent
+sys.path.extend([str(HANDLER_DIR), str(HANDLER_DIR.parent)])
 
-from src.trackers.tracker import Tracker
-from src.team_assigner.team_assigner import TeamAssigner
-from src.ball_assigner.ball_assigner import BallAssigner
-from src.camera_movement.camera_movement_estimator import CameraMovementEstimator
-from src.view_transformer.view_transformer import ViewTransformer
-from src.speed_distance.speed_distance_estimator import SpeedDistanceEstimator
-from src.tactical_analysis.tactical_analyzer import TacticalAnalyzer
-from src.advanced_features.pass_detector import PassDetector
-from src.advanced_features.shot_detector import ShotDetector
-from src.utils.video_utils import read_video_sampled, save_video, get_video_properties
-
-MODEL_PATH = "models/abdullah_yolov5.pt"
-INPUT_VIDEO_PATH = "/tmp/input_video.mp4"
-OUTPUT_VIDEO_PATH = "/tmp/output_video.avi"
+from src.api.object_storage_client import ObjectStorageClient
+from src.processing.batch_analyzer import run_batch_analysis
 
 
-def _download_video(video_url: str, target_path: str) -> None:
-    """Download input video file from URL."""
-    urllib.request.urlretrieve(video_url, target_path)
+DEFAULT_MODEL_PATH = os.environ.get("MODEL_PATH", "models/abdullah_yolov5.pt")
+TMP_ROOT = Path(os.environ.get("RUNPOD_TMP_ROOT", "/tmp/football-ai"))
 
 
-def _upload_file(upload_url: str, file_path: str) -> Dict[str, Any]:
-    """Upload output file to a pre-signed URL via HTTP PUT."""
-    with open(file_path, "rb") as f:
-        response = requests.put(upload_url, data=f, timeout=300)
+def _download_url(url: str, target_path: Path) -> None:
+    """Download a legacy URL input to disk."""
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    urllib.request.urlretrieve(url, str(target_path))
 
-    return {
-        "status_code": response.status_code,
-        "ok": response.ok,
-        "message": "uploaded" if response.ok else response.text[:300],
+
+def _artifact_response(storage: Optional[ObjectStorageClient], job_id: str, name: str, path: Path, content_type: str) -> Dict[str, Any]:
+    """Upload an artifact when storage is configured and return metadata."""
+    artifact: Dict[str, Any] = {
+        "local_path": str(path),
+        "content_type": content_type,
+        "object_key": None,
+        "public_url": None,
     }
+    if storage is None:
+        return artifact
+
+    uploaded = storage.upload_file(
+        str(path),
+        file_kind="artifact",
+        job_id=job_id,
+        content_type=content_type,
+    )
+    artifact.update(uploaded)
+    return artifact
 
 
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
-    """RunPod serverless entrypoint."""
-    input_data = event.get("input", {})
+    """RunPod queue-based serverless entrypoint."""
+    input_data = event.get("input", {}) or {}
+    job_id = str(event.get("id") or input_data.get("job_id") or uuid.uuid4())
 
-    video_url = input_data.get("video_url")
-    if not video_url:
-        return {"error": "No video_url provided"}
+    analysis_fps = float(input_data.get("analysis_fps", 3.0))
+    resize_width = int(input_data.get("resize_width", 1280))
+    max_frames_raw = input_data.get("max_frames")
+    max_frames = int(max_frames_raw) if max_frames_raw else None
+    batch_size = int(input_data.get("batch_size") or os.environ.get("PROCESSING_BATCH_SIZE", "16"))
 
-    # Memory-aware defaults for long videos.
-    analysis_fps = float(input_data.get("analysis_fps", 1.0))
-    max_frames = int(input_data.get("max_frames", 5400))
-    resize_width = int(input_data.get("resize_width", 960))
+    work_dir = TMP_ROOT / job_id
+    work_dir.mkdir(parents=True, exist_ok=True)
+    video_path = work_dir / "input_video.mp4"
+    output_dir = work_dir / "outputs"
 
-    detect_passes = bool(input_data.get("detect_passes", True))
-    detect_shots = bool(input_data.get("detect_shots", True))
-    model_path = input_data.get("model_path", MODEL_PATH)
-    output_upload_url: Optional[str] = input_data.get("output_upload_url")
+    storage: Optional[ObjectStorageClient] = None
+    try:
+        storage = ObjectStorageClient()
+    except Exception:
+        storage = None
 
     try:
-        _download_video(video_url, INPUT_VIDEO_PATH)
-        source_meta = get_video_properties(INPUT_VIDEO_PATH)
+        video_object_key = input_data.get("video_object_key")
+        video_url = input_data.get("video_url")
+        if video_object_key:
+            if storage is None:
+                raise ValueError("Object storage is required when video_object_key is provided")
+            storage.download_file(video_object_key, str(video_path))
+        elif video_url:
+            _download_url(video_url, video_path)
+        else:
+            raise ValueError("video_object_key is required for production serverless jobs")
 
-        video_frames = read_video_sampled(
-            INPUT_VIDEO_PATH,
-            target_fps=analysis_fps,
-            max_frames=max_frames,
+        model_path = input_data.get("model_path") or DEFAULT_MODEL_PATH
+        model_object_key = input_data.get("model_object_key")
+        if model_object_key:
+            if storage is None:
+                raise ValueError("Object storage is required when model_object_key is provided")
+            model_path = str(work_dir / "model.pt")
+            storage.download_file(model_object_key, model_path)
+
+        if not Path(model_path).exists():
+            raise FileNotFoundError(f"Model file not found in worker: {model_path}")
+
+        result = run_batch_analysis(
+            job_id=job_id,
+            video_path=str(video_path),
+            model_path=str(model_path),
+            output_dir=output_dir,
+            analysis_fps=analysis_fps,
             resize_width=resize_width,
+            max_frames=max_frames,
+            batch_size=batch_size,
         )
+        report = result["report"]
+        paths = result["paths"]
 
-        if not video_frames:
-            return {"error": "Could not read video frames"}
-
-        tracker = Tracker(model_path)
-        tracks = tracker.get_object_tracks(video_frames)
-        tracker.add_position_to_tracks(tracks)
-
-        camera_estimator = CameraMovementEstimator(video_frames[0])
-        camera_movements = camera_estimator.get_camera_movement(video_frames)
-        camera_estimator.add_adjust_positions_to_tracks(tracks, camera_movements)
-
-        view_transformer = ViewTransformer()
-        view_transformer.add_transformed_position_to_tracks(tracks)
-
-        tracks["ball"] = tracker.interpolate_ball_positions(tracks["ball"])
-
-        speed_estimator = SpeedDistanceEstimator(frame_rate=int(analysis_fps) if analysis_fps >= 1 else 1)
-        speed_estimator.add_speed_and_distance_to_tracks(tracks)
-
-        if not tracks["players"] or not tracks["players"][0]:
-            return {"error": "No players detected in first frame"}
-
-        team_assigner = TeamAssigner()
-        team_assigner.assign_team_color(video_frames[0], tracks["players"][0])
-
-        for frame_num, player_track in enumerate(tracks["players"]):
-            for player_id, track in player_track.items():
-                team = team_assigner.get_player_team(video_frames[frame_num], track["bbox"], player_id)
-                tracks["players"][frame_num][player_id]["team"] = team
-
-        team_ball_control = []
-        ball_assigner = BallAssigner()
-
-        for frame_num, player_track in enumerate(tracks["players"]):
-            ball_frame = tracks["ball"][frame_num] if frame_num < len(tracks["ball"]) else {}
-            ball_bbox = ball_frame.get(1, {}).get("bbox")
-
-            if ball_bbox:
-                assigned_player = ball_assigner.assign_ball_to_player(player_track, ball_bbox)
-                if assigned_player != -1:
-                    tracks["players"][frame_num][assigned_player]["has_ball"] = True
-                    team_ball_control.append(tracks["players"][frame_num][assigned_player]["team"])
-                else:
-                    team_ball_control.append(team_ball_control[-1] if team_ball_control else 0)
-            else:
-                team_ball_control.append(team_ball_control[-1] if team_ball_control else 0)
-
-        team_ball_control_array = np.array(team_ball_control)
-
-        tactical_analyzer = TacticalAnalyzer()
-        tactical_report = tactical_analyzer.analyze_match(tracks, team_ball_control)
-
-        passes = []
-        if detect_passes:
-            pass_detector = PassDetector()
-            passes = pass_detector.detect_passes(tracks, team_ball_control)
-
-        shots = []
-        if detect_shots:
-            shot_detector = ShotDetector()
-            shots = shot_detector.detect_shots(tracks, team_ball_control)
-
-        output_frames = tracker.draw_annotations(video_frames, tracks, team_ball_control_array)
-        output_frames = camera_estimator.draw_camera_movement(output_frames, camera_movements)
-        output_frames = speed_estimator.draw_speed_and_distance(output_frames, tracks)
-        save_video(output_frames, OUTPUT_VIDEO_PATH, fps=analysis_fps if analysis_fps > 0 else 1)
-
-        total_possession = len(team_ball_control_array)
-        team1_poss = float((team_ball_control_array == 1).sum() / total_possession * 100) if total_possession > 0 else 0.0
-        team2_poss = float((team_ball_control_array == 2).sum() / total_possession * 100) if total_possession > 0 else 0.0
-
-        upload_result = None
-        if output_upload_url:
-            upload_result = _upload_file(output_upload_url, OUTPUT_VIDEO_PATH)
-
-        return {
-            "status": "completed",
-            "video_meta": {
-                "source": source_meta,
-                "processed_frames": len(video_frames),
-                "analysis_fps": analysis_fps,
-                "resize_width": resize_width,
-                "max_frames": max_frames,
-            },
-            "stats": {
-                "total_frames": len(video_frames),
-                "duration_seconds_processed": int(len(video_frames) / analysis_fps) if analysis_fps > 0 else 0,
-                "possession_team1": team1_poss,
-                "possession_team2": team2_poss,
-                "player_count": len(tracks["players"][0]) if tracks["players"] else 0,
-                "passes_detected": len(passes),
-                "shots_detected": len(shots),
-            },
-            "tactical_analysis": tactical_report,
-            "output": {
-                "local_path": OUTPUT_VIDEO_PATH,
-                "upload": upload_result,
-                "note": "Set output_upload_url input to persist the output video outside worker storage.",
-            },
+        artifacts = {
+            "annotated_video": _artifact_response(storage, job_id, "annotated_video", paths["annotated_video"], "video/mp4"),
+            "report_json": _artifact_response(storage, job_id, "report_json", paths["report_json"], "application/json"),
+            "report_csv": _artifact_response(storage, job_id, "report_csv", paths["report_csv"], "text/csv"),
         }
+        report["artifacts"] = artifacts
+        report["annotated_video_url"] = artifacts["annotated_video"].get("public_url")
+        report["report_json_url"] = artifacts["report_json"].get("public_url")
+        report["report_csv_url"] = artifacts["report_csv"].get("public_url")
+        report["status"] = "completed"
+        return report
 
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "error": str(exc),
+            "job_id": job_id,
+        }
 
 
 if __name__ == "__main__":
+    if runpod is None:
+        raise RuntimeError("runpod package is required to start the serverless worker")
     runpod.serverless.start({"handler": handler})

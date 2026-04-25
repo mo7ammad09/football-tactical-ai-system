@@ -11,3 +11,4 @@ pyyaml==6.0.1
 tqdm==4.66.1
 runpod==1.6.0
 requests==2.31.0
+boto3>=1.34.0

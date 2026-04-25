@@ -31,8 +31,46 @@ from src.speed_distance.speed_distance_estimator import SpeedDistanceEstimator
 from src.ai_analysis.ai_analyzer import AIAnalyzer
 from src.ai_analysis.video_ai_analyzer import VideoAIAnalyzer, MockVideoAnalyzer
 from src.visualizations.tactical_board import TacticalBoard
-from src.utils.video_utils import read_video, save_video
+from src.utils.video_utils import read_video, read_video_sampled, save_video, get_video_properties
+from src.api.runpod_serverless_client import RunPodServerlessClient
 from src.api.server_client import ServerClient
+
+
+VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
+SMALL_UPLOAD_LIMIT_MB = 512
+
+
+def list_input_videos(input_dir: str = "input_videos") -> list[Path]:
+    """Return local videos intended for large-match processing."""
+    root = Path(input_dir)
+    if not root.exists():
+        return []
+    return sorted(
+        [path for path in root.iterdir() if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def human_file_size(path: Path) -> str:
+    """Format a file size for UI labels."""
+    size = path.stat().st_size
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{size} B"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def save_uploaded_file_stream(uploaded_file, dest_path: str) -> None:
+    """Save a Streamlit upload in chunks instead of materializing getbuffer()."""
+    with open(dest_path, "wb") as f:
+        while True:
+            chunk = uploaded_file.read(1024 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+    uploaded_file.seek(0)
 
 
 # ==================== SESSION STATE ====================
@@ -44,6 +82,8 @@ if "video_path" not in st.session_state:
     st.session_state.video_path = None
 if "remote_server_url" not in st.session_state:
     st.session_state.remote_server_url = os.environ.get("REMOTE_GPU_URL", "http://localhost:8000")
+if "video_properties" not in st.session_state:
+    st.session_state.video_properties = None
 
 
 # ==================== SIDEBAR ====================
@@ -59,10 +99,11 @@ with st.sidebar:
 
     processing_mode = st.radio(
         "⚙️ وضع المعالجة:" if lang == "ar" else "⚙️ Processing Mode:",
-        ["Remote GPU", "Local"],
+        ["RunPod Serverless", "Remote GPU", "Local"],
         index=0
     )
     use_remote_gpu = processing_mode == "Remote GPU"
+    use_runpod_serverless = processing_mode == "RunPod Serverless"
 
     st.markdown("---")
     
@@ -134,6 +175,9 @@ with st.sidebar:
     
     st.markdown("---")
 
+    runpod_api_key = ""
+    runpod_endpoint_id = ""
+
     if use_remote_gpu:
         st.subheader("🌐 " + ("إعدادات السيرفر GPU" if lang == "ar" else "GPU Server Settings"))
         remote_server_url = st.text_input(
@@ -151,7 +195,8 @@ with st.sidebar:
 
         if st.button("🔎 اختبار الاتصال" if lang == "ar" else "🔎 Test Connection", use_container_width=True):
             try:
-                health_resp = requests.get(f"{remote_server_url.rstrip('/')}/health", timeout=10)
+                health_headers = {"Authorization": f"Bearer {remote_api_key}"} if remote_api_key else None
+                health_resp = requests.get(f"{remote_server_url.rstrip('/')}/health", headers=health_headers, timeout=10)
                 if health_resp.ok:
                     st.success("✅ السيرفر متصل وجاهز" if lang == "ar" else "✅ Server is reachable")
                 else:
@@ -159,24 +204,81 @@ with st.sidebar:
             except Exception as conn_err:
                 st.error(f"❌ {conn_err}")
 
+    elif use_runpod_serverless:
+        st.subheader("☁️ " + ("RunPod Serverless" if lang == "ar" else "RunPod Serverless"))
+        runpod_endpoint_id = st.text_input(
+            "Endpoint ID" if lang == "ar" else "Endpoint ID",
+            value=os.environ.get("RUNPOD_ENDPOINT_ID", ""),
+        )
+        runpod_api_key = st.text_input(
+            "RunPod API Key" if lang == "ar" else "RunPod API Key",
+            type="password",
+            value=os.environ.get("RUNPOD_API_KEY", ""),
+        )
+        st.caption(
+            "هذا الوضع يشغّل GPU تلقائياً عند إرسال job ويتوقف بعد الخمول حسب إعدادات RunPod."
+            if lang == "ar"
+            else "This mode starts GPU workers on demand and idles them down according to RunPod settings."
+        )
+
+        if st.button("🔎 اختبار RunPod" if lang == "ar" else "🔎 Test RunPod", use_container_width=True):
+            try:
+                if not runpod_endpoint_id or not runpod_api_key:
+                    raise ValueError("RUNPOD_ENDPOINT_ID and RUNPOD_API_KEY are required")
+                health_resp = requests.get(
+                    f"https://api.runpod.ai/v2/{runpod_endpoint_id}/health",
+                    headers={"Authorization": runpod_api_key},
+                    timeout=20,
+                )
+                if health_resp.ok:
+                    st.success("✅ RunPod endpoint جاهز" if lang == "ar" else "✅ RunPod endpoint is reachable")
+                    st.json(health_resp.json())
+                else:
+                    st.error(f"❌ RunPod health failed: {health_resp.status_code} {health_resp.text[:200]}")
+            except Exception as conn_err:
+                st.error(f"❌ {conn_err}")
+
+    if use_remote_gpu or use_runpod_serverless:
         analysis_fps_remote = st.number_input(
             "FPS للتحليل (أقل = أسرع)" if lang == "ar" else "Analysis FPS (lower = faster)",
-            min_value=0.2, max_value=30.0, value=1.0, step=0.2
+            min_value=0.5, max_value=30.0, value=3.0, step=0.5,
+            help=(
+                "2-4 FPS مناسب للمباراة الكاملة. ارفعها فقط للمقاطع القصيرة."
+                if lang == "ar"
+                else "2-4 FPS is suitable for a full match. Increase only for short clips."
+            )
         )
-        max_frames_remote = st.number_input(
-            "أقصى عدد فريمات" if lang == "ar" else "Max Frames",
-            min_value=300, max_value=20000, value=5400, step=300
+        analyze_full_match = st.checkbox(
+            "تحليل المباراة كاملة" if lang == "ar" else "Analyze full match",
+            value=True,
+            help=(
+                "إذا ألغيت الخيار سيتم تحليل أول عدد محدد من الفريمات فقط."
+                if lang == "ar"
+                else "Disable to cap processing to the first N sampled frames."
+            ),
         )
+        if analyze_full_match:
+            max_frames_remote = None
+        else:
+            max_frames_remote = st.number_input(
+                "أقصى عدد فريمات" if lang == "ar" else "Max Frames",
+                min_value=300, max_value=50000, value=5400, step=300
+            )
         resize_width_remote = st.number_input(
             "عرض الفريم قبل التحليل" if lang == "ar" else "Resize Width",
-            min_value=480, max_value=1920, value=960, step=80
+            min_value=480, max_value=1920, value=1280, step=80
+        )
+        st.caption(
+            "للمقاطع القصيرة: FPS=8 و Resize=1280. للمباريات الطويلة: FPS=2-4."
+            if lang == "ar"
+            else "For short clips: FPS=8 and Resize=1280. For long matches: FPS=2-4."
         )
     else:
         remote_server_url = ""
         remote_api_key = ""
-        analysis_fps_remote = 1.0
-        max_frames_remote = 5400
-        resize_width_remote = 960
+        analysis_fps_remote = 3.0
+        max_frames_remote = None
+        resize_width_remote = 1280
 
     st.markdown("---")
     
@@ -201,33 +303,81 @@ st.markdown("---")
 
 
 # ==================== VIDEO UPLOAD ====================
-if lang == "ar":
-    st.header("📹 رفع الفيديو")
-    uploaded_file = st.file_uploader("اسحب الفيديو هنا أو انقر للاختيار", type=["mp4", "avi", "mov"])
+st.header("📹 " + ("مصدر الفيديو" if lang == "ar" else "Video Source"))
+local_videos = list_input_videos()
+video_path = None
+uploaded_file = None
+
+source_mode = st.radio(
+    "اختر طريقة إدخال الفيديو" if lang == "ar" else "Choose video input method",
+    [
+        "اختيار ملف من input_videos" if lang == "ar" else "Select from input_videos",
+        "رفع اختبار صغير" if lang == "ar" else "Upload small test file",
+    ],
+    index=0,
+    horizontal=True,
+)
+
+if source_mode.startswith("اختيار") or source_mode.startswith("Select"):
+    if not local_videos:
+        st.warning(
+            "ضع ملفات المباريات الكبيرة داخل مجلد input_videos ثم أعد تحميل الصفحة."
+            if lang == "ar"
+            else "Place large match files in input_videos, then refresh the page."
+        )
+    else:
+        selected_video = st.selectbox(
+            "الفيديو المحلي" if lang == "ar" else "Local video",
+            local_videos,
+            format_func=lambda path: f"{path.name} ({human_file_size(path)})",
+        )
+        video_path = str(selected_video)
+        st.session_state.video_path = video_path
+        st.session_state.video_properties = get_video_properties(video_path)
 else:
-    st.header("📹 Upload Video")
-    uploaded_file = st.file_uploader("Drag video here or click to browse", type=["mp4", "avi", "mov"])
+    uploaded_file = st.file_uploader(
+        "اسحب فيديو قصير هنا أو انقر للاختيار" if lang == "ar" else "Drag a short test video here or click to browse",
+        type=["mp4", "avi", "mov", "mkv"],
+    )
+    if uploaded_file:
+        file_size_mb = (uploaded_file.size or 0) / (1024 * 1024)
+        if file_size_mb > SMALL_UPLOAD_LIMIT_MB:
+            st.warning(
+                f"هذا المسار للاختبارات الصغيرة فقط. لملف {file_size_mb:.1f} MB استخدم input_videos حتى لا يدخل الملف ذاكرة Streamlit."
+                if lang == "ar"
+                else f"This path is for small tests only. For a {file_size_mb:.1f} MB file, use input_videos to avoid Streamlit memory pressure."
+            )
+        os.makedirs("temp", exist_ok=True)
+        safe_upload_name = Path(uploaded_file.name).name
+        video_path = f"temp/{safe_upload_name}"
+        save_uploaded_file_stream(uploaded_file, video_path)
+        st.session_state.video_path = video_path
+        st.session_state.video_properties = get_video_properties(video_path)
 
-
-if uploaded_file:
-    # Save file
-    os.makedirs("temp", exist_ok=True)
-    video_path = f"temp/{uploaded_file.name}"
-    with open(video_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    st.session_state.video_path = video_path
-    
-    # Show video
+if video_path:
     col1, col2 = st.columns([2, 1])
+    file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
     with col1:
-        st.video(uploaded_file)
+        if file_size_mb <= SMALL_UPLOAD_LIMIT_MB:
+            st.video(video_path)
+        else:
+            st.info(
+                "تم اختيار ملف كبير. لن يتم عرضه داخل المتصفح لتجنب استهلاك الذاكرة."
+                if lang == "ar"
+                else "Large file selected. Browser preview is skipped to avoid memory use."
+            )
     with col2:
         st.markdown("### 📋 معلومات الفيديو" if lang == "ar" else "### 📋 Video Info")
-        file_size = len(uploaded_file.getvalue()) / (1024 * 1024)
-        st.info(f"{'الحجم' if lang == 'ar' else 'Size'}: {file_size:.1f} MB")
-        st.info(f"{'النوع' if lang == 'ar' else 'Type'}: {uploaded_file.type}")
-        
-        # Show model info
+        st.info(f"{'المسار' if lang == 'ar' else 'Path'}: {video_path}")
+        st.info(f"{'الحجم' if lang == 'ar' else 'Size'}: {file_size_mb:.1f} MB")
+        video_props = st.session_state.get("video_properties") or {}
+        duration_seconds = int(video_props.get("duration_seconds", 0) or 0)
+        if duration_seconds > 0:
+            mins = duration_seconds // 60
+            secs = duration_seconds % 60
+            st.info(f"{'المدة' if lang == 'ar' else 'Duration'}: {mins:02d}:{secs:02d}")
+        if video_props.get("fps"):
+            st.info(f"FPS: {float(video_props['fps']):.1f}")
         if use_real_model:
             st.success("🧠 " + ("سيتم استخدام النموذج الحقيقي" if lang == "ar" else "Real model will be used"))
         else:
@@ -236,9 +386,9 @@ if uploaded_file:
     remote_model_file = None
     remote_model_path = None
     remote_model_mode = None
-    if use_remote_gpu:
+    if use_remote_gpu or use_runpod_serverless:
         st.markdown("---")
-        st.subheader("🧠 " + ("الموديل على السيرفر GPU" if lang == "ar" else "Model on GPU Server"))
+        st.subheader("🧠 " + ("الموديل على GPU" if lang == "ar" else "Model on GPU"))
         remote_model_mode = st.radio(
             "طريقة تحديد الموديل" if lang == "ar" else "Model Source",
             [
@@ -299,6 +449,24 @@ if uploaded_file:
                     if not remote_server_url.strip():
                         raise ValueError("يرجى إدخال رابط سيرفر GPU" if lang == "ar" else "Please provide GPU server URL")
 
+                    props = st.session_state.get("video_properties") or {}
+                    duration_seconds = int(props.get("duration_seconds", 0) or 0)
+                    if duration_seconds > 0 and max_frames_remote:
+                        needed_frames = int(duration_seconds * float(analysis_fps_remote))
+                        if needed_frames > int(max_frames_remote):
+                            covered_minutes = (int(max_frames_remote) / float(analysis_fps_remote)) / 60.0
+                            st.warning(
+                                (
+                                    f"تنبيه: بالإعدادات الحالية سيُحلَّل فقط أول {covered_minutes:.1f} دقيقة من الفيديو. "
+                                    "ارفع Max Frames أو خفّض FPS."
+                                )
+                                if lang == "ar"
+                                else (
+                                    f"Note: with current settings, only the first {covered_minutes:.1f} minutes will be analyzed. "
+                                    "Increase Max Frames or lower FPS."
+                                )
+                            )
+
                     model_file_path = None
                     model_path_for_server = None
                     if remote_model_mode == "Use selected app model (recommended)":
@@ -318,8 +486,7 @@ if uploaded_file:
                             )
                         os.makedirs("temp", exist_ok=True)
                         model_file_path = f"temp/{remote_model_file.name}"
-                        with open(model_file_path, "wb") as mf:
-                            mf.write(remote_model_file.getbuffer())
+                        save_uploaded_file_stream(remote_model_file, model_file_path)
                     else:
                         if remote_model_path is None or not remote_model_path.strip():
                             raise ValueError(
@@ -333,24 +500,38 @@ if uploaded_file:
                     progress_bar.progress(5)
 
                     client = ServerClient(server_url=remote_server_url, api_key=remote_api_key or None)
+                    upload_started_at = time.time()
                     job_id = client.upload_video(
                         video_path=video_path,
                         progress_callback=lambda p: progress_bar.progress(max(5, min(int(p), 95))),
                         model_path=model_path_for_server,
                         model_file_path=model_file_path,
                         analysis_fps=float(analysis_fps_remote),
-                        max_frames=int(max_frames_remote),
+                        max_frames=int(max_frames_remote) if max_frames_remote else None,
                         resize_width=int(resize_width_remote),
                     )
+                    upload_elapsed_s = time.time() - upload_started_at
 
-                    status_text.info(f"🧠 Job ID: {job_id} - جاري المعالجة..." if lang == "ar" else f"🧠 Job ID: {job_id} - Processing...")
+                    status_text.info(
+                        (
+                            f"🧠 Job ID: {job_id} - انتهى الرفع خلال {upload_elapsed_s:.1f} ثانية. جاري المعالجة..."
+                            if lang == "ar"
+                            else f"🧠 Job ID: {job_id} - Upload finished in {upload_elapsed_s:.1f}s. Processing..."
+                        )
+                    )
                     progress_bar.progress(15)
 
+                    processing_started_at = time.time()
                     while True:
                         status = client.get_status(job_id)
                         progress_bar.progress(int(status.get("progress", 15)))
+                        processing_elapsed_s = time.time() - processing_started_at
                         status_text.info(
-                            f"⏳ {status.get('message', 'processing')}" if lang == "ar" else f"⏳ {status.get('message', 'processing')}"
+                            (
+                                f"⏳ {status.get('message', 'processing')} ({processing_elapsed_s:.1f}s)"
+                                if lang == "ar"
+                                else f"⏳ {status.get('message', 'processing')} ({processing_elapsed_s:.1f}s)"
+                            )
                         )
                         if status.get("status") == "completed":
                             break
@@ -363,6 +544,10 @@ if uploaded_file:
                     if video_url and video_url.startswith("/"):
                         video_url = f"{remote_server_url.rstrip('/')}{video_url}"
                     results["output_video"] = video_url
+                    for artifact_url_key in ("report_json_url", "report_csv_url"):
+                        artifact_url = results.get(artifact_url_key)
+                        if artifact_url and artifact_url.startswith("/"):
+                            results[artifact_url_key] = f"{remote_server_url.rstrip('/')}{artifact_url}"
 
                     st.session_state.analysis_results = results
                     st.session_state.analysis_done = True
@@ -378,8 +563,120 @@ if uploaded_file:
                             f"[⬇️ {'تحميل الفيديو الناتج' if lang == 'ar' else 'Download output video'}]({video_url})"
                         )
 
+                elif use_runpod_serverless:
+                    if not runpod_endpoint_id.strip() or not runpod_api_key.strip():
+                        raise ValueError(
+                            "أدخل RUNPOD_ENDPOINT_ID و RUNPOD_API_KEY."
+                            if lang == "ar"
+                            else "Please provide RUNPOD_ENDPOINT_ID and RUNPOD_API_KEY."
+                        )
+
+                    model_file_path = None
+                    model_path_for_worker = None
+                    if remote_model_mode == "Use selected app model (recommended)":
+                        if not use_real_model or not model_path or not os.path.exists(model_path):
+                            raise ValueError(
+                                "الموديل المحدد غير موجود محلياً. اختر Upload model file (.pt) أو أدخل مسار موديل داخل صورة RunPod."
+                                if lang == "ar"
+                                else "Selected model is not available locally. Choose Upload model file (.pt) or provide a model path inside the RunPod image."
+                            )
+                        model_file_path = model_path
+                    elif remote_model_mode == "Upload model file (.pt)":
+                        if remote_model_file is None:
+                            raise ValueError(
+                                "ارفع ملف موديل (.pt) أولاً."
+                                if lang == "ar"
+                                else "Please upload a model file (.pt) first."
+                            )
+                        os.makedirs("temp", exist_ok=True)
+                        model_file_path = f"temp/{remote_model_file.name}"
+                        save_uploaded_file_stream(remote_model_file, model_file_path)
+                    else:
+                        if remote_model_path is None or not remote_model_path.strip():
+                            raise ValueError(
+                                "أدخل مسار الموديل داخل صورة RunPod."
+                                if lang == "ar"
+                                else "Please provide a model path inside the RunPod image."
+                            )
+                        model_path_for_worker = remote_model_path.strip()
+
+                    status_text.info(
+                        "☁️ رفع الفيديو إلى التخزين ثم إرسال job إلى RunPod Serverless..."
+                        if lang == "ar"
+                        else "☁️ Uploading to object storage, then submitting RunPod Serverless job..."
+                    )
+                    progress_bar.progress(5)
+
+                    client = RunPodServerlessClient(
+                        api_key=runpod_api_key,
+                        endpoint_id=runpod_endpoint_id,
+                    )
+                    upload_started_at = time.time()
+                    job_id = client.upload_video(
+                        video_path=video_path,
+                        progress_callback=lambda p: progress_bar.progress(max(5, min(int(p), 95))),
+                        model_path=model_path_for_worker,
+                        model_file_path=model_file_path,
+                        analysis_fps=float(analysis_fps_remote),
+                        max_frames=int(max_frames_remote) if max_frames_remote else None,
+                        resize_width=int(resize_width_remote),
+                    )
+                    upload_elapsed_s = time.time() - upload_started_at
+
+                    status_text.info(
+                        (
+                            f"🧠 RunPod Job ID: {job_id} - أُرسل خلال {upload_elapsed_s:.1f} ثانية. جاري الانتظار..."
+                            if lang == "ar"
+                            else f"🧠 RunPod Job ID: {job_id} - Submitted in {upload_elapsed_s:.1f}s. Waiting..."
+                        )
+                    )
+                    progress_bar.progress(15)
+
+                    processing_started_at = time.time()
+                    while True:
+                        status = client.get_status(job_id)
+                        progress_bar.progress(int(status.get("progress", 15)))
+                        processing_elapsed_s = time.time() - processing_started_at
+                        status_text.info(
+                            (
+                                f"⏳ {status.get('message', 'processing')} ({processing_elapsed_s:.1f}s)"
+                                if lang == "ar"
+                                else f"⏳ {status.get('message', 'processing')} ({processing_elapsed_s:.1f}s)"
+                            )
+                        )
+                        if status.get("status") == "completed":
+                            break
+                        if status.get("status") == "failed":
+                            raise ValueError(status.get("message", "RunPod analysis failed"))
+                        time.sleep(10)
+
+                    results = client.get_results(job_id)
+                    video_url = results.get("annotated_video_url")
+                    results["output_video"] = video_url
+
+                    st.session_state.analysis_results = results
+                    st.session_state.analysis_done = True
+
+                    progress_bar.progress(100)
+                    status_text.success("✅ اكتمل التحليل عبر RunPod Serverless!" if lang == "ar" else "✅ RunPod Serverless analysis completed!")
+
+                    if video_url:
+                        st.markdown("---")
+                        st.subheader("🎬 " + ("الفيديو المعلّم (RunPod)" if lang == "ar" else "Annotated Video (RunPod)"))
+                        st.video(video_url)
+                        st.markdown(
+                            f"[⬇️ {'تحميل الفيديو الناتج' if lang == 'ar' else 'Download output video'}]({video_url})"
+                        )
+
                 elif use_real_model:
                     # ===== REAL MODEL ANALYSIS =====
+                    local_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+                    if local_size_mb > SMALL_UPLOAD_LIMIT_MB:
+                        raise ValueError(
+                            "المعالجة المحلية مخصصة للمقاطع الصغيرة. استخدم RunPod Serverless أو Remote GPU للمباريات الكبيرة."
+                            if lang == "ar"
+                            else "Local processing is for small clips. Use RunPod Serverless or Remote GPU for large matches."
+                        )
                     
                     # Step 1: Read video
                     status_text.info("📹 جاري قراءة الفيديو..." if lang == "ar" else "📹 Reading video...")
@@ -605,6 +902,11 @@ if st.session_state.analysis_done and st.session_state.analysis_results:
     
     results = st.session_state.analysis_results
     output_video = results.get("output_video")
+    warnings = results.get("warnings", [])
+    confidence = results.get("confidence", {})
+
+    if warnings:
+        st.warning("\n".join(f"- {warning}" for warning in warnings))
 
     if output_video:
         st.subheader("🎬 " + ("الفيديو الناتج" if lang == "ar" else "Output Video"))
@@ -622,6 +924,16 @@ if st.session_state.analysis_done and st.session_state.analysis_results:
                     mime="video/mp4",
                     use_container_width=True,
                 )
+
+    report_json_url = results.get("report_json_url")
+    report_csv_url = results.get("report_csv_url")
+    if report_json_url or report_csv_url:
+        st.markdown("### 📄 " + ("التقارير" if lang == "ar" else "Reports"))
+        cols = st.columns(2)
+        if report_json_url:
+            cols[0].markdown(f"[JSON report]({report_json_url})")
+        if report_csv_url:
+            cols[1].markdown(f"[CSV player report]({report_csv_url})")
     
     # Tabs
     tab_labels = ["📊 إحصائيات", "🎯 لوحة تكتيكية", "👥 لاعبين", "🤖 تحليل AI"] if lang == "ar" else ["📊 Stats", "🎯 Tactical", "👥 Players", "🤖 AI"]
@@ -633,17 +945,34 @@ if st.session_state.analysis_done and st.session_state.analysis_results:
         
         stats = results["stats"]
         tactical = results.get("tactical_analysis", {})
+
+        def metric_value(value, suffix=""):
+            if value is None:
+                return "غير متاح" if lang == "ar" else "Unavailable"
+            if isinstance(value, float):
+                return f"{value:.1f}{suffix}"
+            return f"{value}{suffix}"
         
         # Metrics
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            st.metric("استحواذ الفريق 1" if lang == "ar" else "Team 1 Possession", f"{stats['possession_team1']:.1f}%")
+            st.metric("استحواذ الفريق 1" if lang == "ar" else "Team 1 Possession", metric_value(stats.get("possession_team1"), "%"))
         with col2:
-            st.metric("استحواذ الفريق 2" if lang == "ar" else "Team 2 Possession", f"{stats['possession_team2']:.1f}%")
+            st.metric("استحواذ الفريق 2" if lang == "ar" else "Team 2 Possession", metric_value(stats.get("possession_team2"), "%"))
         with col3:
-            st.metric("التمريرات" if lang == "ar" else "Passes", stats.get("total_passes", 0))
+            st.metric("التمريرات" if lang == "ar" else "Passes", metric_value(stats.get("total_passes")))
         with col4:
-            st.metric("التسديدات" if lang == "ar" else "Shots", stats.get("total_shots", 0))
+            st.metric("التسديدات" if lang == "ar" else "Shots", metric_value(stats.get("total_shots")))
+
+        if confidence:
+            st.markdown("### " + ("الثقة" if lang == "ar" else "Confidence"))
+            st.dataframe(
+                pd.DataFrame(
+                    [{"metric": key, "confidence": value} for key, value in confidence.items()]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
         
         st.markdown("---")
         
@@ -654,8 +983,8 @@ if st.session_state.analysis_done and st.session_state.analysis_results:
             formation_data = {
                 "الفريق" if lang == "ar" else "Team": ["Team 1", "Team 2"],
                 "التشكيلة" if lang == "ar" else "Formation": [
-                    tactical.get("formation_team1", "4-3-3"),
-                    tactical.get("formation_team2", "4-4-2")
+                    tactical.get("formation_team1") or ("غير متاح" if lang == "ar" else "Unavailable"),
+                    tactical.get("formation_team2") or ("غير متاح" if lang == "ar" else "Unavailable")
                 ]
             }
             st.dataframe(pd.DataFrame(formation_data), use_container_width=True, hide_index=True)
@@ -671,66 +1000,68 @@ if st.session_state.analysis_done and st.session_state.analysis_results:
         st.subheader("📊 " + ("توزيع الاستحواذ" if lang == "ar" else "Possession"))
         
         fig, ax = plt.subplots(figsize=(10, 2))
-        possession = [stats["possession_team1"], stats["possession_team2"]]
-        colors = ['#2196F3', '#f44336']
-        ax.barh([''], [possession[0]], color=colors[0], height=0.5)
-        ax.barh([''], [possession[1]], left=[possession[0]], color=colors[1], height=0.5)
-        ax.set_xlim(0, 100)
-        ax.text(possession[0]/2, 0, f"Team 1\n{possession[0]:.1f}%", ha='center', va='center', color='white', fontweight='bold')
-        ax.text(possession[0] + possession[1]/2, 0, f"Team 2\n{possession[1]:.1f}%", ha='center', va='center', color='white', fontweight='bold')
-        ax.axis('off')
-        st.pyplot(fig)
+        if stats.get("possession_team1") is not None and stats.get("possession_team2") is not None:
+            possession = [stats["possession_team1"], stats["possession_team2"]]
+            colors = ['#2196F3', '#f44336']
+            ax.barh([''], [possession[0]], color=colors[0], height=0.5)
+            ax.barh([''], [possession[1]], left=[possession[0]], color=colors[1], height=0.5)
+            ax.set_xlim(0, 100)
+            ax.text(possession[0]/2, 0, f"Team 1\n{possession[0]:.1f}%", ha='center', va='center', color='white', fontweight='bold')
+            ax.text(possession[0] + possession[1]/2, 0, f"Team 2\n{possession[1]:.1f}%", ha='center', va='center', color='white', fontweight='bold')
+            ax.axis('off')
+            st.pyplot(fig)
+        else:
+            st.info("الاستحواذ غير متاح بثقة كافية." if lang == "ar" else "Possession is not available with enough confidence.")
     
     # ===== Tab 2: Tactical Board =====
     with tab2:
         st.subheader("🎯 " + ("اللوحة التكتيكية" if lang == "ar" else "Tactical Board"))
-        
-        board = TacticalBoard()
-        fig, ax = board.draw_pitch()
-        
-        # Sample positions
-        players = {
-            1: {"position": (15, 34), "team": 1, "has_ball": False},
-            2: {"position": (25, 20), "team": 1, "has_ball": True},
-            3: {"position": (25, 48), "team": 1, "has_ball": False},
-            4: {"position": (40, 34), "team": 1, "has_ball": False},
-            5: {"position": (85, 34), "team": 2, "has_ball": False},
-            6: {"position": (75, 20), "team": 2, "has_ball": False},
-            7: {"position": (75, 48), "team": 2, "has_ball": False},
-        }
-        
-        board.draw_players(ax, players, ball_position=(25, 34))
-        st.pyplot(fig)
-        
-        # Formation diagrams
-        st.markdown("---")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("⚔️ Team 1 (4-3-3)")
-            fig1, ax1 = board.create_formation_diagram("4-3-3", team=1)
-            st.pyplot(fig1)
-        with col2:
-            st.subheader("⚔️ Team 2 (4-4-2)")
-            fig2, ax2 = board.create_formation_diagram("4-4-2", team=2)
-            st.pyplot(fig2)
+        if (confidence or {}).get("field_calibration", 0) >= 0.5:
+            st.info(
+                "معايرة الملعب نجحت، لكن رسم اللوحة من بيانات المباراة سيضاف في الخطوة التالية."
+                if lang == "ar"
+                else "Field calibration passed, but match-derived board rendering is scheduled for the next step."
+            )
+        else:
+            st.info(
+                "اللوحة التكتيكية والتشكيلات معطّلة لأن معايرة الملعب غير موثوقة. هذا أفضل من عرض مواقع وهمية."
+                if lang == "ar"
+                else "Tactical board and formations are disabled because field calibration is not reliable. This avoids fake positions."
+            )
     
     # ===== Tab 3: Players =====
     with tab3:
         st.subheader("👥 " + ("إحصائيات اللاعبين" if lang == "ar" else "Player Statistics"))
-        
-        df = pd.DataFrame(results["player_stats"])
-        df.columns = ["ID", "Name", "Team", "Distance (km)", "Max Speed (km/h)"] if lang == "en" else ["الرقم", "الاسم", "الفريق", "المسافة (كم)", "أقصى سرعة (كم/س)"]
-        st.dataframe(df, use_container_width=True, hide_index=True)
-        
-        # Chart
-        st.markdown("---")
-        st.subheader("📊 " + ("المسافة المقطوعة" if lang == "ar" else "Distance Covered"))
-        
-        fig, ax = plt.subplots(figsize=(10, 4))
-        colors = ['#2196F3' if p["team"] == 1 else '#f44336' for p in results["player_stats"]]
-        ax.bar([p["name"] for p in results["player_stats"]], [p["distance_km"] for p in results["player_stats"]], color=colors)
-        ax.set_ylabel("km")
-        st.pyplot(fig)
+        player_stats = results.get("player_stats", [])
+        if not player_stats:
+            st.info("لا توجد بيانات لاعبين كافية." if lang == "ar" else "No player data available.")
+        else:
+            df = pd.DataFrame(player_stats)
+            rename_map = {
+                "id": "ID" if lang == "en" else "الرقم",
+                "name": "Name" if lang == "en" else "الاسم",
+                "team": "Team" if lang == "en" else "الفريق",
+                "frames_seen": "Frames Seen" if lang == "en" else "فريمات مرصودة",
+                "distance_km": "Distance (km)" if lang == "en" else "المسافة (كم)",
+                "max_speed_kmh": "Max Speed (km/h)" if lang == "en" else "أقصى سرعة (كم/س)",
+                "distance_speed_confidence": "Distance/Speed Confidence" if lang == "en" else "ثقة السرعة/المسافة",
+            }
+            st.dataframe(df.rename(columns=rename_map), use_container_width=True, hide_index=True)
+
+            if df["distance_km"].notna().any():
+                st.markdown("---")
+                st.subheader("📊 " + ("المسافة المقطوعة" if lang == "ar" else "Distance Covered"))
+                fig, ax = plt.subplots(figsize=(10, 4))
+                colors = ['#2196F3' if p.get("team") == 1 else '#f44336' for p in player_stats]
+                ax.bar([p["name"] for p in player_stats], [p["distance_km"] or 0 for p in player_stats], color=colors)
+                ax.set_ylabel("km")
+                st.pyplot(fig)
+            else:
+                st.info(
+                    "المسافة والسرعة غير معروضتين لأن معايرة الملعب غير موثوقة."
+                    if lang == "ar"
+                    else "Distance and speed are hidden because field calibration is not reliable."
+                )
     
     # ===== Tab 4: AI Analysis =====
     with tab4:
@@ -773,12 +1104,12 @@ if st.session_state.analysis_done and st.session_state.analysis_results:
                 video_frames = []
                 if st.session_state.get("video_path") and os.path.exists(st.session_state.video_path):
                     try:
-                        video_frames = read_video(st.session_state.video_path)
-                        # Limit frames for AI (too many = slow/expensive)
-                        if len(video_frames) > 50:
-                            # Take 10 evenly spaced frames
-                            indices = np.linspace(0, len(video_frames)-1, 10, dtype=int)
-                            video_frames = [video_frames[i] for i in indices]
+                        video_frames = read_video_sampled(
+                            st.session_state.video_path,
+                            target_fps=0.2,
+                            max_frames=10,
+                            resize_width=960,
+                        )
                     except:
                         pass
                 

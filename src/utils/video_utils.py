@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Iterator, List, Optional
 
 import cv2
 import numpy as np
@@ -66,6 +66,46 @@ def _read_video_with_opencv(
         cap.release()
 
     return frames
+
+
+def _iter_video_frames_with_opencv(
+    video_path: str,
+    target_fps: Optional[float] = None,
+    max_frames: Optional[int] = None,
+    resize_width: Optional[int] = None,
+) -> Iterator[np.ndarray]:
+    """Yield sampled frames using OpenCV without retaining the full video."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return
+
+    source_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    if target_fps and source_fps > 0:
+        step = max(1, int(round(source_fps / target_fps)))
+    else:
+        step = 1
+
+    emitted = 0
+    frame_idx = 0
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_idx % step == 0:
+                if resize_width and frame.shape[1] > resize_width:
+                    scale = resize_width / frame.shape[1]
+                    resized_height = int(frame.shape[0] * scale)
+                    frame = cv2.resize(frame, (resize_width, resized_height), interpolation=cv2.INTER_AREA)
+                yield frame
+                emitted += 1
+                if max_frames is not None and emitted >= max_frames:
+                    break
+
+            frame_idx += 1
+    finally:
+        cap.release()
 
 
 def _transcode_to_h264_mp4(video_path: str) -> Optional[str]:
@@ -154,6 +194,42 @@ def read_video_sampled(
             os.remove(transcoded_path)
 
     return frames
+
+
+def iter_video_frames_sampled(
+    video_path: str,
+    target_fps: Optional[float] = None,
+    max_frames: Optional[int] = None,
+    resize_width: Optional[int] = None,
+) -> Iterator[np.ndarray]:
+    """Yield sampled video frames without loading the full file into memory."""
+    cap = cv2.VideoCapture(video_path)
+    can_open = cap.isOpened()
+    cap.release()
+
+    if can_open:
+        yield from _iter_video_frames_with_opencv(
+            video_path=video_path,
+            target_fps=target_fps,
+            max_frames=max_frames,
+            resize_width=resize_width,
+        )
+        return
+
+    transcoded_path = _transcode_to_h264_mp4(video_path)
+    if not transcoded_path:
+        return
+
+    try:
+        yield from _iter_video_frames_with_opencv(
+            video_path=transcoded_path,
+            target_fps=target_fps,
+            max_frames=max_frames,
+            resize_width=resize_width,
+        )
+    finally:
+        if os.path.exists(transcoded_path):
+            os.remove(transcoded_path)
 
 
 def save_video(

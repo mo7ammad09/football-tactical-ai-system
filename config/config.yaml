@@ -9,8 +9,9 @@ video:
   target_resolution: [1920, 1080]
   fps: 30
   batch_size: 20
-  analysis_fps: 10
-  max_frames: 3000
+  analysis_fps: 3
+  max_frames: null  # null = full match
+  resize_width: 1280
 
 # Object Detection
 detection:

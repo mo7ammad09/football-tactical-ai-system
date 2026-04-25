@@ -82,13 +82,23 @@ python main.py --input input_videos/match.mp4 --output output_videos/analyzed.mp
 streamlit run Home.py
 ```
 
-### واجهة + GPU خارجي
-- من نفس الواجهة اختر `Processing Mode = Remote GPU`
-- أدخل رابط سيرفر الـGPU (FastAPI)
-- ارفع فيديو المباراة
+### واجهة + GPU خارجي تلقائي
+- من نفس الواجهة اختر `Processing Mode = RunPod Serverless`
+- أدخل `RUNPOD_ENDPOINT_ID` و `RUNPOD_API_KEY`
+- للمباريات الكبيرة: ضع الفيديو داخل `input_videos/` واختره من الواجهة
+- الرفع المباشر من المتصفح مخصص للمقاطع القصيرة فقط
 - اختر إما:
-  - `Model path on server` (مثل: `models/abdullah_yolov5.pt`)
+  - `Model path on server` (مثل: `models/abdullah_yolov5.pt` داخل صورة RunPod)
   - أو `Upload model file (.pt)` لرفع موديلك مع الطلب
+
+إعدادات v1 المقترحة للمباراة الكاملة:
+```bash
+analysis_fps=3
+resize_width=1280
+max_frames=0  # المباراة كاملة
+```
+
+النتائج حالياً محافظة: إذا فشلت معايرة الملعب تلقائياً، يعرض النظام فيديو detection وتقريراً أساسياً، ويوقف المسافة/السرعة/التشكيلات بدل عرض أرقام غير موثوقة.
 
 ### تشغيل جاهز بأوامر بسيطة
 ```bash

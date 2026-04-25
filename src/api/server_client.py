@@ -129,16 +129,13 @@ class ServerClient(AnalysisClient):
         tmp.write_text(json.dumps(state, ensure_ascii=True), encoding="utf-8")
         tmp.replace(self.STORAGE_STATE_FILE)
 
-    def _file_sha256(self, file_path: str) -> str:
-        """Compute SHA256 for a file path."""
-        h = hashlib.sha256()
-        with open(file_path, "rb") as f:
-            while True:
-                chunk = f.read(8 * 1024 * 1024)
-                if not chunk:
-                    break
-                h.update(chunk)
-        return h.hexdigest()
+    def _model_fingerprint(self, model_file_path: str) -> str:
+        """Fast cache key for local model file."""
+        stat = os.stat(model_file_path)
+        return (
+            f"{os.path.abspath(model_file_path)}|"
+            f"{stat.st_size}|{int(stat.st_mtime)}"
+        )
 
     def _get_cached_model_object_key(self, model_file_path: str) -> Optional[str]:
         """Return cached object key for model file, if present."""
@@ -147,7 +144,7 @@ class ServerClient(AnalysisClient):
         if not isinstance(cache, dict):
             return None
 
-        fp = self._file_sha256(model_file_path)
+        fp = self._model_fingerprint(model_file_path)
         entry = cache.get(fp)
         if isinstance(entry, str):
             return entry
@@ -164,7 +161,7 @@ class ServerClient(AnalysisClient):
         if not isinstance(cache, dict):
             cache = {}
 
-        fp = self._file_sha256(model_file_path)
+        fp = self._model_fingerprint(model_file_path)
         cache[fp] = {
             "object_key": object_key,
             "updated_at": int(time.time()),
@@ -531,7 +528,7 @@ class ServerClient(AnalysisClient):
         model_path: Optional[str],
         model_file_path: Optional[str],
         analysis_fps: float,
-        max_frames: int,
+        max_frames: Optional[int],
         resize_width: int,
         progress_callback: Optional[Callable[[int], None]],
     ) -> str:
@@ -564,9 +561,10 @@ class ServerClient(AnalysisClient):
         payload: Dict[str, Any] = {
             "video_object_key": video_object_key,
             "analysis_fps": float(analysis_fps),
-            "max_frames": int(max_frames),
             "resize_width": int(resize_width),
         }
+        if max_frames:
+            payload["max_frames"] = int(max_frames)
         if model_path:
             payload["model_path"] = model_path
         if model_object_key:
@@ -591,9 +589,9 @@ class ServerClient(AnalysisClient):
         progress_callback: Optional[Callable] = None,
         model_path: Optional[str] = None,
         model_file_path: Optional[str] = None,
-        analysis_fps: float = 1.0,
-        max_frames: int = 5400,
-        resize_width: int = 960,
+        analysis_fps: float = 3.0,
+        max_frames: Optional[int] = None,
+        resize_width: int = 1280,
     ) -> str:
         """Upload video to server and start job."""
         video_size = os.path.getsize(video_path)
@@ -622,7 +620,7 @@ class ServerClient(AnalysisClient):
 
         data = {
             "analysis_fps": str(analysis_fps),
-            "max_frames": str(max_frames),
+            "max_frames": str(int(max_frames) if max_frames else 0),
             "resize_width": str(resize_width),
         }
         if model_path:
@@ -671,7 +669,7 @@ class ServerClient(AnalysisClient):
         model_path: Optional[str],
         model_file_path: Optional[str],
         analysis_fps: float,
-        max_frames: int,
+        max_frames: Optional[int],
         resize_width: int,
         progress_callback: Optional[Callable],
     ) -> str:
@@ -705,7 +703,7 @@ class ServerClient(AnalysisClient):
             "video_file_name": os.path.basename(video_path),
             "video_total_chunks": str(video_total_chunks),
             "analysis_fps": str(analysis_fps),
-            "max_frames": str(max_frames),
+            "max_frames": str(int(max_frames) if max_frames else 0),
             "resize_width": str(resize_width),
             "model_total_chunks": str(model_total_chunks),
         }

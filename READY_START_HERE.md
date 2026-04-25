@@ -30,11 +30,14 @@ REMOTE_GPU_URL=http://YOUR_HOST:8000 bash scripts/start_ui.sh
 ```
 
 من الواجهة:
-- `Processing Mode = Remote GPU`
-- `Test Connection`
-- ارفع الفيديو
+- `Processing Mode = RunPod Serverless`
+- أدخل `RUNPOD_ENDPOINT_ID` و `RUNPOD_API_KEY`
+- `Test RunPod`
+- ضع فيديو المباراة في `input_videos/` ثم اختره من الواجهة
 - اختر موديل (مسار أو رفع ملف `.pt`)
 - `Start Analysis`
+
+للملفات الكبيرة لا تستخدم رفع المتصفح. هذا المسار مخصص للاختبارات الصغيرة فقط.
 
 ---
 

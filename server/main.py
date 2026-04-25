@@ -6,20 +6,35 @@ This runs on the GPU server and processes videos.
 from __future__ import annotations
 
 import os
+import csv
+import json
+import queue
 import shutil
+import sqlite3
+import threading
+import time
 import uuid
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
-import boto3
+import cv2
 import numpy as np
 import uvicorn
-from botocore.config import Config as BotoConfig
-from botocore.exceptions import ClientError
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks, Form, Request
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
+
+try:
+    import boto3
+    from botocore.config import Config as BotoConfig
+    from botocore.exceptions import ClientError
+except ImportError:  # pragma: no cover - exercised when server deps are not installed locally
+    boto3 = None
+    BotoConfig = None
+
+    class ClientError(Exception):
+        """Fallback when botocore is unavailable."""
 
 # Import our analysis modules
 import sys
@@ -30,8 +45,7 @@ from src.team_assigner.team_assigner import TeamAssigner
 from src.ball_assigner.ball_assigner import BallAssigner
 from src.camera_movement.camera_movement_estimator import CameraMovementEstimator
 from src.view_transformer.view_transformer import ViewTransformer
-from src.speed_distance.speed_distance_estimator import SpeedDistanceEstimator
-from src.utils.video_utils import read_video_sampled, save_video
+from src.utils.video_utils import get_video_properties, iter_video_frames_sampled
 
 
 app = FastAPI(
@@ -40,18 +54,283 @@ app = FastAPI(
     version="1.1.0"
 )
 
-# In-memory job storage (use Redis in production)
-jobs: Dict[str, Dict[str, Any]] = {}
+
+@app.middleware("http")
+async def require_api_key(request: Request, call_next):
+    """Enforce API key when GPU_API_KEY/REMOTE_GPU_API_KEY is configured."""
+    if not GPU_API_KEY:
+        return await call_next(request)
+
+    auth_header = request.headers.get("authorization", "")
+    bearer = auth_header.removeprefix("Bearer ").strip() if auth_header.startswith("Bearer ") else ""
+    api_key = request.headers.get("x-api-key", "").strip()
+
+    if bearer != GPU_API_KEY and api_key != GPU_API_KEY:
+        return JSONResponse(status_code=401, content={"detail": "Invalid or missing API key"})
+
+    return await call_next(request)
+
+
+def _connect_db() -> sqlite3.Connection:
+    """Open a SQLite connection for persistent job state."""
+    JOB_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(JOB_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_job_db() -> None:
+    """Create the job table if needed."""
+    with _connect_db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                progress INTEGER NOT NULL,
+                message TEXT NOT NULL,
+                video_path TEXT NOT NULL,
+                output_path TEXT,
+                settings_json TEXT NOT NULL,
+                results_json TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+
+
+def _row_to_job(row: sqlite3.Row) -> Dict[str, Any]:
+    """Convert a DB row to the runtime job dictionary."""
+    return {
+        "job_id": row["job_id"],
+        "status": row["status"],
+        "progress": int(row["progress"]),
+        "message": row["message"],
+        "video_path": row["video_path"],
+        "output_path": row["output_path"],
+        "settings": json.loads(row["settings_json"]),
+        "results": json.loads(row["results_json"]) if row["results_json"] else None,
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _insert_job(job: Dict[str, Any]) -> None:
+    """Persist a newly-created job."""
+    _init_job_db()
+    now = time.time()
+    with _connect_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs (
+                job_id, status, progress, message, video_path, output_path,
+                settings_json, results_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job["job_id"],
+                job["status"],
+                int(job["progress"]),
+                job["message"],
+                job["video_path"],
+                job.get("output_path"),
+                json.dumps(job["settings"], ensure_ascii=True),
+                json.dumps(job["results"], ensure_ascii=True) if job.get("results") else None,
+                now,
+                now,
+            ),
+        )
+
+
+def _get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    """Load a job by ID."""
+    _init_job_db()
+    with _connect_db() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+    return _row_to_job(row) if row else None
+
+
+def _update_job(job_id: str, **fields: Any) -> None:
+    """Update selected job fields."""
+    if not fields:
+        return
+
+    columns = []
+    values: List[Any] = []
+    for key, value in fields.items():
+        if key == "settings":
+            columns.append("settings_json = ?")
+            values.append(json.dumps(value, ensure_ascii=True))
+        elif key == "results":
+            columns.append("results_json = ?")
+            values.append(json.dumps(value, ensure_ascii=True))
+        elif key in {"status", "progress", "message", "video_path", "output_path"}:
+            columns.append(f"{key} = ?")
+            values.append(value)
+        else:
+            raise ValueError(f"Unsupported job field: {key}")
+
+    columns.append("updated_at = ?")
+    values.append(time.time())
+    values.append(job_id)
+
+    _init_job_db()
+    with _connect_db() as conn:
+        conn.execute(f"UPDATE jobs SET {', '.join(columns)} WHERE job_id = ?", values)
+
+
+def _worker_loop() -> None:
+    """Single-GPU processing loop."""
+    while True:
+        job_id = job_queue.get()
+        try:
+            process_video(job_id)
+        finally:
+            job_queue.task_done()
+
+
+def _ensure_worker_started() -> None:
+    """Start the background worker once."""
+    global worker_started
+    with worker_lock:
+        if worker_started:
+            return
+        thread = threading.Thread(target=_worker_loop, name="football-gpu-worker", daemon=True)
+        thread.start()
+        worker_started = True
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    """Initialize persistent job state and the single worker."""
+    _init_job_db()
+    _ensure_worker_started()
+
+
+def _normalize_color(color: Any, fallback: tuple[int, int, int] = (0, 0, 255)) -> tuple[int, int, int]:
+    """Convert model/KMeans colors into OpenCV BGR tuples."""
+    if color is None:
+        return fallback
+    try:
+        values = list(color)
+        if len(values) < 3:
+            return fallback
+        return tuple(int(max(0, min(255, v))) for v in values[:3])
+    except Exception:
+        return fallback
+
+
+def _create_video_writer(output_path: Path, first_frame: np.ndarray, fps: float) -> cv2.VideoWriter:
+    """Create a browser-friendly OpenCV video writer."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    height, width = first_frame.shape[:2]
+    for codec in ("avc1", "mp4v", "H264"):
+        fourcc = cv2.VideoWriter_fourcc(*codec)
+        writer = cv2.VideoWriter(str(output_path), fourcc, max(1.0, float(fps)), (width, height))
+        if writer.isOpened():
+            return writer
+        writer.release()
+    raise ValueError(f"Could not initialize video writer for: {output_path}")
+
+
+def _draw_review_frame(
+    tracker: Tracker,
+    frame: np.ndarray,
+    player_track: Dict,
+    referee_track: Dict,
+    ball_track: Dict,
+    team_ball_counts: Dict[int, int],
+    processed_frames: int,
+) -> np.ndarray:
+    """Draw lightweight review annotations for one sampled frame."""
+    out = frame.copy()
+
+    for track_id, player in player_track.items():
+        color = _normalize_color(player.get("team_color"), (0, 0, 255))
+        out = tracker.draw_ellipse(out, player["bbox"], color, track_id)
+        if player.get("has_ball", False):
+            out = tracker.draw_triangle(out, player["bbox"], (0, 0, 255))
+
+    for _, referee in referee_track.items():
+        out = tracker.draw_ellipse(out, referee["bbox"], (0, 255, 255))
+
+    for _, ball in ball_track.items():
+        out = tracker.draw_triangle(out, ball["bbox"], (0, 255, 0))
+
+    height, width = out.shape[:2]
+    panel_w = min(520, max(320, width // 3))
+    panel_h = 110
+    x1 = max(0, width - panel_w - 24)
+    y1 = max(0, height - panel_h - 24)
+    overlay = out.copy()
+    cv2.rectangle(overlay, (x1, y1), (x1 + panel_w, y1 + panel_h), (255, 255, 255), -1)
+    cv2.addWeighted(overlay, 0.55, out, 0.45, 0, out)
+
+    counted = team_ball_counts.get(1, 0) + team_ball_counts.get(2, 0)
+    if counted > 0:
+        team1 = team_ball_counts.get(1, 0) / counted * 100
+        team2 = team_ball_counts.get(2, 0) / counted * 100
+        cv2.putText(out, f"Team 1 possession: {team1:.1f}%", (x1 + 16, y1 + 42), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+        cv2.putText(out, f"Team 2 possession: {team2:.1f}%", (x1 + 16, y1 + 82), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+    else:
+        cv2.putText(out, "Possession: unavailable", (x1 + 16, y1 + 58), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+
+    cv2.putText(out, f"Frame sample: {processed_frames}", (16, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    return out
+
+
+def _estimate_sample_count(video_path: str, analysis_fps: float, max_frames: Optional[int]) -> Optional[int]:
+    """Estimate sampled frames for progress reporting."""
+    props = get_video_properties(video_path)
+    duration = props.get("duration_seconds") or 0
+    if duration <= 0:
+        return max_frames
+    estimated = max(1, int(duration * analysis_fps))
+    if max_frames:
+        estimated = min(estimated, max_frames)
+    return estimated
+
+
+def _write_report_files(job_id: str, report: Dict[str, Any], player_stats: List[Dict[str, Any]]) -> Dict[str, Path]:
+    """Write JSON and CSV report artifacts."""
+    report_dir = Path("outputs") / "reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    json_path = report_dir / f"{job_id}_report.json"
+    csv_path = report_dir / f"{job_id}_players.csv"
+
+    json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    fieldnames = ["id", "name", "team", "frames_seen", "distance_km", "max_speed_kmh", "distance_speed_confidence"]
+    with open(csv_path, "w", encoding="utf-8", newline="") as csv_f:
+        writer = csv.DictWriter(csv_f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in player_stats:
+            writer.writerow({key: row.get(key) for key in fieldnames})
+
+    return {"report_json": json_path, "report_csv": csv_path}
 
 # Default model path
 DEFAULT_MODEL_PATH = os.environ.get("MODEL_PATH", "models/best.pt")
 CHUNK_ROOT = Path("uploads") / "_chunked"
+JOB_DB_PATH = Path(os.environ.get("JOB_DB_PATH", "jobs.sqlite3"))
 OBJECT_STORAGE_BUCKET = os.environ.get("OBJECT_STORAGE_BUCKET", "").strip()
 OBJECT_STORAGE_REGION = os.environ.get("OBJECT_STORAGE_REGION", "us-east-1").strip() or "us-east-1"
 OBJECT_STORAGE_ENDPOINT_URL = os.environ.get("OBJECT_STORAGE_ENDPOINT_URL", "").strip() or None
 OBJECT_STORAGE_PREFIX = os.environ.get("OBJECT_STORAGE_PREFIX", "football-ai").strip().strip("/")
 OBJECT_STORAGE_URL_EXPIRES = int(os.environ.get("OBJECT_STORAGE_URL_EXPIRES", "3600"))
 OBJECT_STORAGE_PUBLIC_BASE_URL = os.environ.get("OBJECT_STORAGE_PUBLIC_BASE_URL", "").strip().rstrip("/")
+GPU_API_KEY = (
+    os.environ.get("GPU_API_KEY")
+    or os.environ.get("REMOTE_GPU_API_KEY")
+    or ""
+).strip()
+PROCESSING_BATCH_SIZE = int(os.environ.get("PROCESSING_BATCH_SIZE", "16"))
+
+job_queue: "queue.Queue[str]" = queue.Queue()
+worker_started = False
+worker_lock = threading.Lock()
 
 
 class JobStatus(BaseModel):
@@ -112,14 +391,14 @@ class StartFromStorageRequest(BaseModel):
     video_object_key: str
     model_object_key: Optional[str] = None
     model_path: Optional[str] = None
-    analysis_fps: float = 1.0
-    max_frames: int = 5400
-    resize_width: int = 960
+    analysis_fps: float = 3.0
+    max_frames: Optional[int] = None
+    resize_width: int = 1280
 
 
 def _is_object_storage_enabled() -> bool:
     """Return True when object storage has minimum config."""
-    return bool(OBJECT_STORAGE_BUCKET)
+    return bool(OBJECT_STORAGE_BUCKET and boto3 is not None)
 
 
 def _storage_error() -> HTTPException:
@@ -137,7 +416,7 @@ def _storage_error() -> HTTPException:
 def _get_s3_client():
     """Create and cache S3-compatible client."""
     if not _is_object_storage_enabled():
-        raise RuntimeError("Object storage is not configured")
+        raise RuntimeError("Object storage is not configured or boto3 is not installed")
 
     access_key = os.environ.get("OBJECT_STORAGE_ACCESS_KEY_ID") or os.environ.get("AWS_ACCESS_KEY_ID")
     secret_key = os.environ.get("OBJECT_STORAGE_SECRET_ACCESS_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY")
@@ -168,6 +447,26 @@ def _download_from_object_storage(object_key: str, local_path: Path) -> None:
     """Download object to local path."""
     local_path.parent.mkdir(parents=True, exist_ok=True)
     _get_s3_client().download_file(OBJECT_STORAGE_BUCKET, object_key, str(local_path))
+
+
+def _artifact_object_key(job_id: str, local_path: Path) -> str:
+    """Return the object key used for final artifacts."""
+    prefix = OBJECT_STORAGE_PREFIX.strip("/")
+    safe_name = _safe_name(local_path.name, "artifact.bin")
+    return f"{prefix}/artifacts/{job_id}/{safe_name}" if prefix else f"artifacts/{job_id}/{safe_name}"
+
+
+def _upload_artifact(job_id: str, local_path: Path, content_type: str) -> Dict[str, Optional[str]]:
+    """Upload an output artifact to object storage when configured."""
+    if not _is_object_storage_enabled():
+        return {"object_key": None, "public_url": None}
+
+    object_key = _artifact_object_key(job_id, local_path)
+    extra_args = {"ContentType": content_type}
+    _get_s3_client().upload_file(str(local_path), OBJECT_STORAGE_BUCKET, object_key, ExtraArgs=extra_args)
+
+    public_url = f"{OBJECT_STORAGE_PUBLIC_BASE_URL}/{object_key}" if OBJECT_STORAGE_PUBLIC_BASE_URL else None
+    return {"object_key": object_key, "public_url": public_url}
 
 
 def _safe_name(filename: str, fallback: str) -> str:
@@ -230,32 +529,36 @@ def _create_job(
     video_path: Path,
     chosen_model_path: str,
     analysis_fps: float,
-    max_frames: int,
+    max_frames: Optional[int],
     resize_width: int,
     video_object_key: Optional[str] = None,
     model_object_key: Optional[str] = None,
 ) -> Dict[str, str]:
     """Create and enqueue a processing job."""
     job_id = str(uuid.uuid4())
+    normalized_max_frames = int(max_frames) if max_frames else None
 
-    jobs[job_id] = {
+    job = {
+        "job_id": job_id,
         "status": "pending",
         "progress": 0,
-        "message": "Video uploaded, waiting for processing",
+        "message": "Job queued for GPU processing",
         "video_path": str(video_path),
         "output_path": None,
         "results": None,
         "settings": {
             "model_path": chosen_model_path,
             "analysis_fps": max(0.1, float(analysis_fps)),
-            "max_frames": max(1, int(max_frames)),
+            "max_frames": normalized_max_frames if normalized_max_frames and normalized_max_frames > 0 else None,
             "resize_width": max(256, int(resize_width)),
             "video_object_key": video_object_key,
             "model_object_key": model_object_key,
         },
     }
 
-    background_tasks.add_task(process_video, job_id)
+    _insert_job(job)
+    _ensure_worker_started()
+    job_queue.put(job_id)
     return {"job_id": job_id, "status": "pending"}
 
 
@@ -264,9 +567,9 @@ async def upload_video(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     model_path: Optional[str] = Form(default=None),
-    analysis_fps: float = Form(default=1.0),
-    max_frames: int = Form(default=5400),
-    resize_width: int = Form(default=960),
+    analysis_fps: float = Form(default=3.0),
+    max_frames: int = Form(default=0),
+    resize_width: int = Form(default=1280),
     model_file: Optional[UploadFile] = File(default=None),
 ):
     """Upload video for analysis.
@@ -332,9 +635,9 @@ async def upload_finalize(
     model_path: Optional[str] = Form(default=None),
     model_file_name: Optional[str] = Form(default=None),
     model_total_chunks: int = Form(default=0),
-    analysis_fps: float = Form(default=1.0),
-    max_frames: int = Form(default=5400),
-    resize_width: int = Form(default=960),
+    analysis_fps: float = Form(default=3.0),
+    max_frames: int = Form(default=0),
+    resize_width: int = Form(default=1280),
 ):
     """Finalize chunked upload, assemble files, and start processing."""
     chunk_root = CHUNK_ROOT / upload_id
@@ -593,10 +896,10 @@ async def start_job_from_storage(
 @app.get("/status/{job_id}", response_model=JobStatus)
 async def get_status(job_id: str):
     """Get processing status."""
-    if job_id not in jobs:
+    job = _get_job(job_id)
+    if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    job = jobs[job_id]
     return JobStatus(
         job_id=job_id,
         status=job["status"],
@@ -608,10 +911,10 @@ async def get_status(job_id: str):
 @app.get("/results/{job_id}")
 async def get_results(job_id: str):
     """Get analysis results."""
-    if job_id not in jobs:
+    job = _get_job(job_id)
+    if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    job = jobs[job_id]
     if job["status"] != "completed":
         raise HTTPException(status_code=400, detail="Analysis not complete")
 
@@ -621,18 +924,46 @@ async def get_results(job_id: str):
 @app.get("/video/{job_id}")
 async def get_video(job_id: str):
     """Download annotated video."""
-    if job_id not in jobs:
+    job = _get_job(job_id)
+    if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    job = jobs[job_id]
     video_path = job.get("output_path")
 
     if not video_path or not os.path.exists(video_path):
+        results = job.get("results") or {}
+        artifact = results.get("artifacts", {}).get("annotated_video", {})
+        public_url = artifact.get("public_url")
+        if public_url:
+            return RedirectResponse(public_url)
         raise HTTPException(status_code=404, detail="Video not found")
 
     ext = Path(video_path).suffix.lower() or ".mp4"
     media_type = "video/mp4" if ext == ".mp4" else "video/x-msvideo"
     return FileResponse(video_path, media_type=media_type, filename=f"{job_id}_analyzed{ext}")
+
+
+@app.get("/artifact/{job_id}/{artifact_name}")
+async def get_artifact(job_id: str, artifact_name: str):
+    """Download a generated report artifact."""
+    job = _get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    results = job.get("results") or {}
+    artifact = results.get("artifacts", {}).get(artifact_name)
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    public_url = artifact.get("public_url")
+    local_path = artifact.get("local_path")
+    if local_path and os.path.exists(local_path):
+        media_type = artifact.get("content_type") or "application/octet-stream"
+        return FileResponse(local_path, media_type=media_type, filename=Path(local_path).name)
+    if public_url:
+        return RedirectResponse(public_url)
+
+    raise HTTPException(status_code=404, detail="Artifact not found")
 
 
 @app.get("/health")
@@ -642,12 +973,17 @@ async def health_check():
         "status": "healthy",
         "default_model_exists": os.path.exists(DEFAULT_MODEL_PATH),
         "object_storage_enabled": _is_object_storage_enabled(),
+        "job_store": str(JOB_DB_PATH),
+        "queue_size": job_queue.qsize(),
+        "auth_enabled": bool(GPU_API_KEY),
     }
 
 
 def process_video(job_id: str) -> None:
     """Process video in background."""
-    job = jobs[job_id]
+    job = _get_job(job_id)
+    if job is None:
+        return
 
     try:
         video_path = job["video_path"]
@@ -659,17 +995,14 @@ def process_video(job_id: str) -> None:
         analysis_fps = settings["analysis_fps"]
         max_frames = settings["max_frames"]
         resize_width = settings["resize_width"]
+        warnings: List[str] = []
 
         if video_object_key:
-            job["status"] = "processing"
-            job["message"] = "Downloading video from object storage"
-            job["progress"] = 2
+            _update_job(job_id, status="processing", message="Downloading video from object storage", progress=2)
             _download_from_object_storage(video_object_key, Path(video_path))
 
         if model_object_key:
-            job["status"] = "processing"
-            job["message"] = "Downloading model from object storage"
-            job["progress"] = 4
+            _update_job(job_id, status="processing", message="Downloading model from object storage", progress=4)
             _download_from_object_storage(model_object_key, Path(model_path))
 
         if not os.path.exists(video_path) or os.path.getsize(video_path) <= 0:
@@ -681,143 +1014,267 @@ def process_video(job_id: str) -> None:
                 "Upload a model file or provide a valid model path."
             )
 
-        job["status"] = "processing"
-        job["message"] = "Reading video"
-        job["progress"] = 5
+        _update_job(job_id, status="processing", message="Initializing tracker", progress=8)
+        tracker = Tracker(model_path)
+        team_assigner = TeamAssigner()
+        ball_assigner = BallAssigner()
+        view_transformer = ViewTransformer()
 
-        video_frames = read_video_sampled(
-            video_path,
-            target_fps=analysis_fps,
-            max_frames=max_frames,
-            resize_width=resize_width,
-        )
+        estimated_frames = _estimate_sample_count(video_path, float(analysis_fps), max_frames)
+        props = get_video_properties(video_path)
+        output_dir = Path("outputs")
+        output_path = output_dir / f"{job_id}_output.mp4"
+        writer: Optional[cv2.VideoWriter] = None
 
-        if not video_frames:
-            raise ValueError(
-                f"Could not read video: {video_path}. "
-                "Try MP4 (H.264) or re-upload the file."
+        processed_frames = 0
+        player_frame_detections = 0
+        referee_frame_detections = 0
+        ball_detections = 0
+        max_players_in_frame = 0
+        team_ball_counts = {1: 0, 2: 0}
+        last_team_control = 0
+        player_summary: Dict[int, Dict[str, Any]] = {}
+        calibration_checked = False
+        field_calibration_confidence = 0.0
+
+        batch: List[np.ndarray] = []
+        _update_job(job_id, status="processing", message="Reading sampled frames", progress=12)
+
+        def process_batch(frames: List[np.ndarray]) -> None:
+            nonlocal writer
+            nonlocal processed_frames
+            nonlocal player_frame_detections
+            nonlocal referee_frame_detections
+            nonlocal ball_detections
+            nonlocal max_players_in_frame
+            nonlocal last_team_control
+            nonlocal calibration_checked
+            nonlocal field_calibration_confidence
+
+            if not frames:
+                return
+
+            batch_tracks = tracker.get_object_tracks_for_frames(frames)
+            tracker.add_position_to_tracks(batch_tracks)
+
+            if not calibration_checked:
+                transformed = 0
+                total_positions = 0
+                for player_track in batch_tracks["players"]:
+                    for track in player_track.values():
+                        total_positions += 1
+                        if view_transformer.transform_point(track.get("position")) is not None:
+                            transformed += 1
+                field_calibration_confidence = transformed / total_positions if total_positions else 0.0
+                calibration_checked = True
+                if field_calibration_confidence < 0.5:
+                    warnings.append(
+                        "Field calibration confidence is low; distance, speed, formation, and tactical board metrics are disabled."
+                    )
+
+            if team_assigner.kmeans is None:
+                for frame, player_track in zip(frames, batch_tracks["players"]):
+                    if len(player_track) >= 2:
+                        try:
+                            team_assigner.assign_team_color(frame, player_track)
+                        except Exception as exc:
+                            warnings.append(f"Team color assignment failed on an early frame: {exc}")
+                        break
+
+            for local_idx, frame in enumerate(frames):
+                player_track = batch_tracks["players"][local_idx]
+                referee_track = batch_tracks["referees"][local_idx]
+                ball_track = batch_tracks["ball"][local_idx]
+
+                max_players_in_frame = max(max_players_in_frame, len(player_track))
+                player_frame_detections += len(player_track)
+                referee_frame_detections += len(referee_track)
+                if ball_track:
+                    ball_detections += 1
+
+                for player_id, track in player_track.items():
+                    team = 0
+                    if team_assigner.kmeans is not None:
+                        try:
+                            team = team_assigner.get_player_team(frame, track["bbox"], player_id)
+                        except Exception:
+                            team = 0
+                    track["team"] = int(team)
+                    track["team_color"] = team_assigner.team_colors.get(team, (128, 128, 128))
+
+                    summary = player_summary.setdefault(
+                        int(player_id),
+                        {
+                            "id": int(player_id),
+                            "name": f"Player {player_id}",
+                            "team": int(team),
+                            "frames_seen": 0,
+                            "distance_km": None,
+                            "max_speed_kmh": None,
+                            "distance_speed_confidence": 0.0,
+                        },
+                    )
+                    summary["frames_seen"] += 1
+                    if team:
+                        summary["team"] = int(team)
+
+                ball_bbox = ball_track.get(1, {}).get("bbox") if ball_track else None
+                assigned_player = -1
+                if ball_bbox:
+                    assigned_player = ball_assigner.assign_ball_to_player(player_track, ball_bbox)
+                if assigned_player != -1 and assigned_player in player_track:
+                    player_track[assigned_player]["has_ball"] = True
+                    last_team_control = int(player_track[assigned_player].get("team", 0))
+
+                if last_team_control in team_ball_counts:
+                    team_ball_counts[last_team_control] += 1
+
+                processed_frames += 1
+                annotated = _draw_review_frame(
+                    tracker=tracker,
+                    frame=frame,
+                    player_track=player_track,
+                    referee_track=referee_track,
+                    ball_track=ball_track,
+                    team_ball_counts=team_ball_counts,
+                    processed_frames=processed_frames,
+                )
+                if writer is None:
+                    writer = _create_video_writer(output_path, annotated, float(analysis_fps))
+                writer.write(annotated)
+
+            if estimated_frames:
+                progress = min(90, 12 + int((processed_frames / max(1, estimated_frames)) * 78))
+            else:
+                progress = min(90, 12 + processed_frames // 50)
+            _update_job(
+                job_id,
+                status="processing",
+                message=f"Processed {processed_frames} sampled frames",
+                progress=progress,
             )
 
-        job["message"] = "Initializing tracker"
-        job["progress"] = 12
-        tracker = Tracker(model_path)
+        for frame in iter_video_frames_sampled(
+            video_path,
+            target_fps=float(analysis_fps),
+            max_frames=max_frames,
+            resize_width=int(resize_width),
+        ):
+            batch.append(frame)
+            if len(batch) >= max(1, PROCESSING_BATCH_SIZE):
+                process_batch(batch)
+                batch = []
 
-        job["message"] = "Detecting and tracking objects"
-        job["progress"] = 25
-        tracks = tracker.get_object_tracks(video_frames)
-        tracker.add_position_to_tracks(tracks)
+        process_batch(batch)
 
-        job["message"] = "Estimating camera movement"
-        job["progress"] = 40
-        camera_estimator = CameraMovementEstimator(video_frames[0])
-        camera_movements = camera_estimator.get_camera_movement(video_frames)
-        camera_estimator.add_adjust_positions_to_tracks(tracks, camera_movements)
+        if writer is not None:
+            writer.release()
 
-        job["message"] = "Transforming coordinates"
-        job["progress"] = 50
-        view_transformer = ViewTransformer()
-        view_transformer.add_transformed_position_to_tracks(tracks)
+        if processed_frames == 0:
+            raise ValueError(
+                f"Could not read video: {video_path}. Try MP4 (H.264) or re-upload the file."
+            )
 
-        job["message"] = "Interpolating ball positions"
-        job["progress"] = 58
-        tracks["ball"] = tracker.interpolate_ball_positions(tracks["ball"])
+        if team_assigner.kmeans is None:
+            warnings.append("Team assignment was unavailable because not enough players were detected in any sampled frame.")
 
-        job["message"] = "Calculating speed and distance"
-        job["progress"] = 66
-        speed_estimator = SpeedDistanceEstimator(frame_rate=max(1, int(round(analysis_fps))))
-        speed_estimator.add_speed_and_distance_to_tracks(tracks)
+        counted_possession = team_ball_counts[1] + team_ball_counts[2]
+        possession_team1 = (team_ball_counts[1] / counted_possession * 100.0) if counted_possession else None
+        possession_team2 = (team_ball_counts[2] / counted_possession * 100.0) if counted_possession else None
+        possession_confidence = counted_possession / processed_frames if processed_frames else 0.0
 
-        if not tracks["players"] or not tracks["players"][0]:
-            raise ValueError("No players detected in first frame")
-
-        job["message"] = "Assigning teams"
-        job["progress"] = 74
-        team_assigner = TeamAssigner()
-        team_assigner.assign_team_color(video_frames[0], tracks["players"][0])
-
-        for frame_num, player_track in enumerate(tracks["players"]):
-            for player_id, track in player_track.items():
-                team = team_assigner.get_player_team(video_frames[frame_num], track["bbox"], player_id)
-                tracks["players"][frame_num][player_id]["team"] = team
-                tracks["players"][frame_num][player_id]["team_color"] = team_assigner.team_colors[team]
-
-        job["message"] = "Assigning ball possession"
-        job["progress"] = 82
-        ball_assigner = BallAssigner()
-        team_ball_control = []
-
-        for frame_num, player_track in enumerate(tracks["players"]):
-            ball_frame = tracks["ball"][frame_num] if frame_num < len(tracks["ball"]) else {}
-            ball_bbox = ball_frame.get(1, {}).get("bbox")
-
-            if ball_bbox:
-                assigned_player = ball_assigner.assign_ball_to_player(player_track, ball_bbox)
-                if assigned_player != -1:
-                    tracks["players"][frame_num][assigned_player]["has_ball"] = True
-                    team_ball_control.append(tracks["players"][frame_num][assigned_player]["team"])
-                else:
-                    team_ball_control.append(team_ball_control[-1] if team_ball_control else 0)
-            else:
-                team_ball_control.append(team_ball_control[-1] if team_ball_control else 0)
-
-        team_ball_control_np = np.array(team_ball_control)
-
-        job["message"] = "Drawing annotations"
-        job["progress"] = 92
-        output_frames = tracker.draw_annotations(video_frames, tracks, team_ball_control_np)
-        output_frames = camera_estimator.draw_camera_movement(output_frames, camera_movements)
-        output_frames = speed_estimator.draw_speed_and_distance(output_frames, tracks)
-
-        output_dir = Path("outputs")
-        output_dir.mkdir(exist_ok=True)
-        output_path = output_dir / f"{job_id}_output.mp4"
-        save_video(output_frames, str(output_path), fps=analysis_fps)
-
-        total_possession = len(team_ball_control_np)
-        possession_team1 = float((team_ball_control_np == 1).sum() / total_possession * 100) if total_possession > 0 else 50.0
-        possession_team2 = float((team_ball_control_np == 2).sum() / total_possession * 100) if total_possession > 0 else 50.0
-
-        player_stats = []
-        last_frame_idx = len(tracks["players"]) - 1
-        if tracks["players"] and tracks["players"][last_frame_idx]:
-            for player_id, track in tracks["players"][last_frame_idx].items():
-                player_stats.append({
-                    "id": int(player_id),
-                    "name": f"Player {player_id}",
-                    "team": int(track.get("team", 1)),
-                    "distance_km": float(track.get("distance", 0)) / 1000.0,
-                    "max_speed_kmh": float(track.get("speed", 0)),
-                })
-
-        job["status"] = "completed"
-        job["progress"] = 100
-        job["message"] = "Analysis complete"
-        job["output_path"] = str(output_path)
-        job["results"] = {
-            "job_id": job_id,
-            "annotated_video_url": f"/video/{job_id}",
-            "stats": {
-                "possession_team1": possession_team1,
-                "possession_team2": possession_team2,
-                "total_passes": 0,
-                "total_shots": 0,
-                "player_count": len(tracks["players"][0]) if tracks["players"] else 0,
-                "processed_frames": len(video_frames),
-                "analysis_fps": analysis_fps,
-            },
-            "tactical_analysis": {
-                "formation_team1": "4-3-3",
-                "formation_team2": "4-4-2",
-                "pressing_intensity": "medium",
-                "key_moments": [],
-            },
-            "player_stats": player_stats,
+        player_stats = sorted(player_summary.values(), key=lambda item: item["id"])
+        stats = {
+            "possession_team1": possession_team1,
+            "possession_team2": possession_team2,
+            "possession_confidence": possession_confidence,
+            "total_passes": None,
+            "total_shots": None,
+            "player_count": len(player_summary),
+            "max_players_in_frame": max_players_in_frame,
+            "processed_frames": processed_frames,
+            "analysis_fps": float(analysis_fps),
+            "resize_width": int(resize_width),
+            "source_duration_seconds": props.get("duration_seconds"),
+            "source_fps": props.get("fps"),
+            "ball_detection_frames": ball_detections,
+            "player_frame_detections": player_frame_detections,
+            "referee_frame_detections": referee_frame_detections,
         }
 
+        confidence = {
+            "field_calibration": field_calibration_confidence,
+            "possession": possession_confidence,
+            "distance_speed": 0.0,
+            "formation": 0.0,
+        }
+
+        report = {
+            "job_id": job_id,
+            "annotated_video_url": f"/video/{job_id}",
+            "stats": stats,
+            "tactical_analysis": {
+                "formation_team1": None,
+                "formation_team2": None,
+                "pressing_intensity": None,
+                "key_moments": [],
+                "status": "unavailable_without_field_calibration",
+            },
+            "player_stats": player_stats,
+            "warnings": warnings,
+            "confidence": confidence,
+            "unavailable_metrics": [
+                "passes",
+                "shots",
+                "formations",
+                "distance_km",
+                "max_speed_kmh",
+            ],
+        }
+
+        report_paths = _write_report_files(job_id, report, player_stats)
+        _update_job(job_id, status="processing", message="Uploading artifacts", progress=94, output_path=str(output_path))
+
+        video_artifact = _upload_artifact(job_id, output_path, "video/mp4")
+        json_artifact = _upload_artifact(job_id, report_paths["report_json"], "application/json")
+        csv_artifact = _upload_artifact(job_id, report_paths["report_csv"], "text/csv")
+
+        report["artifacts"] = {
+            "annotated_video": {
+                "local_path": str(output_path),
+                "object_key": video_artifact.get("object_key"),
+                "public_url": video_artifact.get("public_url"),
+                "content_type": "video/mp4",
+            },
+            "report_json": {
+                "local_path": str(report_paths["report_json"]),
+                "object_key": json_artifact.get("object_key"),
+                "public_url": json_artifact.get("public_url"),
+                "content_type": "application/json",
+            },
+            "report_csv": {
+                "local_path": str(report_paths["report_csv"]),
+                "object_key": csv_artifact.get("object_key"),
+                "public_url": csv_artifact.get("public_url"),
+                "content_type": "text/csv",
+            },
+        }
+        if video_artifact.get("public_url"):
+            report["annotated_video_url"] = video_artifact["public_url"]
+        report["report_json_url"] = json_artifact.get("public_url") or f"/artifact/{job_id}/report_json"
+        report["report_csv_url"] = csv_artifact.get("public_url") or f"/artifact/{job_id}/report_csv"
+
+        _update_job(
+            job_id,
+            status="completed",
+            progress=100,
+            message="Analysis complete",
+            output_path=str(output_path),
+            results=report,
+        )
+
     except Exception as e:
-        job["status"] = "failed"
-        job["message"] = f"Error: {str(e)}"
-        job["progress"] = 0
+        _update_job(job_id, status="failed", message=f"Error: {str(e)}", progress=0)
 
 
 if __name__ == "__main__":
