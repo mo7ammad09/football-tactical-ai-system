@@ -68,6 +68,11 @@ class Tracker:
         self.ball_confidence = ball_confidence
         self.role_stability_window = max(1, int(role_stability_window))
         self._role_votes: Dict[int, List[str]] = defaultdict(list)
+        self._frame_index = 0
+        self._next_display_id = 1
+        self._display_id_by_tracker_id: Dict[int, int] = {}
+        self._last_seen_by_display_id: Dict[int, Dict] = {}
+        self.identity_lost_buffer = 90
 
     @staticmethod
     def _bytetrack_kwargs_for_signature(parameter_names: Set[str]) -> Dict:
@@ -210,6 +215,105 @@ class Tracker:
             del votes[0: len(votes) - self.role_stability_window]
         return Counter(votes).most_common(1)[0][0]
 
+    def _bbox_center(self, bbox: np.ndarray) -> np.ndarray:
+        """Return center point for an xyxy bbox."""
+        return np.array(
+            [
+                (float(bbox[0]) + float(bbox[2])) / 2.0,
+                (float(bbox[1]) + float(bbox[3])) / 2.0,
+            ],
+            dtype=float,
+        )
+
+    def _role_compatible_for_identity(self, previous_role: str, current_role: str) -> bool:
+        """Allow relinking only between roles that can reasonably flicker."""
+        if previous_role == current_role:
+            return True
+        return {previous_role, current_role}.issubset({"player", "goalkeeper"})
+
+    def _match_previous_display_id(
+        self,
+        bbox: np.ndarray,
+        role: str,
+        used_display_ids: Set[int],
+    ) -> Optional[int]:
+        """Relink a new ByteTrack ID to a recent display ID when likely same person."""
+        best_display_id = None
+        best_score = -999.0
+        current_center = self._bbox_center(bbox)
+        current_width = max(1.0, float(bbox[2] - bbox[0]))
+        current_height = max(1.0, float(bbox[3] - bbox[1]))
+        current_scale = max(current_width, current_height)
+
+        for display_id, state in self._last_seen_by_display_id.items():
+            if display_id in used_display_ids:
+                continue
+            age = self._frame_index - int(state["frame_index"])
+            if age <= 0 or age > self.identity_lost_buffer:
+                continue
+            previous_role = str(state.get("role", "player"))
+            if not self._role_compatible_for_identity(previous_role, role):
+                continue
+
+            previous_bbox = np.asarray(state["bbox"], dtype=float)
+            previous_center = self._bbox_center(previous_bbox)
+            previous_width = max(1.0, float(previous_bbox[2] - previous_bbox[0]))
+            previous_height = max(1.0, float(previous_bbox[3] - previous_bbox[1]))
+            previous_scale = max(previous_width, previous_height)
+            scale = max(current_scale, previous_scale)
+            center_distance = float(np.linalg.norm(current_center - previous_center))
+            normalized_distance = center_distance / scale
+            iou = self._bbox_iou(bbox, previous_bbox)
+
+            if iou < 0.08 and normalized_distance > 0.95:
+                continue
+
+            score = (2.0 * iou) - normalized_distance - (0.02 * age)
+            if score > best_score:
+                best_score = score
+                best_display_id = int(display_id)
+
+        return best_display_id
+
+    def _display_id_for_track(
+        self,
+        raw_track_id: int,
+        bbox: np.ndarray,
+        role: str,
+        used_display_ids: Set[int],
+    ) -> int:
+        """Map noisy ByteTrack IDs to stable user-facing IDs."""
+        if raw_track_id in self._display_id_by_tracker_id:
+            display_id = self._display_id_by_tracker_id[raw_track_id]
+            if display_id not in used_display_ids:
+                return display_id
+
+        display_id = self._match_previous_display_id(bbox, role, used_display_ids)
+        if display_id is None:
+            display_id = self._next_display_id
+            self._next_display_id += 1
+
+        self._display_id_by_tracker_id[raw_track_id] = display_id
+        return display_id
+
+    def _remember_display_track(self, display_id: int, bbox: np.ndarray, role: str) -> None:
+        """Store last position for lightweight ID relinking."""
+        self._last_seen_by_display_id[int(display_id)] = {
+            "bbox": np.asarray(bbox, dtype=float).tolist(),
+            "role": role,
+            "frame_index": int(self._frame_index),
+        }
+
+    def _prune_identity_cache(self) -> None:
+        """Remove old identity candidates."""
+        expired = [
+            display_id
+            for display_id, state in self._last_seen_by_display_id.items()
+            if self._frame_index - int(state["frame_index"]) > self.identity_lost_buffer
+        ]
+        for display_id in expired:
+            del self._last_seen_by_display_id[display_id]
+
     def _filter_detections(self, detections: sv.Detections, cls_names: Dict[int, str]) -> sv.Detections:
         """Remove low-confidence detections using class-specific thresholds."""
         if detections.class_id is None or len(detections) == 0:
@@ -306,23 +410,34 @@ class Tracker:
                 tracked_class_ids = []
                 tracked_ids = []
 
+            used_display_ids: Set[int] = set()
             for bbox, _cls_id, track_id in zip(tracked_xyxy, tracked_class_ids, tracked_ids):
                 if track_id is None:
                     continue
                 raw_role = self._role_for_tracked_bbox(np.asarray(bbox), original_boxes, original_roles)
                 if raw_role not in self.PERSON_ROLES:
                     raw_role = "player"
-                stable_role = self._stable_role_for_track(int(track_id), raw_role)
+                raw_track_id = int(track_id)
+                stable_role = self._stable_role_for_track(raw_track_id, raw_role)
+                display_id = self._display_id_for_track(
+                    raw_track_id=raw_track_id,
+                    bbox=np.asarray(bbox, dtype=float),
+                    role=stable_role,
+                    used_display_ids=used_display_ids,
+                )
+                used_display_ids.add(display_id)
+                self._remember_display_track(display_id, np.asarray(bbox), stable_role)
                 track_data = {
                     "bbox": bbox.tolist(),
                     "role": stable_role,
                     "detected_role": raw_role,
+                    "raw_track_id": raw_track_id,
                 }
 
                 if stable_role == "referee":
-                    tracks["referees"][frame_num][int(track_id)] = track_data
+                    tracks["referees"][frame_num][display_id] = track_data
                 else:
-                    tracks["players"][frame_num][int(track_id)] = track_data
+                    tracks["players"][frame_num][display_id] = track_data
 
             if len(ball_detections) > 0:
                 ball_confidences = ball_detections.confidence
@@ -333,6 +448,9 @@ class Tracker:
                 tracks["ball"][frame_num][1] = {
                     "bbox": ball_detections.xyxy[best_ball_idx].tolist()
                 }
+
+            self._prune_identity_cache()
+            self._frame_index += 1
 
         return tracks
 

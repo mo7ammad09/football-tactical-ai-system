@@ -3,6 +3,9 @@ Team assignment based on jersey colors using KMeans clustering.
 Based on: football_analysis_yolo by TrishamBP
 """
 
+from collections import Counter, defaultdict
+from typing import Dict, List
+
 import numpy as np
 from sklearn.cluster import KMeans
 
@@ -14,7 +17,10 @@ class TeamAssigner:
         """Initialize team assigner."""
         self.team_colors = {}
         self.player_team_dict = {}
+        self.player_team_votes: Dict[int, List[int]] = defaultdict(list)
         self.kmeans = None
+        self.team_vote_window = 12
+        self.ambiguous_color_margin = 0.18
 
     def get_clustering_model(self, image: np.ndarray) -> KMeans:
         """Get KMeans model for image color clustering.
@@ -44,10 +50,17 @@ class TeamAssigner:
         Returns:
             Dominant jersey color (BGR).
         """
-        image = frame[int(bbox[1]):int(bbox[3]), int(bbox[0]):int(bbox[2])]
+        height, width = frame.shape[:2]
+        x1 = max(0, min(width - 1, int(bbox[0])))
+        y1 = max(0, min(height - 1, int(bbox[1])))
+        x2 = max(x1 + 1, min(width, int(bbox[2])))
+        y2 = max(y1 + 1, min(height, int(bbox[3])))
+        image = frame[y1:y2, x1:x2]
 
         # Use top half (jersey area)
         top_half_image = image[0:int(image.shape[0] / 2), :]
+        if top_half_image.size == 0 or top_half_image.shape[0] < 2 or top_half_image.shape[1] < 2:
+            return np.mean(image.reshape(-1, 3), axis=0)
 
         # Get clustering model
         kmeans = self.get_clustering_model(top_half_image)
@@ -93,8 +106,33 @@ class TeamAssigner:
         self.team_colors[1] = kmeans.cluster_centers_[0]
         self.team_colors[2] = kmeans.cluster_centers_[1]
 
+    def predict_team_from_color(self, player_color: np.ndarray) -> tuple[int, float]:
+        """Predict team and confidence margin from jersey color."""
+        centers = np.asarray(self.kmeans.cluster_centers_, dtype=float)
+        distances = np.linalg.norm(centers - player_color.reshape(1, -1), axis=1)
+        order = np.argsort(distances)
+        best_idx = int(order[0])
+        second_idx = int(order[1]) if len(order) > 1 else best_idx
+        team_id = best_idx + 1
+        margin = (
+            float(distances[second_idx] - distances[best_idx])
+            / max(float(distances[second_idx]), 1e-6)
+        )
+        return team_id, margin
+
+    def _stable_team_for_player(self, player_id: int, team_id: int) -> int:
+        """Smooth team assignment over recent confident observations."""
+        votes = self.player_team_votes[int(player_id)]
+        votes.append(int(team_id))
+        if len(votes) > self.team_vote_window:
+            del votes[0: len(votes) - self.team_vote_window]
+
+        stable_team = Counter(votes).most_common(1)[0][0]
+        self.player_team_dict[int(player_id)] = int(stable_team)
+        return int(stable_team)
+
     def get_player_team(self, frame: np.ndarray, player_bbox: list, player_id: int) -> int:
-        """Get team for specific player (with caching).
+        """Get smoothed team for a player.
 
         Args:
             frame: Current frame.
@@ -104,14 +142,10 @@ class TeamAssigner:
         Returns:
             Team ID (1 or 2).
         """
-        if player_id in self.player_team_dict:
-            return self.player_team_dict[player_id]
-
         player_color = self.get_player_color(frame, player_bbox)
+        team_id, margin = self.predict_team_from_color(player_color)
 
-        team_id = self.kmeans.predict(player_color.reshape(1, -1))[0]
-        team_id += 1
+        if margin < self.ambiguous_color_margin:
+            return int(self.player_team_dict.get(player_id, 0))
 
-        self.player_team_dict[player_id] = int(team_id)
-
-        return int(team_id)
+        return self._stable_team_for_player(player_id, team_id)
