@@ -36,7 +36,7 @@ docker push YOUR_DOCKERHUB_USER/football-tactical-ai:latest
 
 - Endpoint Type: `RunPod Worker`
 - Container Image: `YOUR_DOCKERHUB_USER/football-tactical-ai:latest`
-- GPU: `RTX 4090` أو أعلى
+- GPU: ابدأ بـ `L4` أو `A10` أو `RTX 4090`. إذا اخترت GPU أحدث مثل RTX 50/Blackwell، استخدم الصورة الحالية المبنية على CUDA 12.8.
 - Workers Min: `0`
 - Workers Max: `1` كبداية
 - Idle Timeout: قصير حسب ميزانيتك

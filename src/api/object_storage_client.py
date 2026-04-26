@@ -5,8 +5,9 @@ from __future__ import annotations
 import mimetypes
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 
 class ObjectStorageClient:
@@ -65,6 +66,8 @@ class ObjectStorageClient:
             max_concurrency=4,
             use_threads=True,
         )
+        self.multipart_chunksize = 8 * 1024 * 1024
+        self.max_upload_workers = 4
 
     def object_key(self, file_kind: str, file_name: str, job_id: Optional[str] = None) -> str:
         """Build a canonical object key."""
@@ -97,6 +100,7 @@ class ObjectStorageClient:
         object_key: Optional[str] = None,
         content_type: Optional[str] = None,
         job_id: Optional[str] = None,
+        progress_callback: Optional[Callable[[float, int, int], None]] = None,
     ) -> Dict[str, Optional[str]]:
         """Upload a file using boto3 managed multipart transfer."""
         path = Path(local_path)
@@ -105,18 +109,114 @@ class ObjectStorageClient:
 
         key = object_key or self.object_key(file_kind=file_kind, file_name=path.name, job_id=job_id)
         guessed_type = content_type or mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        self.client.upload_file(
-            str(path),
-            self.bucket,
-            key,
-            ExtraArgs={"ContentType": guessed_type},
-            Config=self.transfer_config,
-        )
+        if progress_callback:
+            self._upload_file_with_progress(path, key, guessed_type, progress_callback)
+        else:
+            self.client.upload_file(
+                str(path),
+                self.bucket,
+                key,
+                ExtraArgs={"ContentType": guessed_type},
+                Config=self.transfer_config,
+            )
         return {
             "object_key": key,
             "object_uri": f"s3://{self.bucket}/{key}",
             "public_url": self.public_url(key),
         }
+
+    def _emit_progress(
+        self,
+        progress_callback: Callable[[float, int, int], None],
+        percent: float,
+        transferred_bytes: int,
+        total_bytes: int,
+    ) -> None:
+        """Call progress callbacks while keeping one-argument callbacks compatible."""
+        try:
+            progress_callback(percent, transferred_bytes, total_bytes)
+        except TypeError:
+            progress_callback(percent)  # type: ignore[misc]
+
+    def _upload_file_with_progress(
+        self,
+        path: Path,
+        key: str,
+        content_type: str,
+        progress_callback: Callable[[float, int, int], None],
+    ) -> None:
+        """Multipart upload with main-thread progress updates."""
+        total_bytes = path.stat().st_size
+        chunk_size = self.multipart_chunksize
+
+        if total_bytes <= 5 * 1024 * 1024:
+            self.client.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=path.read_bytes(),
+                ContentType=content_type,
+            )
+            self._emit_progress(progress_callback, 100.0, total_bytes, total_bytes)
+            return
+
+        response = self.client.create_multipart_upload(
+            Bucket=self.bucket,
+            Key=key,
+            ContentType=content_type,
+        )
+        upload_id = response["UploadId"]
+        parts = []
+        transferred = 0
+
+        def upload_part(part_number: int, offset: int, size: int) -> Dict[str, Any]:
+            with path.open("rb") as file_obj:
+                file_obj.seek(offset)
+                body = file_obj.read(size)
+            part_response = self.client.upload_part(
+                Bucket=self.bucket,
+                Key=key,
+                UploadId=upload_id,
+                PartNumber=part_number,
+                Body=body,
+            )
+            return {
+                "PartNumber": part_number,
+                "ETag": part_response["ETag"],
+                "Size": len(body),
+            }
+
+        try:
+            part_count = (total_bytes + chunk_size - 1) // chunk_size
+            max_workers = max(1, min(self.max_upload_workers, part_count))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = []
+                for part_number in range(1, part_count + 1):
+                    offset = (part_number - 1) * chunk_size
+                    size = min(chunk_size, total_bytes - offset)
+                    futures.append(executor.submit(upload_part, part_number, offset, size))
+
+                for future in as_completed(futures):
+                    part = future.result()
+                    parts.append({"PartNumber": part["PartNumber"], "ETag": part["ETag"]})
+                    transferred += int(part["Size"])
+                    percent = min(100.0, (transferred / total_bytes) * 100)
+                    self._emit_progress(progress_callback, percent, transferred, total_bytes)
+
+            parts.sort(key=lambda item: item["PartNumber"])
+            self.client.complete_multipart_upload(
+                Bucket=self.bucket,
+                Key=key,
+                UploadId=upload_id,
+                MultipartUpload={"Parts": parts},
+            )
+            self._emit_progress(progress_callback, 100.0, total_bytes, total_bytes)
+        except Exception:
+            self.client.abort_multipart_upload(
+                Bucket=self.bucket,
+                Key=key,
+                UploadId=upload_id,
+            )
+            raise
 
     def download_file(self, object_key: str, local_path: str) -> None:
         """Download an object to a local path."""

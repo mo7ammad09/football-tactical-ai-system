@@ -45,13 +45,45 @@ class RunPodServerlessClient(AnalysisClient):
     def _url(self, suffix: str) -> str:
         return f"{self.base_url}/{self.endpoint_id}/{suffix.lstrip('/')}"
 
+    def _emit_progress(
+        self,
+        progress_callback: Optional[Callable],
+        percent: float,
+        transferred_bytes: Optional[int] = None,
+        total_bytes: Optional[int] = None,
+        phase: str = "upload",
+    ) -> None:
+        """Report progress while keeping older one-argument callbacks compatible."""
+        if not progress_callback:
+            return
+        try:
+            progress_callback(percent, transferred_bytes, total_bytes, phase)
+        except TypeError:
+            progress_callback(percent)
+
     def _normalize_output(self, output: Dict[str, Any]) -> Dict[str, Any]:
         """Normalize worker output into the app's result shape."""
         if "output" in output and isinstance(output["output"], dict):
             output = output["output"]
         if output.get("error"):
             raise ValueError(str(output["error"]))
+        if str(output.get("status", "")).lower() == "failed":
+            raise ValueError(str(output.get("message") or "RunPod worker reported failed status"))
         return output
+
+    def _failure_message(self, data: Dict[str, Any], fallback: str) -> str:
+        """Extract the most useful error message from a RunPod status payload."""
+        output = data.get("output")
+        if isinstance(output, dict):
+            for key in ("error", "message", "detail"):
+                value = output.get(key)
+                if value:
+                    return str(value)
+        for key in ("error", "message", "detail"):
+            value = data.get(key)
+            if value:
+                return str(value)
+        return fallback
 
     def start_from_storage(
         self,
@@ -96,17 +128,47 @@ class RunPodServerlessClient(AnalysisClient):
         resize_width: int = 1280,
     ) -> str:
         """Upload input artifacts to object storage and submit a RunPod job."""
-        video_info = self.storage.upload_file(video_path, file_kind="video", content_type="video/mp4")
-        if progress_callback:
-            progress_callback(65)
+        video_total_bytes = os.path.getsize(video_path)
+        self._emit_progress(progress_callback, 5, 0, video_total_bytes, "video_upload")
+
+        def video_progress(upload_percent: float, transferred: int, total: int) -> None:
+            self._emit_progress(
+                progress_callback,
+                5 + (float(upload_percent) * 0.65),
+                transferred,
+                total,
+                "video_upload",
+            )
+
+        video_info = self.storage.upload_file(
+            video_path,
+            file_kind="video",
+            content_type="video/mp4",
+            progress_callback=video_progress,
+        )
+        self._emit_progress(progress_callback, 70, phase="video_uploaded")
 
         model_object_key = None
         if model_file_path:
-            model_info = self.storage.upload_file(model_file_path, file_kind="model", content_type="application/octet-stream")
-            model_object_key = model_info["object_key"]
-            if progress_callback:
-                progress_callback(85)
+            def model_progress(upload_percent: float, transferred: int, total: int) -> None:
+                self._emit_progress(
+                    progress_callback,
+                    70 + (float(upload_percent) * 0.15),
+                    transferred,
+                    total,
+                    "model_upload",
+                )
 
+            model_info = self.storage.upload_file(
+                model_file_path,
+                file_kind="model",
+                content_type="application/octet-stream",
+                progress_callback=model_progress,
+            )
+            model_object_key = model_info["object_key"]
+            self._emit_progress(progress_callback, 85, phase="model_uploaded")
+
+        self._emit_progress(progress_callback, 90, phase="submitting")
         job_id = self.start_from_storage(
             video_object_key=str(video_info["object_key"]),
             model_object_key=model_object_key,
@@ -115,8 +177,7 @@ class RunPodServerlessClient(AnalysisClient):
             max_frames=max_frames,
             resize_width=resize_width,
         )
-        if progress_callback:
-            progress_callback(95)
+        self._emit_progress(progress_callback, 95, phase="submitted")
         return job_id
 
     def get_status(self, job_id: str) -> Dict:
@@ -135,7 +196,20 @@ class RunPodServerlessClient(AnalysisClient):
             "TIMED_OUT": 0,
         }
         if raw_status == "COMPLETED":
-            self._last_outputs[job_id] = self._normalize_output(data)
+            try:
+                self._last_outputs[job_id] = self._normalize_output(data)
+            except ValueError as exc:
+                return {
+                    "job_id": job_id,
+                    "status": "failed",
+                    "raw_status": raw_status,
+                    "progress": 0,
+                    "done": True,
+                    "message": str(exc),
+                    "raw": data,
+                }
+
+        message = self._failure_message(data, raw_status) if raw_status in self.FAILED_STATUSES else raw_status
 
         return {
             "job_id": job_id,
@@ -143,7 +217,8 @@ class RunPodServerlessClient(AnalysisClient):
             "raw_status": raw_status,
             "progress": progress_map.get(raw_status, 25),
             "done": raw_status in self.TERMINAL_STATUSES,
-            "message": raw_status,
+            "message": message,
+            "raw": data,
         }
 
     def get_results(self, job_id: str) -> Dict:

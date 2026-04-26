@@ -24,6 +24,13 @@ from src.processing.batch_analyzer import run_batch_analysis
 
 DEFAULT_MODEL_PATH = os.environ.get("MODEL_PATH", "models/abdullah_yolov5.pt")
 TMP_ROOT = Path(os.environ.get("RUNPOD_TMP_ROOT", "/tmp/football-ai"))
+REQUIRED_STORAGE_ENV = [
+    "OBJECT_STORAGE_BUCKET",
+    "OBJECT_STORAGE_REGION",
+    "OBJECT_STORAGE_ENDPOINT_URL",
+    "OBJECT_STORAGE_ACCESS_KEY_ID",
+    "OBJECT_STORAGE_SECRET_ACCESS_KEY",
+]
 
 
 def _download_url(url: str, target_path: Path) -> None:
@@ -69,10 +76,15 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     video_path = work_dir / "input_video.mp4"
     output_dir = work_dir / "outputs"
 
+    missing_storage_env = [key for key in REQUIRED_STORAGE_ENV if not os.environ.get(key)]
     storage: Optional[ObjectStorageClient] = None
+    storage_error: Optional[str] = None
     try:
+        if missing_storage_env:
+            raise ValueError("Missing RunPod environment variables: " + ", ".join(missing_storage_env))
         storage = ObjectStorageClient()
-    except Exception:
+    except Exception as exc:
+        storage_error = str(exc)
         storage = None
 
     try:
@@ -80,7 +92,10 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         video_url = input_data.get("video_url")
         if video_object_key:
             if storage is None:
-                raise ValueError("Object storage is required when video_object_key is provided")
+                raise ValueError(
+                    "Object storage is required when video_object_key is provided. "
+                    f"Storage setup error: {storage_error or 'unknown'}"
+                )
             storage.download_file(video_object_key, str(video_path))
         elif video_url:
             _download_url(video_url, video_path)

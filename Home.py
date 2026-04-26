@@ -38,6 +38,85 @@ from src.api.server_client import ServerClient
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
 SMALL_UPLOAD_LIMIT_MB = 512
+CONFIG_ENV_PATH = Path(__file__).resolve().parent / ".env"
+LOCAL_CONFIG_KEYS = {
+    "RUNPOD_ENDPOINT_ID",
+    "RUNPOD_API_KEY",
+    "OBJECT_STORAGE_BUCKET",
+    "OBJECT_STORAGE_REGION",
+    "OBJECT_STORAGE_ENDPOINT_URL",
+    "OBJECT_STORAGE_ACCESS_KEY_ID",
+    "OBJECT_STORAGE_SECRET_ACCESS_KEY",
+    "OBJECT_STORAGE_PREFIX",
+    "OBJECT_STORAGE_PRESIGN_EXPIRES",
+}
+
+
+def _parse_env_value(value: str) -> str:
+    """Parse a simple .env value."""
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    return value.replace("\\n", "\n")
+
+
+def _format_env_value(value: str) -> str:
+    """Format a value for a local .env file."""
+    escaped = value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def load_local_config(path: Path = CONFIG_ENV_PATH) -> None:
+    """Load local app settings from .env without overriding real environment variables."""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        if key.startswith("export "):
+            key = key.replace("export ", "", 1).strip()
+        if key in LOCAL_CONFIG_KEYS and key not in os.environ:
+            os.environ[key] = _parse_env_value(value)
+
+
+def save_local_config(values: dict[str, str], path: Path = CONFIG_ENV_PATH) -> None:
+    """Persist local app settings to .env while preserving unrelated lines."""
+    existing_lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    pending = {key: str(value) for key, value in values.items() if key in LOCAL_CONFIG_KEYS}
+    written = set()
+    output_lines: list[str] = []
+
+    for line in existing_lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            output_lines.append(line)
+            continue
+        raw_key = stripped.split("=", 1)[0].strip()
+        key = raw_key.replace("export ", "", 1).strip() if raw_key.startswith("export ") else raw_key
+        if key in pending:
+            output_lines.append(f"{key}={_format_env_value(pending[key])}")
+            written.add(key)
+        else:
+            output_lines.append(line)
+
+    if not output_lines:
+        output_lines.append("# Local settings for Football Tactical AI. Do not commit this file.")
+    for key, value in pending.items():
+        if key not in written:
+            output_lines.append(f"{key}={_format_env_value(value)}")
+
+    path.write_text("\n".join(output_lines) + "\n", encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    os.environ.update(pending)
+
+
+load_local_config()
 
 
 def list_input_videos(input_dir: str = "input_videos") -> list[Path]:
@@ -54,10 +133,14 @@ def list_input_videos(input_dir: str = "input_videos") -> list[Path]:
 
 def human_file_size(path: Path) -> str:
     """Format a file size for UI labels."""
-    size = path.stat().st_size
+    return format_bytes(path.stat().st_size)
+
+
+def format_bytes(size: int | float) -> str:
+    """Format byte counts for progress messages."""
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if size < 1024 or unit == "TB":
-            return f"{size:.1f} {unit}" if unit != "B" else f"{size} B"
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
         size /= 1024
     return f"{size:.1f} TB"
 
@@ -177,6 +260,13 @@ with st.sidebar:
 
     runpod_api_key = ""
     runpod_endpoint_id = ""
+    storage_bucket = ""
+    storage_region = ""
+    storage_endpoint_url = ""
+    storage_access_key = ""
+    storage_secret_key = ""
+    storage_prefix = "football-ai"
+    storage_presign_expires = "86400"
 
     if use_remote_gpu:
         st.subheader("🌐 " + ("إعدادات السيرفر GPU" if lang == "ar" else "GPU Server Settings"))
@@ -220,6 +310,72 @@ with st.sidebar:
             if lang == "ar"
             else "This mode starts GPU workers on demand and idles them down according to RunPod settings."
         )
+
+        with st.expander("🗄️ " + ("إعدادات التخزين" if lang == "ar" else "Storage Settings"), expanded=True):
+            storage_bucket = st.text_input(
+                "Bucket",
+                value=os.environ.get("OBJECT_STORAGE_BUCKET", ""),
+                help="مثال: football-ai-mohammad-01" if lang == "ar" else "Example: football-ai-mohammad-01",
+            )
+            storage_region = st.text_input(
+                "Region",
+                value=os.environ.get("OBJECT_STORAGE_REGION", "eu-north-1"),
+                help="مثال: eu-north-1" if lang == "ar" else "Example: eu-north-1",
+            )
+            storage_endpoint_url = st.text_input(
+                "Endpoint URL",
+                value=os.environ.get("OBJECT_STORAGE_ENDPOINT_URL", "https://s3.eu-north-1.amazonaws.com"),
+            )
+            storage_access_key = st.text_input(
+                "AWS Access Key ID",
+                type="password",
+                value=os.environ.get("OBJECT_STORAGE_ACCESS_KEY_ID", ""),
+            )
+            storage_secret_key = st.text_input(
+                "AWS Secret Access Key",
+                type="password",
+                value=os.environ.get("OBJECT_STORAGE_SECRET_ACCESS_KEY", ""),
+            )
+            storage_prefix = st.text_input(
+                "Prefix",
+                value=os.environ.get("OBJECT_STORAGE_PREFIX", "football-ai"),
+            )
+            storage_presign_expires = st.text_input(
+                "Presigned URL expiry seconds",
+                value=os.environ.get("OBJECT_STORAGE_PRESIGN_EXPIRES", "86400"),
+            )
+
+        local_config_values = {
+            "RUNPOD_ENDPOINT_ID": runpod_endpoint_id.strip(),
+            "RUNPOD_API_KEY": runpod_api_key.strip(),
+            "OBJECT_STORAGE_BUCKET": storage_bucket.strip(),
+            "OBJECT_STORAGE_REGION": storage_region.strip(),
+            "OBJECT_STORAGE_ENDPOINT_URL": storage_endpoint_url.strip(),
+            "OBJECT_STORAGE_ACCESS_KEY_ID": storage_access_key.strip(),
+            "OBJECT_STORAGE_SECRET_ACCESS_KEY": storage_secret_key.strip(),
+            "OBJECT_STORAGE_PREFIX": storage_prefix.strip(),
+            "OBJECT_STORAGE_PRESIGN_EXPIRES": storage_presign_expires.strip(),
+        }
+        st.caption(
+            "اضغط حفظ بعد تعبئة البيانات مرة واحدة. سيتم حفظها محلياً في ملف .env على جهازك."
+            if lang == "ar"
+            else "Save once after filling the fields. Settings are stored locally in your .env file."
+        )
+        if st.button("💾 حفظ الإعدادات على هذا الجهاز" if lang == "ar" else "💾 Save settings on this device", use_container_width=True):
+            missing_config = [key for key, value in local_config_values.items() if not value]
+            if missing_config:
+                st.error(
+                    "قبل الحفظ، أكمل: " + ", ".join(missing_config)
+                    if lang == "ar"
+                    else "Before saving, complete: " + ", ".join(missing_config)
+                )
+            else:
+                save_local_config(local_config_values)
+                st.success(
+                    "تم الحفظ. المرة القادمة ستظهر البيانات تلقائياً."
+                    if lang == "ar"
+                    else "Saved. These values will load automatically next time."
+                )
 
         if st.button("🔎 اختبار RunPod" if lang == "ar" else "🔎 Test RunPod", use_container_width=True):
             try:
@@ -440,9 +596,10 @@ if video_path:
         with progress_container:
             st.markdown("---")
             st.subheader("⏳ جاري التحليل..." if lang == "ar" else "⏳ Analyzing...")
-            
+
             progress_bar = st.progress(0)
             status_text = st.empty()
+            upload_detail = st.empty()
             
             try:
                 if use_remote_gpu:
@@ -570,6 +727,26 @@ if video_path:
                             if lang == "ar"
                             else "Please provide RUNPOD_ENDPOINT_ID and RUNPOD_API_KEY."
                         )
+                    required_storage_fields = {
+                        "OBJECT_STORAGE_BUCKET": storage_bucket.strip(),
+                        "OBJECT_STORAGE_REGION": storage_region.strip(),
+                        "OBJECT_STORAGE_ENDPOINT_URL": storage_endpoint_url.strip(),
+                        "OBJECT_STORAGE_ACCESS_KEY_ID": storage_access_key.strip(),
+                        "OBJECT_STORAGE_SECRET_ACCESS_KEY": storage_secret_key.strip(),
+                        "OBJECT_STORAGE_PREFIX": storage_prefix.strip(),
+                        "OBJECT_STORAGE_PRESIGN_EXPIRES": storage_presign_expires.strip(),
+                    }
+                    missing_storage = [key for key, value in required_storage_fields.items() if not value]
+                    if missing_storage:
+                        raise ValueError(
+                            (
+                                "أكمل إعدادات التخزين في الشريط الجانبي: "
+                                + ", ".join(missing_storage)
+                            )
+                            if lang == "ar"
+                            else "Complete storage settings in the sidebar: " + ", ".join(missing_storage)
+                        )
+                    os.environ.update(required_storage_fields)
 
                     model_file_path = None
                     model_path_for_worker = None
@@ -611,16 +788,78 @@ if video_path:
                         api_key=runpod_api_key,
                         endpoint_id=runpod_endpoint_id,
                     )
+                    last_upload_ui_update = {"at": 0.0}
+
+                    def update_runpod_progress(
+                        percent: float,
+                        transferred_bytes: int | None = None,
+                        total_bytes: int | None = None,
+                        phase: str = "upload",
+                    ) -> None:
+                        progress_bar.progress(max(5, min(int(percent), 95)))
+                        now = time.time()
+                        should_update = now - last_upload_ui_update["at"] >= 0.5
+                        if total_bytes and transferred_bytes is not None:
+                            should_update = should_update or transferred_bytes >= total_bytes
+                        if not should_update:
+                            return
+                        last_upload_ui_update["at"] = now
+
+                        if phase == "video_upload" and total_bytes:
+                            upload_percent = min(100.0, (transferred_bytes or 0) / total_bytes * 100)
+                            status_text.info(
+                                (
+                                    f"⬆️ جاري رفع الفيديو: {upload_percent:.1f}% - "
+                                    f"{format_bytes(transferred_bytes or 0)} من {format_bytes(total_bytes)}"
+                                )
+                                if lang == "ar"
+                                else (
+                                    f"⬆️ Uploading video: {upload_percent:.1f}% - "
+                                    f"{format_bytes(transferred_bytes or 0)} of {format_bytes(total_bytes)}"
+                                )
+                            )
+                            upload_detail.caption(
+                                "بعد اكتمال الرفع سيتم إرسال job إلى RunPod تلقائياً."
+                                if lang == "ar"
+                                else "After upload finishes, the job will be submitted to RunPod automatically."
+                            )
+                        elif phase == "model_upload" and total_bytes:
+                            upload_percent = min(100.0, (transferred_bytes or 0) / total_bytes * 100)
+                            status_text.info(
+                                (
+                                    f"⬆️ جاري رفع الموديل: {upload_percent:.1f}% - "
+                                    f"{format_bytes(transferred_bytes or 0)} من {format_bytes(total_bytes)}"
+                                )
+                                if lang == "ar"
+                                else (
+                                    f"⬆️ Uploading model: {upload_percent:.1f}% - "
+                                    f"{format_bytes(transferred_bytes or 0)} of {format_bytes(total_bytes)}"
+                                )
+                            )
+                        elif phase == "video_uploaded":
+                            status_text.info(
+                                "✅ انتهى رفع الفيديو. جاري تجهيز طلب RunPod..."
+                                if lang == "ar"
+                                else "✅ Video upload finished. Preparing RunPod request..."
+                            )
+                        elif phase == "submitting":
+                            status_text.info(
+                                "☁️ جاري إرسال job إلى RunPod Serverless..."
+                                if lang == "ar"
+                                else "☁️ Submitting job to RunPod Serverless..."
+                            )
+
                     upload_started_at = time.time()
                     job_id = client.upload_video(
                         video_path=video_path,
-                        progress_callback=lambda p: progress_bar.progress(max(5, min(int(p), 95))),
+                        progress_callback=update_runpod_progress,
                         model_path=model_path_for_worker,
                         model_file_path=model_file_path,
                         analysis_fps=float(analysis_fps_remote),
                         max_frames=int(max_frames_remote) if max_frames_remote else None,
                         resize_width=int(resize_width_remote),
                     )
+                    st.session_state.runpod_job_id = job_id
                     upload_elapsed_s = time.time() - upload_started_at
 
                     status_text.info(
@@ -647,7 +886,8 @@ if video_path:
                         if status.get("status") == "completed":
                             break
                         if status.get("status") == "failed":
-                            raise ValueError(status.get("message", "RunPod analysis failed"))
+                            failure_message = status.get("message", "RunPod analysis failed")
+                            raise ValueError(f"RunPod job {job_id} failed: {failure_message}")
                         time.sleep(10)
 
                     results = client.get_results(job_id)
