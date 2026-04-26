@@ -5,6 +5,7 @@ Based on: football_analysis_yolo by TrishamBP
 
 import os
 import pickle
+from collections import Counter, defaultdict
 from typing import Dict, List, Optional
 
 import cv2
@@ -19,14 +20,59 @@ from src.utils.bbox_utils import get_center_of_bbox, get_foot_position, get_bbox
 class Tracker:
     """Detect and track players, referees, and ball in football video."""
 
-    def __init__(self, model_path: str):
+    PERSON_ROLES = {"player", "goalkeeper", "referee"}
+    CLASS_ALIASES = {
+        "players": "player",
+        "football-player": "player",
+        "football_player": "player",
+        "football player": "player",
+        "goalkeeper": "goalkeeper",
+        "goal keeper": "goalkeeper",
+        "keeper": "goalkeeper",
+        "ref": "referee",
+        "referee": "referee",
+        "official": "referee",
+        "match official": "referee",
+        "assistant referee": "referee",
+        "assistant_referee": "referee",
+        "linesman": "referee",
+        "line referee": "referee",
+        "ball": "ball",
+        "football": "ball",
+        "sports ball": "ball",
+        "sports_ball": "ball",
+    }
+
+    def __init__(
+        self,
+        model_path: str,
+        detection_confidence: float = 0.12,
+        person_confidence: float = 0.25,
+        ball_confidence: float = 0.08,
+        role_stability_window: int = 12,
+    ):
         """Initialize tracker with YOLO model.
 
         Args:
             model_path: Path to trained YOLO model.
+            detection_confidence: Base YOLO confidence threshold.
+            person_confidence: Minimum confidence for player/referee/goalkeeper detections.
+            ball_confidence: Minimum confidence for ball detections.
+            role_stability_window: Number of recent role votes kept for each track ID.
         """
         self.model = YOLO(model_path)
-        self.tracker = sv.ByteTrack()
+        self.tracker = sv.ByteTrack(
+            track_activation_threshold=0.2,
+            lost_track_buffer=90,
+            minimum_matching_threshold=0.7,
+            frame_rate=30,
+            minimum_consecutive_frames=1,
+        )
+        self.detection_confidence = detection_confidence
+        self.person_confidence = person_confidence
+        self.ball_confidence = ball_confidence
+        self.role_stability_window = max(1, int(role_stability_window))
+        self._role_votes: Dict[int, List[str]] = defaultdict(list)
 
     def add_position_to_tracks(self, tracks: Dict) -> None:
         """Add foot/center position to all tracked objects.
@@ -76,9 +122,92 @@ class Tracker:
         """
         detections = []
         for i in range(0, len(frames), batch_size):
-            detections_batch = self.model.predict(frames[i:i + batch_size], conf=0.1, verbose=False)
+            detections_batch = self.model.predict(
+                frames[i:i + batch_size],
+                conf=self.detection_confidence,
+                verbose=False,
+            )
             detections += detections_batch
         return detections
+
+    def _normalize_class_name(self, name: str) -> str:
+        """Normalize model class labels into stable project roles."""
+        normalized = str(name).strip().lower().replace("-", " ").replace("_", " ")
+        return self.CLASS_ALIASES.get(normalized, normalized)
+
+    def _class_id_for_role(self, cls_names_inv: Dict[str, int], role: str) -> Optional[int]:
+        """Find the model class id for a normalized role."""
+        for class_name, class_id in cls_names_inv.items():
+            if self._normalize_class_name(class_name) == role:
+                return int(class_id)
+        return None
+
+    def _bbox_iou(self, box_a: np.ndarray, box_b: np.ndarray) -> float:
+        """Compute intersection-over-union for two xyxy boxes."""
+        x1 = max(float(box_a[0]), float(box_b[0]))
+        y1 = max(float(box_a[1]), float(box_b[1]))
+        x2 = min(float(box_a[2]), float(box_b[2]))
+        y2 = min(float(box_a[3]), float(box_b[3]))
+        inter_w = max(0.0, x2 - x1)
+        inter_h = max(0.0, y2 - y1)
+        intersection = inter_w * inter_h
+        area_a = max(0.0, float(box_a[2] - box_a[0])) * max(
+            0.0,
+            float(box_a[3] - box_a[1]),
+        )
+        area_b = max(0.0, float(box_b[2] - box_b[0])) * max(
+            0.0,
+            float(box_b[3] - box_b[1]),
+        )
+        union = area_a + area_b - intersection
+        return intersection / union if union > 0 else 0.0
+
+    def _role_for_tracked_bbox(
+        self,
+        tracked_bbox: np.ndarray,
+        original_boxes: np.ndarray,
+        original_roles: List[str],
+    ) -> str:
+        """Recover the original model role for a tracked bbox."""
+        if len(original_boxes) == 0:
+            return "player"
+        best_idx = 0
+        best_iou = -1.0
+        for idx, original_box in enumerate(original_boxes):
+            iou = self._bbox_iou(np.asarray(tracked_bbox), np.asarray(original_box))
+            if iou > best_iou:
+                best_idx = idx
+                best_iou = iou
+        return original_roles[best_idx] if best_iou >= 0.5 else "player"
+
+    def _stable_role_for_track(self, track_id: int, detected_role: str) -> str:
+        """Return a smoothed role for a tracked person."""
+        votes = self._role_votes[int(track_id)]
+        votes.append(detected_role)
+        if len(votes) > self.role_stability_window:
+            del votes[0: len(votes) - self.role_stability_window]
+        return Counter(votes).most_common(1)[0][0]
+
+    def _filter_detections(self, detections: sv.Detections, cls_names: Dict[int, str]) -> sv.Detections:
+        """Remove low-confidence detections using class-specific thresholds."""
+        if detections.class_id is None or len(detections) == 0:
+            return detections
+
+        confidence = detections.confidence
+        if confidence is None:
+            confidence = np.ones(len(detections), dtype=float)
+
+        keep_mask = []
+        for class_id, conf in zip(detections.class_id, confidence):
+            role = self._normalize_class_name(cls_names.get(int(class_id), ""))
+            if role in self.PERSON_ROLES:
+                keep_mask.append(float(conf) >= self.person_confidence)
+            elif role == "ball":
+                keep_mask.append(float(conf) >= self.ball_confidence)
+            else:
+                keep_mask.append(True)
+
+        return detections[np.array(keep_mask, dtype=bool)]
 
     def get_object_tracks_for_frames(self, frames: List[np.ndarray]) -> Dict:
         """Track a batch of frames using the current tracker state.
@@ -99,34 +228,89 @@ class Tracker:
             cls_names_inv = {v: k for k, v in cls_names.items()}
 
             detection_supervision = sv.Detections.from_ultralytics(detection)
+            detection_supervision = self._filter_detections(detection_supervision, cls_names)
+            class_ids = (
+                detection_supervision.class_id
+                if detection_supervision.class_id is not None
+                else np.array([], dtype=int)
+            )
+            normalized_roles = [
+                self._normalize_class_name(cls_names.get(int(class_id), ""))
+                for class_id in class_ids
+            ]
+            person_mask = np.array(
+                [role in self.PERSON_ROLES for role in normalized_roles],
+                dtype=bool,
+            )
+            ball_mask = np.array(
+                [role == "ball" for role in normalized_roles],
+                dtype=bool,
+            )
 
-            for object_ind, class_id in enumerate(detection_supervision.class_id):
-                if cls_names[class_id] == "goalkeeper" and "player" in cls_names_inv:
-                    detection_supervision.class_id[object_ind] = cls_names_inv["player"]
+            person_detections = detection_supervision[person_mask]
+            ball_detections = detection_supervision[ball_mask]
+            person_class_ids = (
+                person_detections.class_id
+                if person_detections.class_id is not None
+                else np.array([], dtype=int)
+            )
+            original_boxes = np.asarray(person_detections.xyxy).copy()
+            original_roles = [
+                self._normalize_class_name(cls_names.get(int(class_id), ""))
+                for class_id in person_class_ids
+            ]
 
-            detection_with_tracks = self.tracker.update_with_detections(detection_supervision)
+            common_person_class_id = (
+                self._class_id_for_role(cls_names_inv, "person")
+                or self._class_id_for_role(cls_names_inv, "player")
+            )
+            if common_person_class_id is None and len(person_class_ids) > 0:
+                common_person_class_id = int(person_class_ids[0])
+            if common_person_class_id is not None and person_detections.class_id is not None:
+                person_detections.class_id[:] = int(common_person_class_id)
+
+            detection_with_tracks = self.tracker.update_with_detections(person_detections)
 
             tracks["players"].append({})
             tracks["referees"].append({})
             tracks["ball"].append({})
 
-            for frame_detection in detection_with_tracks:
-                bbox = frame_detection[0].tolist()
-                cls_id = frame_detection[3]
-                track_id = frame_detection[4]
+            tracked_xyxy = getattr(detection_with_tracks, "xyxy", [])
+            tracked_class_ids = getattr(detection_with_tracks, "class_id", None)
+            tracked_ids = getattr(detection_with_tracks, "tracker_id", None)
 
-                if "player" in cls_names_inv and cls_id == cls_names_inv["player"]:
-                    tracks["players"][frame_num][track_id] = {"bbox": bbox}
+            if tracked_class_ids is None or tracked_ids is None:
+                tracked_xyxy = []
+                tracked_class_ids = []
+                tracked_ids = []
 
-                if "referee" in cls_names_inv and cls_id == cls_names_inv["referee"]:
-                    tracks["referees"][frame_num][track_id] = {"bbox": bbox}
+            for bbox, _cls_id, track_id in zip(tracked_xyxy, tracked_class_ids, tracked_ids):
+                if track_id is None:
+                    continue
+                raw_role = self._role_for_tracked_bbox(np.asarray(bbox), original_boxes, original_roles)
+                if raw_role not in self.PERSON_ROLES:
+                    raw_role = "player"
+                stable_role = self._stable_role_for_track(int(track_id), raw_role)
+                track_data = {
+                    "bbox": bbox.tolist(),
+                    "role": stable_role,
+                    "detected_role": raw_role,
+                }
 
-            for frame_detection in detection_supervision:
-                bbox = frame_detection[0].tolist()
-                cls_id = frame_detection[3]
+                if stable_role == "referee":
+                    tracks["referees"][frame_num][int(track_id)] = track_data
+                else:
+                    tracks["players"][frame_num][int(track_id)] = track_data
 
-                if "ball" in cls_names_inv and cls_id == cls_names_inv["ball"]:
-                    tracks["ball"][frame_num][1] = {"bbox": bbox}
+            if len(ball_detections) > 0:
+                ball_confidences = ball_detections.confidence
+                if ball_confidences is None:
+                    best_ball_idx = 0
+                else:
+                    best_ball_idx = int(np.argmax(ball_confidences))
+                tracks["ball"][frame_num][1] = {
+                    "bbox": ball_detections.xyxy[best_ball_idx].tolist()
+                }
 
         return tracks
 
@@ -304,7 +488,12 @@ class Tracker:
 
             # Draw Players
             for track_id, player in player_dict.items():
-                color = player.get("team_color", (0, 0, 255))
+                fallback_color = (
+                    (255, 0, 255)
+                    if player.get("role") == "goalkeeper"
+                    else (0, 0, 255)
+                )
+                color = player.get("team_color", fallback_color)
                 frame = self.draw_ellipse(frame, player["bbox"], color, track_id)
 
                 if player.get('has_ball', False):

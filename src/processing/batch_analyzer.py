@@ -57,7 +57,12 @@ def _draw_review_frame(
     out = frame.copy()
 
     for track_id, player in player_track.items():
-        color = _normalize_color(player.get("team_color"), (0, 0, 255))
+        fallback_color = (
+            (255, 0, 255)
+            if player.get("role") == "goalkeeper"
+            else (0, 0, 255)
+        )
+        color = _normalize_color(player.get("team_color"), fallback_color)
         out = tracker.draw_ellipse(out, player["bbox"], color, track_id)
         if player.get("has_ball", False):
             out = tracker.draw_triangle(out, player["bbox"], (0, 0, 255))
@@ -99,7 +104,16 @@ def _write_report_files(job_id: str, report: Dict[str, Any], player_stats: List[
 
     json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    fieldnames = ["id", "name", "team", "frames_seen", "distance_km", "max_speed_kmh", "distance_speed_confidence"]
+    fieldnames = [
+        "id",
+        "name",
+        "role",
+        "team",
+        "frames_seen",
+        "distance_km",
+        "max_speed_kmh",
+        "distance_speed_confidence",
+    ]
     with open(csv_path, "w", encoding="utf-8", newline="") as csv_f:
         writer = csv.DictWriter(csv_f, fieldnames=fieldnames)
         writer.writeheader()
@@ -206,6 +220,7 @@ def run_batch_analysis(
     processed_frames = 0
     rendered_frames = 0
     player_frame_detections = 0
+    goalkeeper_frame_detections = 0
     referee_frame_detections = 0
     ball_detections = 0
     max_players_in_frame = 0
@@ -219,6 +234,7 @@ def run_batch_analysis(
         nonlocal processed_frames
         nonlocal rendered_frames
         nonlocal player_frame_detections
+        nonlocal goalkeeper_frame_detections
         nonlocal referee_frame_detections
         nonlocal ball_detections
         nonlocal max_players_in_frame
@@ -250,9 +266,14 @@ def run_batch_analysis(
 
         if team_assigner.kmeans is None:
             for frame, player_track in zip(frames, batch_tracks["players"]):
-                if len(player_track) >= 2:
+                field_players = {
+                    player_id: track
+                    for player_id, track in player_track.items()
+                    if track.get("role", "player") == "player"
+                }
+                if len(field_players) >= 2:
                     try:
-                        team_assigner.assign_team_color(frame, player_track)
+                        team_assigner.assign_team_color(frame, field_players)
                     except Exception as exc:
                         warnings.append(f"Team color assignment failed on an early frame: {exc}")
                     break
@@ -269,20 +290,28 @@ def run_batch_analysis(
                 ball_detections += 1
 
             for player_id, track in player_track.items():
+                role = track.get("role", "player")
+                if role == "goalkeeper":
+                    goalkeeper_frame_detections += 1
+
                 team = 0
-                if team_assigner.kmeans is not None:
+                if team_assigner.kmeans is not None and role == "player":
                     try:
                         team = team_assigner.get_player_team(frame, track["bbox"], player_id)
                     except Exception:
                         team = 0
                 track["team"] = int(team)
-                track["team_color"] = team_assigner.team_colors.get(team, (128, 128, 128))
+                if role == "goalkeeper":
+                    track["team_color"] = (255, 0, 255)
+                else:
+                    track["team_color"] = team_assigner.team_colors.get(team, (128, 128, 128))
 
                 summary = player_summary.setdefault(
                     int(player_id),
                     {
                         "id": int(player_id),
                         "name": f"Player {player_id}",
+                        "role": role,
                         "team": int(team),
                         "frames_seen": 0,
                         "distance_km": None,
@@ -291,6 +320,7 @@ def run_batch_analysis(
                     },
                 )
                 summary["frames_seen"] += 1
+                summary["role"] = role
                 if team:
                     summary["team"] = int(team)
 
@@ -381,6 +411,7 @@ def run_batch_analysis(
             "source_fps": props.get("fps"),
             "ball_detection_frames": ball_detections,
             "player_frame_detections": player_frame_detections,
+            "goalkeeper_frame_detections": goalkeeper_frame_detections,
             "referee_frame_detections": referee_frame_detections,
         },
         "tactical_analysis": {

@@ -395,9 +395,51 @@ with st.sidebar:
                 st.error(f"❌ {conn_err}")
 
     if use_remote_gpu or use_runpod_serverless:
+        quality_preset_options = (
+            [
+                "سريع للمباراة كاملة",
+                "متوازن",
+                "جودة عالية",
+                "جودة قصوى لمقطع قصير",
+            ]
+            if lang == "ar"
+            else [
+                "Fast Full Match",
+                "Balanced",
+                "High Quality",
+                "Max Quality Short Clip",
+            ]
+        )
+        quality_preset = st.selectbox(
+            "وضع جودة التحليل" if lang == "ar" else "Analysis Quality Preset",
+            quality_preset_options,
+            index=1,
+            help=(
+                "يغيّر FPS التحليل والدقة. الفيديو الناتج يبقى سلساً عبر Output Video FPS."
+                if lang == "ar"
+                else "Changes analysis FPS and resolution. Output video remains smooth via Output Video FPS."
+            ),
+        )
+        if quality_preset in {"سريع للمباراة كاملة", "Fast Full Match"}:
+            preset_analysis_fps = 3.0
+            preset_resize_width = 1280
+            preset_full_match = True
+        elif quality_preset in {"متوازن", "Balanced"}:
+            preset_analysis_fps = 5.0
+            preset_resize_width = 1600
+            preset_full_match = True
+        elif quality_preset in {"جودة عالية", "High Quality"}:
+            preset_analysis_fps = 8.0
+            preset_resize_width = 1920
+            preset_full_match = True
+        else:
+            preset_analysis_fps = 12.0
+            preset_resize_width = 1920
+            preset_full_match = False
+
         analysis_fps_remote = st.number_input(
             "FPS للتحليل (أقل = أسرع)" if lang == "ar" else "Analysis FPS (lower = faster)",
-            min_value=0.5, max_value=30.0, value=3.0, step=0.5,
+            min_value=0.5, max_value=30.0, value=preset_analysis_fps, step=0.5,
             help=(
                 "2-4 FPS مناسب للمباراة الكاملة. ارفعها فقط للمقاطع القصيرة."
                 if lang == "ar"
@@ -415,7 +457,7 @@ with st.sidebar:
         )
         analyze_full_match = st.checkbox(
             "تحليل المباراة كاملة" if lang == "ar" else "Analyze full match",
-            value=True,
+            value=preset_full_match,
             help=(
                 "إذا ألغيت الخيار سيتم تحليل أول عدد محدد من الفريمات فقط."
                 if lang == "ar"
@@ -431,12 +473,12 @@ with st.sidebar:
             )
         resize_width_remote = st.number_input(
             "عرض الفريم قبل التحليل" if lang == "ar" else "Resize Width",
-            min_value=480, max_value=1920, value=1280, step=80
+            min_value=480, max_value=1920, value=preset_resize_width, step=80
         )
         st.caption(
-            "للمقاطع القصيرة: FPS=8 و Resize=1280. للمباريات الطويلة: FPS=2-4."
+            "السريع مناسب للمباريات الطويلة. الجودة العالية أدق لكنها أبطأ وأغلى. جودة قصوى مخصصة للمقاطع القصيرة."
             if lang == "ar"
-            else "For short clips: FPS=8 and Resize=1280. For long matches: FPS=2-4."
+            else "Fast is for full matches. High quality is more accurate but slower and more expensive. Max quality is for short clips."
         )
     else:
         remote_server_url = ""
