@@ -31,7 +31,7 @@ class Tracker:
         "track_high_thresh": 0.25,
         "track_low_thresh": 0.10,
         "new_track_thresh": 0.30,
-        "track_buffer": 900,
+        "track_buffer": 1800,
         "match_thresh": 0.90,
         "fuse_score": True,
         "gmc_method": "sparseOptFlow",
@@ -120,9 +120,9 @@ class Tracker:
         self._next_display_id = 1
         self._display_id_by_tracker_id: Dict[int, int] = {}
         self._last_seen_by_display_id: Dict[int, Dict] = {}
-        self.identity_lost_buffer = 120
-        self.identity_long_buffer = 3600
-        self.appearance_match_threshold = 0.28
+        self.identity_lost_buffer = 900
+        self.identity_long_buffer = 5400
+        self.appearance_match_threshold = 0.38
 
     def _create_botsort_yaml(self) -> str:
         """Create a temporary BoT-SORT config for Ultralytics tracking."""
@@ -372,22 +372,30 @@ class Tracker:
                 else None,
             )
 
+            appearance_match = appearance_distance <= self.appearance_match_threshold
+            loose_position_match = normalized_distance <= 2.25 or iou >= 0.02
+
             if age > self.identity_lost_buffer:
-                if appearance_distance > self.appearance_match_threshold:
+                if not appearance_match and not loose_position_match:
                     continue
-                score = (1.0 - appearance_distance) - (0.0005 * age)
+                score = (
+                    (0.65 * (1.0 - appearance_distance))
+                    + (0.35 * max(0.0, 1.0 - (normalized_distance / 2.25)))
+                    + (0.20 * iou)
+                    - (0.0002 * age)
+                )
                 if score > best_score:
                     best_score = score
                     best_display_id = int(display_id)
                 continue
 
-            if iou < 0.08 and normalized_distance > 0.95:
+            if iou < 0.08 and normalized_distance > 1.50 and not appearance_match:
                 continue
 
             score = (
                 (2.0 * iou)
                 - normalized_distance
-                - (0.02 * age)
+                - (0.002 * age)
                 + (0.2 * (1.0 - appearance_distance))
             )
             if score > best_score:
