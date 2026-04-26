@@ -68,6 +68,7 @@ payload = {
     "input": {
         "video_object_key": "football-ai/video/match_90min.mp4",
         "analysis_fps": 3.0,
+        "output_fps": 30.0,
         "resize_width": 1280,
         "max_frames": None,
         "model_path": "models/abdullah_yolov5.pt"
@@ -88,4 +89,5 @@ print(resp.json())
 - الواجهة ترسل job إلى `/run` وتتابع `/status/{job_id}`.
 - الـworker يحمّل الفيديو من object storage ويرفع فيديو المراجعة + JSON/CSV reports لنفس التخزين.
 - إعدادات `analysis_fps + resize_width` هي المفتاح لتشغيل فيديو طويل بدون انفجار RAM.
+- `output_fps` يتحكم في سلاسة فيديو المراجعة الناتج. اترك `analysis_fps=3` للتحليل، واستخدم `output_fps=25` أو `30` للمشاهدة السلسة.
 - النتائج المتقدمة غير الموثوقة ترجع `Unavailable` بدلاً من أرقام وهمية.

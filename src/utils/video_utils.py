@@ -108,6 +108,48 @@ def _iter_video_frames_with_opencv(
         cap.release()
 
 
+def _iter_video_frames_with_indices_opencv(
+    video_path: str,
+    target_fps: Optional[float] = None,
+    max_frames: Optional[int] = None,
+    resize_width: Optional[int] = None,
+) -> Iterator[tuple[int, int, np.ndarray]]:
+    """Yield sampled frames with their original frame index and emitted index."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return
+
+    source_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    if target_fps and source_fps > 0:
+        frame_step = max(1.0, source_fps / target_fps)
+    else:
+        frame_step = 1.0
+
+    emitted = 0
+    frame_idx = 0
+    next_emit_frame = 0.0
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_idx + 1e-9 >= next_emit_frame:
+                if resize_width and frame.shape[1] > resize_width:
+                    scale = resize_width / frame.shape[1]
+                    resized_height = int(frame.shape[0] * scale)
+                    frame = cv2.resize(frame, (resize_width, resized_height), interpolation=cv2.INTER_AREA)
+                yield frame_idx, emitted, frame
+                emitted += 1
+                next_emit_frame += frame_step
+                if max_frames is not None and emitted >= max_frames:
+                    break
+
+            frame_idx += 1
+    finally:
+        cap.release()
+
+
 def _transcode_to_h264_mp4(video_path: str) -> Optional[str]:
     """Transcode to a broadly-compatible MP4 using ffmpeg when available."""
     ffmpeg_bin = shutil.which("ffmpeg")
@@ -222,6 +264,42 @@ def iter_video_frames_sampled(
 
     try:
         yield from _iter_video_frames_with_opencv(
+            video_path=transcoded_path,
+            target_fps=target_fps,
+            max_frames=max_frames,
+            resize_width=resize_width,
+        )
+    finally:
+        if os.path.exists(transcoded_path):
+            os.remove(transcoded_path)
+
+
+def iter_video_frames_sampled_with_indices(
+    video_path: str,
+    target_fps: Optional[float] = None,
+    max_frames: Optional[int] = None,
+    resize_width: Optional[int] = None,
+) -> Iterator[tuple[int, int, np.ndarray]]:
+    """Yield sampled frames with source frame indices without loading the full video."""
+    cap = cv2.VideoCapture(video_path)
+    can_open = cap.isOpened()
+    cap.release()
+
+    if can_open:
+        yield from _iter_video_frames_with_indices_opencv(
+            video_path=video_path,
+            target_fps=target_fps,
+            max_frames=max_frames,
+            resize_width=resize_width,
+        )
+        return
+
+    transcoded_path = _transcode_to_h264_mp4(video_path)
+    if not transcoded_path:
+        return
+
+    try:
+        yield from _iter_video_frames_with_indices_opencv(
             video_path=transcoded_path,
             target_fps=target_fps,
             max_frames=max_frames,

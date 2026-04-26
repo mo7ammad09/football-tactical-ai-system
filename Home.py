@@ -404,6 +404,15 @@ with st.sidebar:
                 else "2-4 FPS is suitable for a full match. Increase only for short clips."
             )
         )
+        output_video_fps_remote = st.number_input(
+            "FPS للفيديو الناتج (السلاسة)" if lang == "ar" else "Output Video FPS (smoothness)",
+            min_value=3.0, max_value=30.0, value=30.0, step=1.0,
+            help=(
+                "هذا لا يزيد تكلفة الكشف مثل FPS التحليل؛ يستخدم فريمات الفيديو الأصلية لجعل المراجعة أكثر سلاسة."
+                if lang == "ar"
+                else "This does not raise detection cost like analysis FPS; it uses source frames for smoother review video."
+            ),
+        )
         analyze_full_match = st.checkbox(
             "تحليل المباراة كاملة" if lang == "ar" else "Analyze full match",
             value=True,
@@ -433,6 +442,7 @@ with st.sidebar:
         remote_server_url = ""
         remote_api_key = ""
         analysis_fps_remote = 3.0
+        output_video_fps_remote = 30.0
         max_frames_remote = None
         resize_width_remote = 1280
 
@@ -856,6 +866,7 @@ if video_path:
                         model_path=model_path_for_worker,
                         model_file_path=model_file_path,
                         analysis_fps=float(analysis_fps_remote),
+                        output_fps=float(output_video_fps_remote),
                         max_frames=int(max_frames_remote) if max_frames_remote else None,
                         resize_width=int(resize_width_remote),
                     )

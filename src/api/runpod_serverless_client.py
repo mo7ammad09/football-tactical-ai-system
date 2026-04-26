@@ -92,6 +92,7 @@ class RunPodServerlessClient(AnalysisClient):
         model_object_key: Optional[str] = None,
         model_path: Optional[str] = None,
         analysis_fps: float = 3.0,
+        output_fps: Optional[float] = None,
         max_frames: Optional[int] = None,
         resize_width: int = 1280,
     ) -> str:
@@ -100,6 +101,7 @@ class RunPodServerlessClient(AnalysisClient):
             "input": {
                 "video_object_key": video_object_key,
                 "analysis_fps": float(analysis_fps),
+                "output_fps": float(output_fps) if output_fps is not None else None,
                 "resize_width": int(resize_width),
                 "max_frames": int(max_frames) if max_frames is not None else None,
             }
@@ -124,6 +126,7 @@ class RunPodServerlessClient(AnalysisClient):
         model_path: Optional[str] = None,
         model_file_path: Optional[str] = None,
         analysis_fps: float = 3.0,
+        output_fps: Optional[float] = None,
         max_frames: Optional[int] = None,
         resize_width: int = 1280,
     ) -> str:
@@ -174,6 +177,7 @@ class RunPodServerlessClient(AnalysisClient):
             model_object_key=model_object_key,
             model_path=model_path,
             analysis_fps=analysis_fps,
+            output_fps=output_fps,
             max_frames=max_frames,
             resize_width=resize_width,
         )

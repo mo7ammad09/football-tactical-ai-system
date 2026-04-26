@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import csv
 import json
 from pathlib import Path
@@ -13,7 +14,7 @@ import numpy as np
 from src.ball_assigner.ball_assigner import BallAssigner
 from src.team_assigner.team_assigner import TeamAssigner
 from src.trackers.tracker import Tracker
-from src.utils.video_utils import get_video_properties, iter_video_frames_sampled
+from src.utils.video_utils import get_video_properties, iter_video_frames_sampled_with_indices
 from src.view_transformer.view_transformer import ViewTransformer
 
 
@@ -108,6 +109,74 @@ def _write_report_files(job_id: str, report: Dict[str, Any], player_stats: List[
     return {"report_json": json_path, "report_csv": csv_path}
 
 
+def _resolve_output_fps(props: Dict[str, Any], output_fps: Optional[float], analysis_fps: float) -> float:
+    """Choose a smooth but bounded output FPS."""
+    source_fps = float(props.get("fps") or 0.0)
+    if output_fps and output_fps > 0:
+        return min(float(output_fps), source_fps) if source_fps > 0 else float(output_fps)
+    if source_fps > 0:
+        return min(source_fps, 30.0)
+    return max(1.0, float(analysis_fps))
+
+
+def _render_smooth_review_video(
+    *,
+    tracker: Tracker,
+    video_path: str,
+    output_path: Path,
+    annotation_states: List[Dict[str, Any]],
+    output_fps: float,
+    resize_width: int,
+    max_source_frame_idx: Optional[int],
+) -> int:
+    """Render original video frames at output FPS using the latest sampled annotations."""
+    if not annotation_states:
+        return 0
+
+    writer: Optional[cv2.VideoWriter] = None
+    state_idx = 0
+    current_state: Optional[Dict[str, Any]] = None
+    rendered_frames = 0
+
+    for source_frame_idx, _, frame in iter_video_frames_sampled_with_indices(
+        video_path,
+        target_fps=float(output_fps),
+        resize_width=int(resize_width),
+    ):
+        if max_source_frame_idx is not None and source_frame_idx > max_source_frame_idx:
+            break
+
+        while (
+            state_idx < len(annotation_states)
+            and annotation_states[state_idx]["source_frame_idx"] <= source_frame_idx
+        ):
+            current_state = annotation_states[state_idx]
+            state_idx += 1
+
+        if current_state is None:
+            annotated = frame
+        else:
+            annotated = _draw_review_frame(
+                tracker=tracker,
+                frame=frame,
+                player_track=current_state["players"],
+                referee_track=current_state["referees"],
+                ball_track=current_state["ball"],
+                team_ball_counts=current_state["team_ball_counts"],
+                processed_frames=current_state["sample_number"],
+            )
+
+        if writer is None:
+            writer = _create_video_writer(output_path, annotated, float(output_fps))
+        writer.write(annotated)
+        rendered_frames += 1
+
+    if writer is not None:
+        writer.release()
+
+    return rendered_frames
+
+
 def run_batch_analysis(
     *,
     job_id: str,
@@ -116,6 +185,7 @@ def run_batch_analysis(
     output_dir: str | Path,
     analysis_fps: float = 3.0,
     resize_width: int = 1280,
+    output_fps: Optional[float] = None,
     max_frames: Optional[int] = None,
     batch_size: int = 16,
 ) -> Dict[str, Any]:
@@ -131,8 +201,10 @@ def run_batch_analysis(
     view_transformer = ViewTransformer()
 
     props = get_video_properties(video_path)
-    writer: Optional[cv2.VideoWriter] = None
+    resolved_output_fps = _resolve_output_fps(props, output_fps, float(analysis_fps))
+    annotation_states: List[Dict[str, Any]] = []
     processed_frames = 0
+    rendered_frames = 0
     player_frame_detections = 0
     referee_frame_detections = 0
     ball_detections = 0
@@ -143,9 +215,9 @@ def run_batch_analysis(
     calibration_checked = False
     field_calibration_confidence = 0.0
 
-    def process_batch(frames: List[np.ndarray]) -> None:
-        nonlocal writer
+    def process_batch(entries: List[tuple[int, np.ndarray]]) -> None:
         nonlocal processed_frames
+        nonlocal rendered_frames
         nonlocal player_frame_detections
         nonlocal referee_frame_detections
         nonlocal ball_detections
@@ -154,9 +226,10 @@ def run_batch_analysis(
         nonlocal calibration_checked
         nonlocal field_calibration_confidence
 
-        if not frames:
+        if not entries:
             return
 
+        frames = [entry[1] for entry in entries]
         batch_tracks = tracker.get_object_tracks_for_frames(frames)
         tracker.add_position_to_tracks(batch_tracks)
 
@@ -184,7 +257,7 @@ def run_batch_analysis(
                         warnings.append(f"Team color assignment failed on an early frame: {exc}")
                     break
 
-        for local_idx, frame in enumerate(frames):
+        for local_idx, (source_frame_idx, frame) in enumerate(entries):
             player_track = batch_tracks["players"][local_idx]
             referee_track = batch_tracks["referees"][local_idx]
             ball_track = batch_tracks["ball"][local_idx]
@@ -233,37 +306,51 @@ def run_batch_analysis(
                 team_ball_counts[last_team_control] += 1
 
             processed_frames += 1
-            annotated = _draw_review_frame(
-                tracker=tracker,
-                frame=frame,
-                player_track=player_track,
-                referee_track=referee_track,
-                ball_track=ball_track,
-                team_ball_counts=team_ball_counts,
-                processed_frames=processed_frames,
+            annotation_states.append(
+                {
+                    "source_frame_idx": int(source_frame_idx),
+                    "sample_number": int(processed_frames),
+                    "players": deepcopy(player_track),
+                    "referees": deepcopy(referee_track),
+                    "ball": deepcopy(ball_track),
+                    "team_ball_counts": dict(team_ball_counts),
+                }
             )
-            if writer is None:
-                writer = _create_video_writer(output_path, annotated, float(analysis_fps))
-            writer.write(annotated)
 
-    batch: List[np.ndarray] = []
-    for frame in iter_video_frames_sampled(
+    batch: List[tuple[int, np.ndarray]] = []
+    for source_frame_idx, _, frame in iter_video_frames_sampled_with_indices(
         video_path,
         target_fps=float(analysis_fps),
         max_frames=max_frames,
         resize_width=int(resize_width),
     ):
-        batch.append(frame)
+        batch.append((source_frame_idx, frame))
         if len(batch) >= max(1, batch_size):
             process_batch(batch)
             batch = []
     process_batch(batch)
 
-    if writer is not None:
-        writer.release()
-
     if processed_frames == 0:
         raise ValueError(f"Could not read video: {video_path}. Try MP4 (H.264) or re-upload the file.")
+
+    max_source_frame_idx = None
+    if max_frames is not None and annotation_states:
+        source_fps = float(props.get("fps") or 0.0)
+        sample_step = max(1, int(round(source_fps / float(analysis_fps)))) if source_fps > 0 else 1
+        max_source_frame_idx = int(annotation_states[-1]["source_frame_idx"]) + sample_step - 1
+
+    rendered_frames = _render_smooth_review_video(
+        tracker=tracker,
+        video_path=video_path,
+        output_path=output_path,
+        annotation_states=annotation_states,
+        output_fps=resolved_output_fps,
+        resize_width=int(resize_width),
+        max_source_frame_idx=max_source_frame_idx,
+    )
+
+    if rendered_frames == 0:
+        raise ValueError(f"Could not render output video: {output_path}")
 
     if team_assigner.kmeans is None:
         warnings.append("Team assignment was unavailable because not enough players were detected in any sampled frame.")
@@ -286,7 +373,9 @@ def run_batch_analysis(
             "player_count": len(player_summary),
             "max_players_in_frame": max_players_in_frame,
             "processed_frames": processed_frames,
+            "rendered_output_frames": rendered_frames,
             "analysis_fps": float(analysis_fps),
+            "output_fps": float(resolved_output_fps),
             "resize_width": int(resize_width),
             "source_duration_seconds": props.get("duration_seconds"),
             "source_fps": props.get("fps"),

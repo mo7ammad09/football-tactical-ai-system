@@ -70,6 +70,8 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     job_id = str(event.get("id") or input_data.get("job_id") or uuid.uuid4())
 
     analysis_fps = float(input_data.get("analysis_fps", 3.0))
+    output_fps_raw = input_data.get("output_fps")
+    output_fps = float(output_fps_raw) if output_fps_raw else None
     resize_width = int(input_data.get("resize_width", 1280))
     max_frames_raw = input_data.get("max_frames")
     max_frames = int(max_frames_raw) if max_frames_raw else None
@@ -123,6 +125,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             model_path=str(model_path),
             output_dir=output_dir,
             analysis_fps=analysis_fps,
+            output_fps=output_fps,
             resize_width=resize_width,
             max_frames=max_frames,
             batch_size=batch_size,

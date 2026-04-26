@@ -49,7 +49,7 @@ class DummyStorage:
         return {"object_key": f"football-ai/video/{local_path}", "public_url": None}
 
 
-def test_runpod_client_uploads_to_storage_and_submits_job():
+def test_runpod_client_uploads_to_storage_and_submits_job(tmp_path):
     client = RunPodServerlessClient(
         api_key="key",
         endpoint_id="endpoint",
@@ -59,9 +59,13 @@ def test_runpod_client_uploads_to_storage_and_submits_job():
     dummy_session = DummySession()
     client.session = dummy_session
 
+    video_path = tmp_path / "match.mp4"
+    video_path.write_bytes(b"video")
+
     job_id = client.upload_video(
-        "match.mp4",
+        str(video_path),
         analysis_fps=3,
+        output_fps=30,
         max_frames=None,
         resize_width=1280,
         model_path="models/model.pt",
@@ -70,8 +74,9 @@ def test_runpod_client_uploads_to_storage_and_submits_job():
     assert job_id == "rp-job-1"
     assert dummy_session.posts[0]["url"] == "https://api.runpod.ai/v2/endpoint/run"
     payload = dummy_session.posts[0]["json"]["input"]
-    assert payload["video_object_key"] == "football-ai/video/match.mp4"
+    assert payload["video_object_key"].endswith("/match.mp4")
     assert payload["analysis_fps"] == 3.0
+    assert payload["output_fps"] == 30.0
     assert payload["resize_width"] == 1280
     assert payload["max_frames"] is None
     assert payload["model_path"] == "models/model.pt"
