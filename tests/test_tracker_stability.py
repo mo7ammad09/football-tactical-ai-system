@@ -17,6 +17,8 @@ def _tracker_without_model() -> Tracker:
     tracker._display_id_by_tracker_id = {}
     tracker._last_seen_by_display_id = {}
     tracker.identity_lost_buffer = 90
+    tracker.identity_long_buffer = 3600
+    tracker.appearance_match_threshold = 0.28
     return tracker
 
 
@@ -68,12 +70,14 @@ def test_display_id_relinks_new_raw_track_near_recent_player():
         raw_track_id=101,
         bbox=np.array([100, 100, 140, 220], dtype=float),
         role="player",
+        appearance=None,
         used_display_ids=set(),
     )
     tracker._remember_display_track(
         first_display_id,
         np.array([100, 100, 140, 220], dtype=float),
         "player",
+        None,
     )
     tracker._frame_index = 1
 
@@ -81,6 +85,7 @@ def test_display_id_relinks_new_raw_track_near_recent_player():
         raw_track_id=430,
         bbox=np.array([104, 102, 144, 222], dtype=float),
         role="player",
+        appearance=None,
         used_display_ids=set(),
     )
 
@@ -93,12 +98,14 @@ def test_display_id_does_not_relink_player_to_recent_referee():
         raw_track_id=10,
         bbox=np.array([100, 100, 140, 220], dtype=float),
         role="referee",
+        appearance=None,
         used_display_ids=set(),
     )
     tracker._remember_display_track(
         referee_display_id,
         np.array([100, 100, 140, 220], dtype=float),
         "referee",
+        None,
     )
     tracker._frame_index = 1
 
@@ -106,7 +113,72 @@ def test_display_id_does_not_relink_player_to_recent_referee():
         raw_track_id=11,
         bbox=np.array([104, 102, 144, 222], dtype=float),
         role="player",
+        appearance=None,
         used_display_ids=set(),
     )
 
     assert player_display_id != referee_display_id
+
+
+def test_display_id_relinks_long_gap_with_matching_appearance():
+    tracker = _tracker_without_model()
+    appearance = np.zeros(128, dtype=float)
+    appearance[5] = 1.0
+
+    first_display_id = tracker._display_id_for_track(
+        raw_track_id=21,
+        bbox=np.array([100, 100, 140, 220], dtype=float),
+        role="player",
+        appearance=appearance,
+        used_display_ids=set(),
+    )
+    tracker._remember_display_track(
+        first_display_id,
+        np.array([100, 100, 140, 220], dtype=float),
+        "player",
+        appearance,
+    )
+    tracker._frame_index = tracker.identity_lost_buffer + 30
+
+    relinked_display_id = tracker._display_id_for_track(
+        raw_track_id=99,
+        bbox=np.array([700, 100, 740, 220], dtype=float),
+        role="player",
+        appearance=appearance,
+        used_display_ids=set(),
+    )
+
+    assert relinked_display_id == first_display_id
+
+
+def test_display_id_does_not_relink_long_gap_with_different_appearance():
+    tracker = _tracker_without_model()
+    first_appearance = np.zeros(128, dtype=float)
+    first_appearance[5] = 1.0
+    second_appearance = np.zeros(128, dtype=float)
+    second_appearance[70] = 1.0
+
+    first_display_id = tracker._display_id_for_track(
+        raw_track_id=21,
+        bbox=np.array([100, 100, 140, 220], dtype=float),
+        role="player",
+        appearance=first_appearance,
+        used_display_ids=set(),
+    )
+    tracker._remember_display_track(
+        first_display_id,
+        np.array([100, 100, 140, 220], dtype=float),
+        "player",
+        first_appearance,
+    )
+    tracker._frame_index = tracker.identity_lost_buffer + 30
+
+    new_display_id = tracker._display_id_for_track(
+        raw_track_id=99,
+        bbox=np.array([700, 100, 740, 220], dtype=float),
+        role="player",
+        appearance=second_appearance,
+        used_display_ids=set(),
+    )
+
+    assert new_display_id != first_display_id

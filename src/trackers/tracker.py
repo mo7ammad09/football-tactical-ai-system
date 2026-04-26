@@ -31,7 +31,7 @@ class Tracker:
         "track_high_thresh": 0.25,
         "track_low_thresh": 0.10,
         "new_track_thresh": 0.30,
-        "track_buffer": 150,
+        "track_buffer": 900,
         "match_thresh": 0.90,
         "fuse_score": True,
         "gmc_method": "sparseOptFlow",
@@ -120,7 +120,9 @@ class Tracker:
         self._next_display_id = 1
         self._display_id_by_tracker_id: Dict[int, int] = {}
         self._last_seen_by_display_id: Dict[int, Dict] = {}
-        self.identity_lost_buffer = 90
+        self.identity_lost_buffer = 120
+        self.identity_long_buffer = 3600
+        self.appearance_match_threshold = 0.28
 
     def _create_botsort_yaml(self) -> str:
         """Create a temporary BoT-SORT config for Ultralytics tracking."""
@@ -290,13 +292,53 @@ class Tracker:
             return True
         return {previous_role, current_role}.issubset({"player", "goalkeeper"})
 
+    def _extract_appearance(self, frame: np.ndarray, bbox: np.ndarray) -> Optional[np.ndarray]:
+        """Extract a lightweight HSV color fingerprint for long-term relinking."""
+        frame_h, frame_w = frame.shape[:2]
+        x1 = max(0, min(frame_w - 1, int(bbox[0])))
+        y1 = max(0, min(frame_h - 1, int(bbox[1])))
+        x2 = max(x1 + 1, min(frame_w, int(bbox[2])))
+        y2 = max(y1 + 1, min(frame_h, int(bbox[3])))
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+
+        jersey_crop = crop[: max(1, int(crop.shape[0] * 0.60)), :]
+        hsv_crop = cv2.cvtColor(jersey_crop, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist(
+            [hsv_crop],
+            [0, 1],
+            None,
+            [16, 8],
+            [0, 180, 0, 256],
+        )
+        hist = cv2.normalize(hist, hist).flatten()
+        if not np.isfinite(hist).all() or float(np.sum(hist)) == 0.0:
+            return None
+        return hist.astype(float)
+
+    def _appearance_distance(
+        self,
+        appearance_a: Optional[np.ndarray],
+        appearance_b: Optional[np.ndarray],
+    ) -> float:
+        """Compare two normalized HSV histograms."""
+        if appearance_a is None or appearance_b is None:
+            return 1.0
+        return float(cv2.compareHist(
+            appearance_a.astype(np.float32),
+            appearance_b.astype(np.float32),
+            cv2.HISTCMP_BHATTACHARYYA,
+        ))
+
     def _match_previous_display_id(
         self,
         bbox: np.ndarray,
         role: str,
+        appearance: Optional[np.ndarray],
         used_display_ids: Set[int],
     ) -> Optional[int]:
-        """Relink a new ByteTrack ID to a recent display ID when likely same person."""
+        """Relink a new tracker ID to a previous display ID when likely same person."""
         best_display_id = None
         best_score = -999.0
         current_center = self._bbox_center(bbox)
@@ -308,7 +350,7 @@ class Tracker:
             if display_id in used_display_ids:
                 continue
             age = self._frame_index - int(state["frame_index"])
-            if age <= 0 or age > self.identity_lost_buffer:
+            if age <= 0 or age > self.identity_long_buffer:
                 continue
             previous_role = str(state.get("role", "player"))
             if not self._role_compatible_for_identity(previous_role, role):
@@ -323,11 +365,31 @@ class Tracker:
             center_distance = float(np.linalg.norm(current_center - previous_center))
             normalized_distance = center_distance / scale
             iou = self._bbox_iou(bbox, previous_bbox)
+            appearance_distance = self._appearance_distance(
+                appearance,
+                np.asarray(state["appearance"], dtype=float)
+                if state.get("appearance") is not None
+                else None,
+            )
+
+            if age > self.identity_lost_buffer:
+                if appearance_distance > self.appearance_match_threshold:
+                    continue
+                score = (1.0 - appearance_distance) - (0.0005 * age)
+                if score > best_score:
+                    best_score = score
+                    best_display_id = int(display_id)
+                continue
 
             if iou < 0.08 and normalized_distance > 0.95:
                 continue
 
-            score = (2.0 * iou) - normalized_distance - (0.02 * age)
+            score = (
+                (2.0 * iou)
+                - normalized_distance
+                - (0.02 * age)
+                + (0.2 * (1.0 - appearance_distance))
+            )
             if score > best_score:
                 best_score = score
                 best_display_id = int(display_id)
@@ -339,6 +401,7 @@ class Tracker:
         raw_track_id: int,
         bbox: np.ndarray,
         role: str,
+        appearance: Optional[np.ndarray],
         used_display_ids: Set[int],
     ) -> int:
         """Map noisy ByteTrack IDs to stable user-facing IDs."""
@@ -347,7 +410,12 @@ class Tracker:
             if display_id not in used_display_ids:
                 return display_id
 
-        display_id = self._match_previous_display_id(bbox, role, used_display_ids)
+        display_id = self._match_previous_display_id(
+            bbox,
+            role,
+            appearance,
+            used_display_ids,
+        )
         if display_id is None:
             display_id = self._next_display_id
             self._next_display_id += 1
@@ -355,11 +423,32 @@ class Tracker:
         self._display_id_by_tracker_id[raw_track_id] = display_id
         return display_id
 
-    def _remember_display_track(self, display_id: int, bbox: np.ndarray, role: str) -> None:
+    def _remember_display_track(
+        self,
+        display_id: int,
+        bbox: np.ndarray,
+        role: str,
+        appearance: Optional[np.ndarray],
+    ) -> None:
         """Store last position for lightweight ID relinking."""
+        previous = self._last_seen_by_display_id.get(int(display_id), {})
+        previous_appearance = previous.get("appearance")
+        if appearance is None and previous_appearance is not None:
+            stored_appearance = previous_appearance
+        elif appearance is not None and previous_appearance is not None:
+            stored_appearance = (
+                0.70 * np.asarray(previous_appearance, dtype=float)
+                + 0.30 * appearance
+            ).tolist()
+        elif appearance is not None:
+            stored_appearance = appearance.tolist()
+        else:
+            stored_appearance = None
+
         self._last_seen_by_display_id[int(display_id)] = {
             "bbox": np.asarray(bbox, dtype=float).tolist(),
             "role": role,
+            "appearance": stored_appearance,
             "frame_index": int(self._frame_index),
         }
 
@@ -469,14 +558,16 @@ class Tracker:
                 raw_track_id = int(item["raw_track_id"])
                 raw_role = str(item["role"])
                 stable_role = self._stable_role_for_track(raw_track_id, raw_role)
+                appearance = self._extract_appearance(frame, bbox)
                 display_id = self._display_id_for_track(
                     raw_track_id=raw_track_id,
                     bbox=bbox,
                     role=stable_role,
+                    appearance=appearance,
                     used_display_ids=used_display_ids,
                 )
                 used_display_ids.add(display_id)
-                self._remember_display_track(display_id, bbox, stable_role)
+                self._remember_display_track(display_id, bbox, stable_role, appearance)
 
                 track_data = {
                     "bbox": bbox.tolist(),
@@ -588,14 +679,22 @@ class Tracker:
                     raw_role = "player"
                 raw_track_id = int(track_id)
                 stable_role = self._stable_role_for_track(raw_track_id, raw_role)
+                frame = frames[frame_num]
+                appearance = self._extract_appearance(frame, np.asarray(bbox, dtype=float))
                 display_id = self._display_id_for_track(
                     raw_track_id=raw_track_id,
                     bbox=np.asarray(bbox, dtype=float),
                     role=stable_role,
+                    appearance=appearance,
                     used_display_ids=used_display_ids,
                 )
                 used_display_ids.add(display_id)
-                self._remember_display_track(display_id, np.asarray(bbox), stable_role)
+                self._remember_display_track(
+                    display_id,
+                    np.asarray(bbox),
+                    stable_role,
+                    appearance,
+                )
                 track_data = {
                     "bbox": bbox.tolist(),
                     "role": stable_role,
