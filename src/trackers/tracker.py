@@ -6,7 +6,9 @@ Based on: football_analysis_yolo by TrishamBP
 import os
 import pickle
 import inspect
+import tempfile
 from collections import Counter, defaultdict
+from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 import cv2
@@ -14,7 +16,9 @@ import numpy as np
 import pandas as pd
 from ultralytics import YOLO
 import supervision as sv
+import yaml
 
+from src.field_filter import FieldFilter
 from src.utils.bbox_utils import get_center_of_bbox, get_foot_position, get_bbox_width
 
 
@@ -22,6 +26,37 @@ class Tracker:
     """Detect and track players, referees, and ball in football video."""
 
     PERSON_ROLES = {"player", "goalkeeper", "referee"}
+    DEFAULT_BOTSORT_SETTINGS = {
+        "tracker_type": "botsort",
+        "track_high_thresh": 0.25,
+        "track_low_thresh": 0.10,
+        "new_track_thresh": 0.30,
+        "track_buffer": 150,
+        "match_thresh": 0.90,
+        "fuse_score": True,
+        "gmc_method": "sparseOptFlow",
+        "proximity_thresh": 0.90,
+        "appearance_thresh": 0.30,
+        "with_reid": True,
+        "model": "auto",
+    }
+    DEFAULT_FIELD_FILTER_SETTINGS = {
+        "hsv_lower": [35, 27, 40],
+        "hsv_upper": [95, 200, 200],
+        "alpha_smooth": 0.7,
+        "kernel_erode_size": 18,
+        "kernel_dilate_size": 13,
+        "kernel_close_size": 30,
+        "morph_iterations": 2,
+        "binary_threshold": 100,
+        "min_area_ratio": 0.01,
+        "poly_epsilon": 0.01,
+        "bottom_zone_ratio": 0.80,
+        "clipping_margin": 5,
+        "thresh_clipping": -5.0,
+        "thresh_bottom": 5.0,
+        "thresh_standard": -2.0,
+    }
     CLASS_ALIASES = {
         "players": "player",
         "football-player": "player",
@@ -51,6 +86,8 @@ class Tracker:
         person_confidence: float = 0.25,
         ball_confidence: float = 0.08,
         role_stability_window: int = 12,
+        tracker_backend: Optional[str] = None,
+        enable_field_filter: Optional[bool] = None,
     ):
         """Initialize tracker with YOLO model.
 
@@ -60,9 +97,20 @@ class Tracker:
             person_confidence: Minimum confidence for player/referee/goalkeeper detections.
             ball_confidence: Minimum confidence for ball detections.
             role_stability_window: Number of recent role votes kept for each track ID.
+            tracker_backend: "botsort" or "bytetrack".
+            enable_field_filter: Remove non-pitch detections when True.
         """
         self.model = YOLO(model_path)
+        self.tracker_backend = (tracker_backend or os.environ.get("TRACKER_BACKEND", "botsort")).lower()
         self.tracker = sv.ByteTrack(**self._bytetrack_kwargs())
+        self.botsort_tracker_path = self._create_botsort_yaml()
+        if enable_field_filter is None:
+            enable_field_filter = os.environ.get("ENABLE_FIELD_FILTER", "1").strip() != "0"
+        self.field_filter = (
+            FieldFilter(self.DEFAULT_FIELD_FILTER_SETTINGS)
+            if enable_field_filter
+            else None
+        )
         self.detection_confidence = detection_confidence
         self.person_confidence = person_confidence
         self.ball_confidence = ball_confidence
@@ -73,6 +121,17 @@ class Tracker:
         self._display_id_by_tracker_id: Dict[int, int] = {}
         self._last_seen_by_display_id: Dict[int, Dict] = {}
         self.identity_lost_buffer = 90
+
+    def _create_botsort_yaml(self) -> str:
+        """Create a temporary BoT-SORT config for Ultralytics tracking."""
+        config_dir = Path(tempfile.gettempdir()) / "football_tactical_ai"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_path = config_dir / "botsort_reid.yaml"
+        config_path.write_text(
+            yaml.safe_dump(self.DEFAULT_BOTSORT_SETTINGS, sort_keys=False),
+            encoding="utf-8",
+        )
+        return str(config_path)
 
     @staticmethod
     def _bytetrack_kwargs_for_signature(parameter_names: Set[str]) -> Dict:
@@ -335,12 +394,122 @@ class Tracker:
 
         return detections[np.array(keep_mask, dtype=bool)]
 
+    def _get_object_tracks_with_botsort(self, frames: List[np.ndarray]) -> Dict:
+        """Track frames with Ultralytics BoT-SORT + ReID settings."""
+        results = self.model.track(
+            source=frames,
+            conf=self.detection_confidence,
+            iou=0.7,
+            tracker=self.botsort_tracker_path,
+            persist=True,
+            verbose=False,
+            stream=False,
+            agnostic_nms=True,
+        )
+
+        tracks = {
+            "players": [],
+            "referees": [],
+            "ball": [],
+        }
+
+        for result_index, result in enumerate(results):
+            frame = frames[result_index]
+            cls_names = getattr(result, "names", {}) or {}
+            tracks["players"].append({})
+            tracks["referees"].append({})
+            tracks["ball"].append({})
+
+            boxes = getattr(result, "boxes", None)
+            if boxes is None or boxes.id is None:
+                self._prune_identity_cache()
+                self._frame_index += 1
+                continue
+
+            xyxy_values = boxes.xyxy.cpu().numpy()
+            class_values = boxes.cls.int().cpu().numpy()
+            confidence_values = boxes.conf.cpu().numpy()
+            track_id_values = boxes.id.int().cpu().numpy()
+
+            people_items = []
+            best_ball = None
+            best_ball_confidence = -1.0
+
+            for bbox, class_id, confidence, raw_track_id in zip(
+                xyxy_values,
+                class_values,
+                confidence_values,
+                track_id_values,
+            ):
+                role = self._normalize_class_name(cls_names.get(int(class_id), ""))
+                confidence = float(confidence)
+
+                if role in self.PERSON_ROLES:
+                    if confidence < self.person_confidence:
+                        continue
+                    people_items.append(
+                        {
+                            "xyxy": np.asarray(bbox, dtype=float),
+                            "raw_track_id": int(raw_track_id),
+                            "role": role,
+                            "confidence": confidence,
+                        }
+                    )
+                elif role == "ball" and confidence >= self.ball_confidence:
+                    if confidence > best_ball_confidence:
+                        best_ball_confidence = confidence
+                        best_ball = np.asarray(bbox, dtype=float)
+
+            if self.field_filter is not None:
+                people_items = self.field_filter.filter_track_items(frame, people_items)
+
+            used_display_ids: Set[int] = set()
+            for item in people_items:
+                bbox = np.asarray(item["xyxy"], dtype=float)
+                raw_track_id = int(item["raw_track_id"])
+                raw_role = str(item["role"])
+                stable_role = self._stable_role_for_track(raw_track_id, raw_role)
+                display_id = self._display_id_for_track(
+                    raw_track_id=raw_track_id,
+                    bbox=bbox,
+                    role=stable_role,
+                    used_display_ids=used_display_ids,
+                )
+                used_display_ids.add(display_id)
+                self._remember_display_track(display_id, bbox, stable_role)
+
+                track_data = {
+                    "bbox": bbox.tolist(),
+                    "role": stable_role,
+                    "detected_role": raw_role,
+                    "raw_track_id": raw_track_id,
+                    "confidence": float(item["confidence"]),
+                }
+                if stable_role == "referee":
+                    tracks["referees"][result_index][display_id] = track_data
+                else:
+                    tracks["players"][result_index][display_id] = track_data
+
+            if best_ball is not None:
+                tracks["ball"][result_index][1] = {"bbox": best_ball.tolist()}
+
+            self._prune_identity_cache()
+            self._frame_index += 1
+
+        return tracks
+
     def get_object_tracks_for_frames(self, frames: List[np.ndarray]) -> Dict:
         """Track a batch of frames using the current tracker state.
 
         This is intended for long videos where the caller processes sampled
         frames in batches instead of keeping the full match in memory.
         """
+        if self.tracker_backend == "botsort":
+            try:
+                return self._get_object_tracks_with_botsort(frames)
+            except Exception:
+                self.tracker_backend = "bytetrack"
+
         detections = self.detect_frames(frames)
 
         tracks = {

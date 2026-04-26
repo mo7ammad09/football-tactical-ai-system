@@ -10,6 +10,7 @@ python-dotenv>=1.0.0
 # Object Detection & Tracking
 ultralytics>=8.0.0
 supervision>=0.16.0
+lap>=0.5.12
 
 # Machine Learning
 scikit-learn>=1.3.0
