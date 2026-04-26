@@ -52,6 +52,7 @@ docker push YOUR_DOCKERHUB_USER/football-tactical-ai:latest
   - `OBJECT_STORAGE_PUBLIC_BASE_URL` إذا عندك CDN/public bucket
   - `OBJECT_STORAGE_PRESIGN_EXPIRES=86400` إذا التخزين private وتحتاج روابط مؤقتة
   - `MODEL_PATH=models/abdullah_yolov5.pt` فقط إذا بنيت الموديل داخل الصورة
+  - `TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1` مفعلة داخل الصورة الرسمية حتى تحمل موديلات Ultralytics القديمة. استخدمها فقط مع ملفات `.pt` تثق بمصدرها.
 
 ملاحظة: الصورة الرسمية لا تضع ملفات `.pt` داخل Docker image. الواجهة سترفع الموديل إلى object storage مع job، والـworker سيحمله عبر `model_object_key`.
 

@@ -9,6 +9,10 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+# PyTorch 2.6+ defaults torch.load(..., weights_only=True). Older trusted
+# Ultralytics checkpoints include model classes and need the classic loader.
+os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
+
 try:
     import runpod
 except ImportError:  # pragma: no cover - local tests may not install runpod
