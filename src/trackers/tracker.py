@@ -5,8 +5,9 @@ Based on: football_analysis_yolo by TrishamBP
 
 import os
 import pickle
+import inspect
 from collections import Counter, defaultdict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import cv2
 import numpy as np
@@ -61,18 +62,39 @@ class Tracker:
             role_stability_window: Number of recent role votes kept for each track ID.
         """
         self.model = YOLO(model_path)
-        self.tracker = sv.ByteTrack(
-            track_activation_threshold=0.2,
-            lost_track_buffer=90,
-            minimum_matching_threshold=0.7,
-            frame_rate=30,
-            minimum_consecutive_frames=1,
-        )
+        self.tracker = sv.ByteTrack(**self._bytetrack_kwargs())
         self.detection_confidence = detection_confidence
         self.person_confidence = person_confidence
         self.ball_confidence = ball_confidence
         self.role_stability_window = max(1, int(role_stability_window))
         self._role_votes: Dict[int, List[str]] = defaultdict(list)
+
+    @staticmethod
+    def _bytetrack_kwargs_for_signature(parameter_names: Set[str]) -> Dict:
+        """Build ByteTrack kwargs for old and new supervision versions."""
+        desired = {
+            "track_activation_threshold": 0.2,
+            "lost_track_buffer": 90,
+            "minimum_matching_threshold": 0.7,
+            "minimum_consecutive_frames": 1,
+            "track_thresh": 0.2,
+            "track_buffer": 90,
+            "match_thresh": 0.7,
+            "frame_rate": 30,
+        }
+        return {
+            name: value
+            for name, value in desired.items()
+            if name in parameter_names
+        }
+
+    def _bytetrack_kwargs(self) -> Dict:
+        """Return kwargs accepted by the installed supervision ByteTrack."""
+        try:
+            signature = inspect.signature(sv.ByteTrack)
+        except (TypeError, ValueError):
+            return {}
+        return self._bytetrack_kwargs_for_signature(set(signature.parameters))
 
     def add_position_to_tracks(self, tracks: Dict) -> None:
         """Add foot/center position to all tracked objects.
