@@ -70,6 +70,7 @@ def test_runpod_client_uploads_to_storage_and_submits_job(tmp_path):
         resize_width=1280,
         model_path="models/model.pt",
         identity_merge_map={430: 12},
+        tracker_backend="strongsort",
     )
 
     assert job_id == "rp-job-1"
@@ -82,6 +83,7 @@ def test_runpod_client_uploads_to_storage_and_submits_job(tmp_path):
     assert payload["max_frames"] is None
     assert payload["model_path"] == "models/model.pt"
     assert payload["identity_merge_map"] == {430: 12}
+    assert payload["tracker_backend"] == "strongsort"
 
 
 def test_runpod_client_polls_completed_result():

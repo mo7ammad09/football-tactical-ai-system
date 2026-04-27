@@ -263,6 +263,7 @@ def run_batch_analysis(
     max_frames: Optional[int] = None,
     batch_size: int = 16,
     identity_merge_map: Optional[Dict[Any, Any]] = None,
+    tracker_backend: str = "botsort",
 ) -> Dict[str, Any]:
     """Run a conservative, memory-aware analysis and write local artifacts."""
     warnings: List[str] = []
@@ -275,7 +276,7 @@ def run_batch_analysis(
     output_root.mkdir(parents=True, exist_ok=True)
     output_path = output_root / f"{job_id}_output.mp4"
 
-    tracker = Tracker(model_path)
+    tracker = Tracker(model_path, tracker_backend=tracker_backend)
     team_assigner = TeamAssigner()
     ball_assigner = BallAssigner()
     view_transformer = ViewTransformer()
@@ -505,6 +506,7 @@ def run_batch_analysis(
             "analysis_fps": float(analysis_fps),
             "output_fps": float(resolved_output_fps),
             "resize_width": int(resize_width),
+            "tracker_backend": str(tracker.tracker_backend),
             "source_duration_seconds": props.get("duration_seconds"),
             "source_fps": props.get("fps"),
             "ball_detection_frames": ball_detections,

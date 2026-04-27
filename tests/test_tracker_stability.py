@@ -16,6 +16,7 @@ def _tracker_without_model() -> Tracker:
     tracker._next_display_id = 1
     tracker._display_id_by_tracker_id = {}
     tracker._last_seen_by_display_id = {}
+    tracker.strongsort_tracker = None
     tracker.identity_lost_buffer = 900
     tracker.identity_long_buffer = 5400
     tracker.appearance_match_threshold = 0.38
@@ -90,6 +91,20 @@ def test_display_id_relinks_new_raw_track_near_recent_player():
     )
 
     assert relinked_display_id == first_display_id
+
+
+def test_identity_cache_prunes_after_long_buffer_not_short_lost_buffer():
+    tracker = _tracker_without_model()
+    tracker._last_seen_by_display_id[1] = {"frame_index": 0}
+    tracker._last_seen_by_display_id[2] = {"frame_index": 0}
+
+    tracker._frame_index = tracker.identity_lost_buffer + 1
+    tracker._prune_identity_cache()
+    assert set(tracker._last_seen_by_display_id) == {1, 2}
+
+    tracker._frame_index = tracker.identity_long_buffer + 1
+    tracker._prune_identity_cache()
+    assert tracker._last_seen_by_display_id == {}
 
 
 def test_display_id_does_not_relink_player_to_recent_referee():

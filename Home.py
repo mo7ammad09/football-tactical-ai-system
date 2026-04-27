@@ -526,6 +526,32 @@ with st.sidebar:
             min_value=480, max_value=1920, value=preset_resize_width, step=80
         )
         if use_runpod_serverless:
+            tracker_backend_options = (
+                [
+                    "StrongSORT/OSNet - أقصى ثبات للهوية",
+                    "BoT-SORT - أسرع ومتوازن",
+                ]
+                if lang == "ar"
+                else [
+                    "StrongSORT/OSNet - Max ID Stability",
+                    "BoT-SORT - Faster Balanced",
+                ]
+            )
+            tracker_backend_label = st.selectbox(
+                "نظام تتبع اللاعبين" if lang == "ar" else "Player Tracking Backend",
+                tracker_backend_options,
+                index=0,
+                help=(
+                    "StrongSORT أبطأ وأغلى لكنه أفضل لتثبيت أرقام اللاعبين في مباريات طويلة."
+                    if lang == "ar"
+                    else "StrongSORT is slower and more expensive, but better for stable player IDs in long matches."
+                ),
+            )
+            tracker_backend_remote = (
+                "strongsort"
+                if "StrongSORT" in tracker_backend_label
+                else "botsort"
+            )
             identity_merge_text_remote = st.text_area(
                 "دمج أرقام التتبع يدوياً (اختياري)" if lang == "ar" else "Manual ID merge map (optional)",
                 value="",
@@ -539,6 +565,7 @@ with st.sidebar:
             )
         else:
             identity_merge_text_remote = ""
+            tracker_backend_remote = "botsort"
         st.caption(
             "السريع مناسب للمباريات الطويلة. الجودة العالية أدق لكنها أبطأ وأغلى. جودة قصوى مخصصة للمقاطع القصيرة."
             if lang == "ar"
@@ -552,6 +579,7 @@ with st.sidebar:
         max_frames_remote = None
         resize_width_remote = 1280
         identity_merge_text_remote = ""
+        tracker_backend_remote = "botsort"
 
     st.markdown("---")
     
@@ -978,6 +1006,7 @@ if video_path:
                         max_frames=int(max_frames_remote) if max_frames_remote else None,
                         resize_width=int(resize_width_remote),
                         identity_merge_map=identity_merge_map,
+                        tracker_backend=tracker_backend_remote,
                     )
                     st.session_state.runpod_job_id = job_id
                     upload_elapsed_s = time.time() - upload_started_at

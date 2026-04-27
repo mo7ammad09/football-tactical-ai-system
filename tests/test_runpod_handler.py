@@ -48,6 +48,7 @@ def test_runpod_handler_accepts_legacy_video_url_without_storage(monkeypatch, tm
             "input": {
                 "video_url": "https://example.com/video.mp4",
                 "identity_merge_map": {"430": 12},
+                "tracker_backend": "strongsort",
             },
         }
     )
@@ -56,3 +57,4 @@ def test_runpod_handler_accepts_legacy_video_url_without_storage(monkeypatch, tm
     assert result["stats"]["processed_frames"] == 1
     assert "annotated_video" in result["artifacts"]
     assert captured_kwargs["identity_merge_map"] == {"430": 12}
+    assert captured_kwargs["tracker_backend"] == "strongsort"

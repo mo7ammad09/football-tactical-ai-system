@@ -97,12 +97,13 @@ class Tracker:
             person_confidence: Minimum confidence for player/referee/goalkeeper detections.
             ball_confidence: Minimum confidence for ball detections.
             role_stability_window: Number of recent role votes kept for each track ID.
-            tracker_backend: "botsort" or "bytetrack".
+            tracker_backend: "strongsort", "botsort", or "bytetrack".
             enable_field_filter: Remove non-pitch detections when True.
         """
         self.model = YOLO(model_path)
         self.tracker_backend = (tracker_backend or os.environ.get("TRACKER_BACKEND", "botsort")).lower()
         self.tracker = sv.ByteTrack(**self._bytetrack_kwargs())
+        self.strongsort_tracker = None
         self.botsort_tracker_path = self._create_botsort_yaml()
         if enable_field_filter is None:
             enable_field_filter = os.environ.get("ENABLE_FIELD_FILTER", "1").strip() != "0"
@@ -123,6 +124,53 @@ class Tracker:
         self.identity_lost_buffer = 900
         self.identity_long_buffer = 5400
         self.appearance_match_threshold = 0.38
+
+    def _create_strongsort_tracker(self):
+        """Create the optional StrongSORT/OSNet tracker."""
+        try:
+            import torch
+            from boxmot.trackers.strongsort.strongsort import StrongSort
+        except Exception as exc:
+            raise RuntimeError(
+                "StrongSORT tracking requires BoxMOT. Install boxmot and its "
+                "runtime dependencies, or use tracker_backend='botsort'."
+            ) from exc
+
+        default_weights = Path("/app/tracking/weights/osnet_ain_x1_0_msmt17.pt")
+        if not default_weights.exists():
+            default_weights = Path("models/reid/osnet_ain_x1_0_msmt17.pt")
+
+        weights_path = Path(
+            os.environ.get(
+                "STRONGSORT_REID_WEIGHTS",
+                str(default_weights),
+            )
+        )
+        weights_path.parent.mkdir(parents=True, exist_ok=True)
+
+        device_name = os.environ.get(
+            "STRONGSORT_DEVICE",
+            "cuda:0" if torch.cuda.is_available() else "cpu",
+        )
+        device = torch.device(device_name)
+        half = (
+            device.type != "cpu"
+            and os.environ.get("STRONGSORT_HALF", "1").strip() != "0"
+        )
+
+        return StrongSort(
+            reid_weights=weights_path,
+            device=device,
+            half=half,
+            min_conf=float(os.environ.get("STRONGSORT_MIN_CONF", str(self.person_confidence))),
+            max_cos_dist=float(os.environ.get("STRONGSORT_MAX_COS_DIST", "0.35")),
+            max_iou_dist=float(os.environ.get("STRONGSORT_MAX_IOU_DIST", "0.95")),
+            max_age=int(os.environ.get("STRONGSORT_MAX_AGE", "1800")),
+            n_init=int(os.environ.get("STRONGSORT_N_INIT", "1")),
+            nn_budget=int(os.environ.get("STRONGSORT_NN_BUDGET", "500")),
+            mc_lambda=float(os.environ.get("STRONGSORT_MC_LAMBDA", "0.995")),
+            ema_alpha=float(os.environ.get("STRONGSORT_EMA_ALPHA", "0.90")),
+        )
 
     def _create_botsort_yaml(self) -> str:
         """Create a temporary BoT-SORT config for Ultralytics tracking."""
@@ -465,7 +513,7 @@ class Tracker:
         expired = [
             display_id
             for display_id, state in self._last_seen_by_display_id.items()
-            if self._frame_index - int(state["frame_index"]) > self.identity_lost_buffer
+            if self._frame_index - int(state["frame_index"]) > self.identity_long_buffer
         ]
         for display_id in expired:
             del self._last_seen_by_display_id[display_id]
@@ -597,12 +645,144 @@ class Tracker:
 
         return tracks
 
+    def _get_object_tracks_with_strongsort(self, frames: List[np.ndarray]) -> Dict:
+        """Track frames with StrongSORT + OSNet ReID for maximum ID stability."""
+        if self.strongsort_tracker is None:
+            self.strongsort_tracker = self._create_strongsort_tracker()
+
+        detections = self.detect_frames(frames)
+        tracks = {
+            "players": [],
+            "referees": [],
+            "ball": [],
+        }
+        role_to_class = {"player": 0, "goalkeeper": 1, "referee": 2}
+        class_to_role = {value: key for key, value in role_to_class.items()}
+
+        for frame_num, detection in enumerate(detections):
+            frame = frames[frame_num]
+            cls_names = detection.names
+            detection_supervision = sv.Detections.from_ultralytics(detection)
+            detection_supervision = self._filter_detections(detection_supervision, cls_names)
+
+            tracks["players"].append({})
+            tracks["referees"].append({})
+            tracks["ball"].append({})
+
+            class_ids = (
+                detection_supervision.class_id
+                if detection_supervision.class_id is not None
+                else np.array([], dtype=int)
+            )
+            confidences = (
+                detection_supervision.confidence
+                if detection_supervision.confidence is not None
+                else np.ones(len(detection_supervision), dtype=float)
+            )
+
+            people_items = []
+            best_ball = None
+            best_ball_confidence = -1.0
+            for bbox, class_id, confidence in zip(
+                np.asarray(detection_supervision.xyxy),
+                class_ids,
+                confidences,
+            ):
+                role = self._normalize_class_name(cls_names.get(int(class_id), ""))
+                confidence = float(confidence)
+                if role in self.PERSON_ROLES:
+                    if confidence < self.person_confidence:
+                        continue
+                    people_items.append(
+                        {
+                            "xyxy": np.asarray(bbox, dtype=float),
+                            "role": role,
+                            "confidence": confidence,
+                        }
+                    )
+                elif role == "ball" and confidence >= self.ball_confidence:
+                    if confidence > best_ball_confidence:
+                        best_ball_confidence = confidence
+                        best_ball = np.asarray(bbox, dtype=float)
+
+            if self.field_filter is not None:
+                people_items = self.field_filter.filter_track_items(frame, people_items)
+
+            if people_items:
+                dets = np.asarray(
+                    [
+                        [
+                            *item["xyxy"].tolist(),
+                            float(item["confidence"]),
+                            float(role_to_class.get(str(item["role"]), 0)),
+                        ]
+                        for item in people_items
+                    ],
+                    dtype=float,
+                )
+            else:
+                dets = np.empty((0, 6), dtype=float)
+
+            strongsort_outputs = self.strongsort_tracker.update(dets, frame)
+            if strongsort_outputs is None:
+                strongsort_outputs = np.empty((0, 8), dtype=float)
+
+            used_display_ids: Set[int] = set()
+            for output in np.asarray(strongsort_outputs):
+                if len(output) < 8:
+                    continue
+                bbox = np.asarray(output[0:4], dtype=float)
+                raw_track_id = int(output[4])
+                confidence = float(output[5])
+                class_id = int(output[6])
+                det_ind = int(output[7])
+                if 0 <= det_ind < len(people_items):
+                    raw_role = str(people_items[det_ind]["role"])
+                else:
+                    raw_role = class_to_role.get(class_id, "player")
+
+                stable_role = self._stable_role_for_track(raw_track_id, raw_role)
+                appearance = self._extract_appearance(frame, bbox)
+                display_id = self._display_id_for_track(
+                    raw_track_id=raw_track_id,
+                    bbox=bbox,
+                    role=stable_role,
+                    appearance=appearance,
+                    used_display_ids=used_display_ids,
+                )
+                used_display_ids.add(display_id)
+                self._remember_display_track(display_id, bbox, stable_role, appearance)
+
+                track_data = {
+                    "bbox": bbox.tolist(),
+                    "role": stable_role,
+                    "detected_role": raw_role,
+                    "raw_track_id": raw_track_id,
+                    "confidence": confidence,
+                    "tracker_backend": "strongsort",
+                }
+                if stable_role == "referee":
+                    tracks["referees"][frame_num][display_id] = track_data
+                else:
+                    tracks["players"][frame_num][display_id] = track_data
+
+            if best_ball is not None:
+                tracks["ball"][frame_num][1] = {"bbox": best_ball.tolist()}
+
+            self._prune_identity_cache()
+            self._frame_index += 1
+
+        return tracks
+
     def get_object_tracks_for_frames(self, frames: List[np.ndarray]) -> Dict:
         """Track a batch of frames using the current tracker state.
 
         This is intended for long videos where the caller processes sampled
         frames in batches instead of keeping the full match in memory.
         """
+        if self.tracker_backend == "strongsort":
+            return self._get_object_tracks_with_strongsort(frames)
+
         if self.tracker_backend == "botsort":
             try:
                 return self._get_object_tracks_with_botsort(frames)

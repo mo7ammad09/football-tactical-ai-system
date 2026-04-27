@@ -96,6 +96,7 @@ class RunPodServerlessClient(AnalysisClient):
         max_frames: Optional[int] = None,
         resize_width: int = 1280,
         identity_merge_map: Optional[Dict[Any, Any]] = None,
+        tracker_backend: str = "botsort",
     ) -> str:
         """Submit a serverless job using existing object storage keys."""
         payload: Dict[str, Any] = {
@@ -106,6 +107,7 @@ class RunPodServerlessClient(AnalysisClient):
                 "resize_width": int(resize_width),
                 "max_frames": int(max_frames) if max_frames is not None else None,
                 "identity_merge_map": identity_merge_map or {},
+                "tracker_backend": str(tracker_backend or "botsort").lower(),
             }
         }
         if model_object_key:
@@ -132,6 +134,7 @@ class RunPodServerlessClient(AnalysisClient):
         max_frames: Optional[int] = None,
         resize_width: int = 1280,
         identity_merge_map: Optional[Dict[Any, Any]] = None,
+        tracker_backend: str = "botsort",
     ) -> str:
         """Upload input artifacts to object storage and submit a RunPod job."""
         video_total_bytes = os.path.getsize(video_path)
@@ -184,6 +187,7 @@ class RunPodServerlessClient(AnalysisClient):
             max_frames=max_frames,
             resize_width=resize_width,
             identity_merge_map=identity_merge_map,
+            tracker_backend=tracker_backend,
         )
         self._emit_progress(progress_callback, 95, phase="submitted")
         return job_id
