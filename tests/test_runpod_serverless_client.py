@@ -71,6 +71,7 @@ def test_runpod_client_uploads_to_storage_and_submits_job(tmp_path):
         model_path="models/model.pt",
         identity_merge_map={430: 12},
         tracker_backend="strongsort",
+        execution_timeout_ms=7_200_000,
     )
 
     assert job_id == "rp-job-1"
@@ -84,6 +85,8 @@ def test_runpod_client_uploads_to_storage_and_submits_job(tmp_path):
     assert payload["model_path"] == "models/model.pt"
     assert payload["identity_merge_map"] == {430: 12}
     assert payload["tracker_backend"] == "strongsort"
+    assert dummy_session.posts[0]["json"]["policy"]["executionTimeout"] == 7_200_000
+    assert dummy_session.posts[0]["json"]["policy"]["ttl"] == 86_400_000
 
 
 def test_runpod_client_polls_completed_result():
@@ -100,3 +103,23 @@ def test_runpod_client_polls_completed_result():
     assert status["status"] == "completed"
     assert status["progress"] == 100
     assert result["stats"]["processed_frames"] == 10
+
+
+def test_runpod_client_defaults_to_longer_policy_for_strongsort():
+    client = RunPodServerlessClient(
+        api_key="key",
+        endpoint_id="endpoint",
+        storage_client=DummyStorage(),
+    )
+    dummy_session = DummySession()
+    client.session = dummy_session
+
+    job_id = client.start_from_storage(
+        video_object_key="video/match.mp4",
+        tracker_backend="strongsort",
+    )
+
+    assert job_id == "rp-job-1"
+    policy = dummy_session.posts[0]["json"]["policy"]
+    assert policy["executionTimeout"] == 21_600_000
+    assert policy["ttl"] == 86_400_000

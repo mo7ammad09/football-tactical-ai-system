@@ -552,6 +552,21 @@ with st.sidebar:
                 if "StrongSORT" in tracker_backend_label
                 else "botsort"
             )
+            default_timeout_hours = 6.0 if tracker_backend_remote == "strongsort" else 2.0
+            runpod_execution_timeout_hours = st.number_input(
+                "أقصى وقت للتحليل في RunPod (ساعات)"
+                if lang == "ar"
+                else "RunPod max analysis time (hours)",
+                min_value=0.25,
+                max_value=24.0,
+                value=default_timeout_hours,
+                step=0.25,
+                help=(
+                    "StrongSORT يحتاج وقت أطول. هذا يمنع RunPod من إيقاف التحليل بعد 10 دقائق."
+                    if lang == "ar"
+                    else "StrongSORT needs more time. This prevents RunPod from stopping after 10 minutes."
+                ),
+            )
             identity_merge_text_remote = st.text_area(
                 "دمج أرقام التتبع يدوياً (اختياري)" if lang == "ar" else "Manual ID merge map (optional)",
                 value="",
@@ -566,6 +581,7 @@ with st.sidebar:
         else:
             identity_merge_text_remote = ""
             tracker_backend_remote = "botsort"
+            runpod_execution_timeout_hours = 2.0
         st.caption(
             "السريع مناسب للمباريات الطويلة. الجودة العالية أدق لكنها أبطأ وأغلى. جودة قصوى مخصصة للمقاطع القصيرة."
             if lang == "ar"
@@ -580,6 +596,7 @@ with st.sidebar:
         resize_width_remote = 1280
         identity_merge_text_remote = ""
         tracker_backend_remote = "botsort"
+        runpod_execution_timeout_hours = 2.0
 
     st.markdown("---")
     
@@ -1007,6 +1024,7 @@ if video_path:
                         resize_width=int(resize_width_remote),
                         identity_merge_map=identity_merge_map,
                         tracker_backend=tracker_backend_remote,
+                        execution_timeout_ms=int(float(runpod_execution_timeout_hours) * 60 * 60 * 1000),
                     )
                     st.session_state.runpod_job_id = job_id
                     upload_elapsed_s = time.time() - upload_started_at

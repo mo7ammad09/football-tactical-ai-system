@@ -17,6 +17,11 @@ class RunPodServerlessClient(AnalysisClient):
 
     TERMINAL_STATUSES = {"COMPLETED", "FAILED", "CANCELLED", "CANCELED", "TIMED_OUT"}
     FAILED_STATUSES = {"FAILED", "CANCELLED", "CANCELED", "TIMED_OUT"}
+    DEFAULT_TTL_MS = 24 * 60 * 60 * 1000
+    DEFAULT_EXECUTION_TIMEOUT_MS = {
+        "botsort": 2 * 60 * 60 * 1000,
+        "strongsort": 6 * 60 * 60 * 1000,
+    }
 
     def __init__(
         self,
@@ -97,8 +102,19 @@ class RunPodServerlessClient(AnalysisClient):
         resize_width: int = 1280,
         identity_merge_map: Optional[Dict[Any, Any]] = None,
         tracker_backend: str = "botsort",
+        execution_timeout_ms: Optional[int] = None,
+        ttl_ms: Optional[int] = None,
     ) -> str:
         """Submit a serverless job using existing object storage keys."""
+        normalized_tracker_backend = str(tracker_backend or "botsort").lower()
+        if execution_timeout_ms is None:
+            execution_timeout_ms = self.DEFAULT_EXECUTION_TIMEOUT_MS.get(
+                normalized_tracker_backend,
+                self.DEFAULT_EXECUTION_TIMEOUT_MS["botsort"],
+            )
+        if ttl_ms is None:
+            ttl_ms = max(self.DEFAULT_TTL_MS, int(execution_timeout_ms) + (60 * 60 * 1000))
+
         payload: Dict[str, Any] = {
             "input": {
                 "video_object_key": video_object_key,
@@ -107,8 +123,12 @@ class RunPodServerlessClient(AnalysisClient):
                 "resize_width": int(resize_width),
                 "max_frames": int(max_frames) if max_frames is not None else None,
                 "identity_merge_map": identity_merge_map or {},
-                "tracker_backend": str(tracker_backend or "botsort").lower(),
-            }
+                "tracker_backend": normalized_tracker_backend,
+            },
+            "policy": {
+                "executionTimeout": int(execution_timeout_ms),
+                "ttl": int(ttl_ms),
+            },
         }
         if model_object_key:
             payload["input"]["model_object_key"] = model_object_key
@@ -135,6 +155,8 @@ class RunPodServerlessClient(AnalysisClient):
         resize_width: int = 1280,
         identity_merge_map: Optional[Dict[Any, Any]] = None,
         tracker_backend: str = "botsort",
+        execution_timeout_ms: Optional[int] = None,
+        ttl_ms: Optional[int] = None,
     ) -> str:
         """Upload input artifacts to object storage and submit a RunPod job."""
         video_total_bytes = os.path.getsize(video_path)
@@ -188,6 +210,8 @@ class RunPodServerlessClient(AnalysisClient):
             resize_width=resize_width,
             identity_merge_map=identity_merge_map,
             tracker_backend=tracker_backend,
+            execution_timeout_ms=execution_timeout_ms,
+            ttl_ms=ttl_ms,
         )
         self._emit_progress(progress_callback, 95, phase="submitted")
         return job_id
