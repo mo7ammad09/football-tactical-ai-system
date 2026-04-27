@@ -723,7 +723,12 @@ class Tracker:
             else:
                 dets = np.empty((0, 6), dtype=float)
 
-            strongsort_outputs = self.strongsort_tracker.update(dets, frame)
+            if len(dets) > 0:
+                strongsort_embeddings = self.strongsort_tracker.model.get_features(dets[:, 0:4], frame)
+            else:
+                strongsort_embeddings = np.empty((0, 0), dtype=float)
+
+            strongsort_outputs = self.strongsort_tracker.update(dets, frame, embs=strongsort_embeddings)
             if strongsort_outputs is None:
                 strongsort_outputs = np.empty((0, 8), dtype=float)
 
@@ -740,6 +745,9 @@ class Tracker:
                     raw_role = str(people_items[det_ind]["role"])
                 else:
                     raw_role = class_to_role.get(class_id, "player")
+                reid_embedding = None
+                if 0 <= det_ind < len(strongsort_embeddings):
+                    reid_embedding = np.asarray(strongsort_embeddings[det_ind], dtype=float)
 
                 stable_role = self._stable_role_for_track(raw_track_id, raw_role)
                 appearance = self._extract_appearance(frame, bbox)
@@ -761,6 +769,8 @@ class Tracker:
                     "confidence": confidence,
                     "tracker_backend": "strongsort",
                 }
+                if reid_embedding is not None and np.isfinite(reid_embedding).all():
+                    track_data["reid_embedding"] = reid_embedding.tolist()
                 if stable_role == "referee":
                     tracks["referees"][frame_num][display_id] = track_data
                 else:

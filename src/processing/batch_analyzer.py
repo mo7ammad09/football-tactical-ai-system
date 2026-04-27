@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from copy import deepcopy
 import csv
 import json
@@ -178,9 +179,376 @@ def _apply_identity_merge_map(batch_tracks: Dict[str, List[Dict]], merge_map: Di
     for object_type in ("players", "referees"):
         for frame_idx, frame_tracks in enumerate(batch_tracks.get(object_type, [])):
             merged, frame_conflicts = _merge_track_ids(frame_tracks, merge_map)
+            frame_tracks.clear()
+            frame_tracks.update(merged)
             batch_tracks[object_type][frame_idx] = merged
             conflicts += frame_conflicts
     return conflicts
+
+
+def _as_bbox_array(bbox: Any) -> np.ndarray:
+    """Convert a bbox-like value to an xyxy float array."""
+    try:
+        values = np.asarray(bbox, dtype=float).reshape(-1)
+    except Exception:
+        values = np.zeros(4, dtype=float)
+    if len(values) < 4:
+        return np.zeros(4, dtype=float)
+    return values[:4]
+
+
+def _bbox_center(bbox: Any) -> np.ndarray:
+    """Return bbox center."""
+    xyxy = _as_bbox_array(bbox)
+    return np.array(
+        [
+            (float(xyxy[0]) + float(xyxy[2])) / 2.0,
+            (float(xyxy[1]) + float(xyxy[3])) / 2.0,
+        ],
+        dtype=float,
+    )
+
+
+def _bbox_scale(bbox: Any) -> float:
+    """Return a stable scale for normalized distance."""
+    xyxy = _as_bbox_array(bbox)
+    return max(1.0, float(xyxy[2] - xyxy[0]), float(xyxy[3] - xyxy[1]))
+
+
+def _normalize_vector(values: Any) -> Optional[np.ndarray]:
+    """Return a finite L2-normalized vector."""
+    if values is None:
+        return None
+    vector = np.asarray(values, dtype=float).reshape(-1)
+    if vector.size == 0 or not np.isfinite(vector).all():
+        return None
+    norm = float(np.linalg.norm(vector))
+    if norm <= 0:
+        return None
+    return vector / norm
+
+
+def _cosine_distance(vector_a: Optional[np.ndarray], vector_b: Optional[np.ndarray]) -> float:
+    """Return cosine distance for normalized identity embeddings."""
+    a = _normalize_vector(vector_a)
+    b = _normalize_vector(vector_b)
+    if a is None or b is None or a.shape != b.shape:
+        return 1.0
+    return float(max(0.0, min(2.0, 1.0 - float(np.dot(a, b)))))
+
+
+def _extract_color_signature(frame: np.ndarray, bbox: Any) -> Optional[np.ndarray]:
+    """Extract a jersey/body color signature for fallback identity linking."""
+    xyxy = _as_bbox_array(bbox)
+    frame_h, frame_w = frame.shape[:2]
+    x1 = max(0, min(frame_w - 1, int(xyxy[0])))
+    y1 = max(0, min(frame_h - 1, int(xyxy[1])))
+    x2 = max(x1 + 1, min(frame_w, int(xyxy[2])))
+    y2 = max(y1 + 1, min(frame_h, int(xyxy[3])))
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None
+
+    body_crop = crop[: max(1, int(crop.shape[0] * 0.68)), :]
+    hsv_crop = cv2.cvtColor(body_crop, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist(
+        [hsv_crop],
+        [0, 1],
+        None,
+        [24, 12],
+        [0, 180, 0, 256],
+    )
+    hist = cv2.normalize(hist, hist).flatten()
+    return hist.astype(float) if np.isfinite(hist).all() else None
+
+
+def _merge_profile_vector(profile: Dict[str, Any], key: str, count_key: str, values: Any) -> None:
+    """Update a running mean vector in a profile."""
+    vector = _normalize_vector(values)
+    if vector is None:
+        return
+    if profile.get(key) is None:
+        profile[key] = vector
+        profile[count_key] = 1
+        return
+    count = int(profile.get(count_key, 0))
+    current = np.asarray(profile[key], dtype=float)
+    profile[key] = ((current * count) + vector) / float(count + 1)
+    profile[count_key] = count + 1
+
+
+def _update_identity_profile(
+    profiles: Dict[int, Dict[str, Any]],
+    *,
+    track_id: int,
+    role: str,
+    team: int,
+    sample_number: int,
+    source_frame_idx: int,
+    bbox: Any,
+    reid_embedding: Any = None,
+    color_signature: Any = None,
+) -> None:
+    """Collect a compact tracklet profile for offline identity reconciliation."""
+    profile = profiles.setdefault(
+        int(track_id),
+        {
+            "id": int(track_id),
+            "role_counts": Counter(),
+            "team_counts": Counter(),
+            "frames_seen": 0,
+            "first_sample": int(sample_number),
+            "last_sample": int(sample_number),
+            "first_source_frame_idx": int(source_frame_idx),
+            "last_source_frame_idx": int(source_frame_idx),
+            "first_bbox": _as_bbox_array(bbox).tolist(),
+            "last_bbox": _as_bbox_array(bbox).tolist(),
+            "reid_embedding": None,
+            "reid_count": 0,
+            "color_signature": None,
+            "color_count": 0,
+        },
+    )
+    profile["role_counts"][str(role)] += 1
+    if team:
+        profile["team_counts"][int(team)] += 1
+    profile["frames_seen"] += 1
+    profile["last_sample"] = int(sample_number)
+    profile["last_source_frame_idx"] = int(source_frame_idx)
+    profile["last_bbox"] = _as_bbox_array(bbox).tolist()
+    _merge_profile_vector(profile, "reid_embedding", "reid_count", reid_embedding)
+    _merge_profile_vector(profile, "color_signature", "color_count", color_signature)
+
+
+def _dominant_count_value(counter: Counter, fallback: Any = None) -> tuple[Any, float]:
+    """Return dominant counter value and confidence."""
+    total = sum(counter.values())
+    if total <= 0:
+        return fallback, 0.0
+    value, count = counter.most_common(1)[0]
+    return value, float(count) / float(total)
+
+
+def _roles_compatible(role_a: str, role_b: str) -> bool:
+    """Allow identity linking only between roles that can reasonably flicker."""
+    if role_a == role_b:
+        return True
+    return {role_a, role_b}.issubset({"player", "goalkeeper"})
+
+
+def _teams_compatible(profile_a: Dict[str, Any], profile_b: Dict[str, Any]) -> bool:
+    """Reject high-confidence team contradictions while allowing noisy teams."""
+    team_a, confidence_a = _dominant_count_value(profile_a.get("team_counts", Counter()), 0)
+    team_b, confidence_b = _dominant_count_value(profile_b.get("team_counts", Counter()), 0)
+    if not team_a or not team_b:
+        return True
+    if team_a == team_b:
+        return True
+    return not (confidence_a >= 0.85 and confidence_b >= 0.85)
+
+
+def _profile_position_distance(profile_a: Dict[str, Any], profile_b: Dict[str, Any]) -> float:
+    """Return normalized distance between old tracklet end and new tracklet start."""
+    center_a = _bbox_center(profile_a.get("last_bbox"))
+    center_b = _bbox_center(profile_b.get("first_bbox"))
+    scale = max(_bbox_scale(profile_a.get("last_bbox")), _bbox_scale(profile_b.get("first_bbox")))
+    return float(np.linalg.norm(center_a - center_b) / scale)
+
+
+def _identity_candidate(profile_a: Dict[str, Any], profile_b: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Score whether two non-overlapping tracklets are the same person."""
+    if int(profile_a["last_source_frame_idx"]) >= int(profile_b["first_source_frame_idx"]):
+        return None
+
+    role_a, _ = _dominant_count_value(profile_a.get("role_counts", Counter()), "player")
+    role_b, _ = _dominant_count_value(profile_b.get("role_counts", Counter()), "player")
+    if not _roles_compatible(str(role_a), str(role_b)):
+        return None
+    if not _teams_compatible(profile_a, profile_b):
+        return None
+
+    gap = int(profile_b["first_source_frame_idx"]) - int(profile_a["last_source_frame_idx"])
+    position_distance = _profile_position_distance(profile_a, profile_b)
+    reid_count = min(int(profile_a.get("reid_count", 0)), int(profile_b.get("reid_count", 0)))
+    color_count = min(int(profile_a.get("color_count", 0)), int(profile_b.get("color_count", 0)))
+
+    if reid_count > 0:
+        reid_distance = _cosine_distance(profile_a.get("reid_embedding"), profile_b.get("reid_embedding"))
+        threshold = 0.36 if position_distance <= 2.5 else 0.28
+        if reid_distance > threshold:
+            return None
+        return {
+            "source_id": int(profile_b["id"]),
+            "target_id": int(profile_a["id"]),
+            "score": float(reid_distance + min(position_distance, 6.0) * 0.015 + min(gap, 9000) / 9000.0 * 0.025),
+            "evidence": "osnet_reid",
+            "reid_distance": float(reid_distance),
+            "position_distance": float(position_distance),
+            "gap_source_frames": int(gap),
+        }
+
+    if color_count > 0:
+        color_distance = _cosine_distance(profile_a.get("color_signature"), profile_b.get("color_signature"))
+        if color_distance > 0.08 or position_distance > 1.25:
+            return None
+        return {
+            "source_id": int(profile_b["id"]),
+            "target_id": int(profile_a["id"]),
+            "score": float(color_distance + position_distance * 0.05),
+            "evidence": "color_position",
+            "color_distance": float(color_distance),
+            "position_distance": float(position_distance),
+            "gap_source_frames": int(gap),
+        }
+
+    return None
+
+
+def _intervals_overlap(intervals_a: List[tuple[int, int]], intervals_b: List[tuple[int, int]]) -> bool:
+    """Return True if any source-frame intervals overlap."""
+    for start_a, end_a in intervals_a:
+        for start_b, end_b in intervals_b:
+            if start_a <= end_b and start_b <= end_a:
+                return True
+    return False
+
+
+def _build_auto_identity_merge_map(profiles: Dict[int, Dict[str, Any]]) -> tuple[Dict[int, int], List[Dict[str, Any]]]:
+    """Build high-confidence automatic tracklet merges after the full pass."""
+    if len(profiles) < 2:
+        return {}, []
+
+    candidates: List[Dict[str, Any]] = []
+    profile_values = sorted(profiles.values(), key=lambda item: int(item["first_source_frame_idx"]))
+    for old_profile in profile_values:
+        for new_profile in profile_values:
+            if int(old_profile["id"]) == int(new_profile["id"]):
+                continue
+            candidate = _identity_candidate(old_profile, new_profile)
+            if candidate is not None:
+                candidates.append(candidate)
+
+    if not candidates:
+        return {}, []
+
+    best_previous_for_source: Dict[int, Dict[str, Any]] = {}
+    best_next_for_target: Dict[int, Dict[str, Any]] = {}
+    for candidate in candidates:
+        source_id = int(candidate["source_id"])
+        target_id = int(candidate["target_id"])
+        if (
+            source_id not in best_previous_for_source
+            or candidate["score"] < best_previous_for_source[source_id]["score"]
+        ):
+            best_previous_for_source[source_id] = candidate
+        if (
+            target_id not in best_next_for_target
+            or candidate["score"] < best_next_for_target[target_id]["score"]
+        ):
+            best_next_for_target[target_id] = candidate
+
+    parent = {int(profile_id): int(profile_id) for profile_id in profiles}
+    intervals = {
+        int(profile_id): [
+            (
+                int(profile["first_source_frame_idx"]),
+                int(profile["last_source_frame_idx"]),
+            )
+        ]
+        for profile_id, profile in profiles.items()
+    }
+
+    def find(track_id: int) -> int:
+        while parent[track_id] != track_id:
+            parent[track_id] = parent[parent[track_id]]
+            track_id = parent[track_id]
+        return track_id
+
+    accepted_links: List[Dict[str, Any]] = []
+    for candidate in sorted(candidates, key=lambda item: float(item["score"])):
+        source_id = int(candidate["source_id"])
+        target_id = int(candidate["target_id"])
+        if best_previous_for_source.get(source_id) is not candidate:
+            continue
+        if best_next_for_target.get(target_id) is not candidate:
+            continue
+
+        source_root = find(source_id)
+        target_root = find(target_id)
+        if source_root == target_root:
+            continue
+        if _intervals_overlap(intervals[source_root], intervals[target_root]):
+            continue
+
+        parent[source_root] = target_root
+        intervals[target_root].extend(intervals[source_root])
+        accepted_links.append(candidate)
+
+    merge_map = {
+        track_id: find(track_id)
+        for track_id in sorted(parent)
+        if find(track_id) != track_id
+    }
+    return merge_map, accepted_links
+
+
+def _rebuild_player_outputs(annotation_states: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Rebuild player stats and final identity spans after all identity merges."""
+    summaries: Dict[int, Dict[str, Any]] = {}
+    spans: Dict[int, Dict[str, Any]] = {}
+
+    for state in annotation_states:
+        sample_number = int(state["sample_number"])
+        source_frame_idx = int(state["source_frame_idx"])
+        for player_id, track in state.get("players", {}).items():
+            player_id = int(player_id)
+            role = str(track.get("role", "player"))
+            team = int(track.get("team", 0) or 0)
+            summary = summaries.setdefault(
+                player_id,
+                {
+                    "id": player_id,
+                    "name": f"Player {player_id}",
+                    "role": role,
+                    "team": team,
+                    "frames_seen": 0,
+                    "distance_km": None,
+                    "max_speed_kmh": None,
+                    "distance_speed_confidence": 0.0,
+                },
+            )
+            summary["frames_seen"] += 1
+            summary["role"] = role
+            if team:
+                summary["team"] = team
+
+            span = spans.setdefault(
+                player_id,
+                {
+                    "id": player_id,
+                    "role": role,
+                    "frames_seen": 0,
+                    "first_sample": sample_number,
+                    "last_sample": sample_number,
+                    "first_source_frame_idx": source_frame_idx,
+                    "last_source_frame_idx": source_frame_idx,
+                    "merged_from_ids": set(),
+                },
+            )
+            span["frames_seen"] += 1
+            span["role"] = role
+            span["last_sample"] = sample_number
+            span["last_source_frame_idx"] = source_frame_idx
+            if track.get("merged_from_id"):
+                span["merged_from_ids"].add(int(track["merged_from_id"]))
+
+    player_stats = sorted(summaries.values(), key=lambda item: item["id"])
+    identity_track_spans = []
+    for span in sorted(spans.values(), key=lambda item: item["id"]):
+        output_span = dict(span)
+        output_span["merged_from_ids"] = sorted(output_span["merged_from_ids"])
+        identity_track_spans.append(output_span)
+    return player_stats, identity_track_spans
 
 
 def _resolve_output_fps(props: Dict[str, Any], output_fps: Optional[float], analysis_fps: float) -> float:
@@ -293,9 +661,10 @@ def run_batch_analysis(
     max_players_in_frame = 0
     team_ball_counts = {1: 0, 2: 0}
     last_team_control = 0
-    player_summary: Dict[int, Dict[str, Any]] = {}
-    identity_spans: Dict[int, Dict[str, Any]] = {}
+    identity_profiles: Dict[int, Dict[str, Any]] = {}
     identity_merge_conflicts = 0
+    auto_identity_merge_map: Dict[int, int] = {}
+    auto_identity_links: List[Dict[str, Any]] = []
     calibration_checked = False
     field_calibration_confidence = 0.0
 
@@ -380,43 +749,18 @@ def run_batch_analysis(
                 else:
                     track["team_color"] = team_assigner.team_colors.get(team, (128, 128, 128))
 
-                summary = player_summary.setdefault(
-                    int(player_id),
-                    {
-                        "id": int(player_id),
-                        "name": f"Player {player_id}",
-                        "role": role,
-                        "team": int(team),
-                        "frames_seen": 0,
-                        "distance_km": None,
-                        "max_speed_kmh": None,
-                        "distance_speed_confidence": 0.0,
-                    },
+                reid_embedding = track.pop("reid_embedding", None)
+                _update_identity_profile(
+                    identity_profiles,
+                    track_id=int(player_id),
+                    role=role,
+                    team=int(team),
+                    sample_number=int(processed_frames + 1),
+                    source_frame_idx=int(source_frame_idx),
+                    bbox=track["bbox"],
+                    reid_embedding=reid_embedding,
+                    color_signature=_extract_color_signature(frame, track["bbox"]),
                 )
-                summary["frames_seen"] += 1
-                summary["role"] = role
-                if team:
-                    summary["team"] = int(team)
-
-                identity_span = identity_spans.setdefault(
-                    int(player_id),
-                    {
-                        "id": int(player_id),
-                        "role": role,
-                        "frames_seen": 0,
-                        "first_sample": int(processed_frames + 1),
-                        "last_sample": int(processed_frames + 1),
-                        "first_source_frame_idx": int(source_frame_idx),
-                        "last_source_frame_idx": int(source_frame_idx),
-                        "merged_from_ids": set(),
-                    },
-                )
-                identity_span["frames_seen"] += 1
-                identity_span["role"] = role
-                identity_span["last_sample"] = int(processed_frames + 1)
-                identity_span["last_source_frame_idx"] = int(source_frame_idx)
-                if track.get("merged_from_id"):
-                    identity_span["merged_from_ids"].add(int(track["merged_from_id"]))
 
             ball_bbox = ball_track.get(1, {}).get("bbox") if ball_track else None
             assigned_player = -1
@@ -428,6 +772,9 @@ def run_batch_analysis(
 
             if last_team_control in team_ball_counts:
                 team_ball_counts[last_team_control] += 1
+
+            for referee in referee_track.values():
+                referee.pop("reid_embedding", None)
 
             processed_frames += 1
             annotation_states.append(
@@ -463,6 +810,17 @@ def run_batch_analysis(
         sample_step = max(1, int(round(source_fps / float(analysis_fps)))) if source_fps > 0 else 1
         max_source_frame_idx = int(annotation_states[-1]["source_frame_idx"]) + sample_step - 1
 
+    auto_identity_merge_map, auto_identity_links = _build_auto_identity_merge_map(identity_profiles)
+    if auto_identity_merge_map:
+        annotation_tracks = {
+            "players": [state["players"] for state in annotation_states],
+            "referees": [state["referees"] for state in annotation_states],
+        }
+        identity_merge_conflicts += _apply_identity_merge_map(annotation_tracks, auto_identity_merge_map)
+        warnings.append(
+            f"Automatic identity reconciliation linked {len(auto_identity_merge_map)} tracklets into stable player IDs."
+        )
+
     rendered_frames = _render_smooth_review_video(
         tracker=tracker,
         video_path=video_path,
@@ -483,12 +841,7 @@ def run_batch_analysis(
     possession_team1 = (team_ball_counts[1] / counted_possession * 100.0) if counted_possession else None
     possession_team2 = (team_ball_counts[2] / counted_possession * 100.0) if counted_possession else None
     possession_confidence = counted_possession / processed_frames if processed_frames else 0.0
-    player_stats = sorted(player_summary.values(), key=lambda item: item["id"])
-    identity_track_spans = []
-    for span in sorted(identity_spans.values(), key=lambda item: item["id"]):
-        span = dict(span)
-        span["merged_from_ids"] = sorted(span["merged_from_ids"])
-        identity_track_spans.append(span)
+    player_stats, identity_track_spans = _rebuild_player_outputs(annotation_states)
 
     report = {
         "job_id": job_id,
@@ -499,7 +852,7 @@ def run_batch_analysis(
             "possession_confidence": possession_confidence,
             "total_passes": None,
             "total_shots": None,
-            "player_count": len(player_summary),
+            "player_count": len(player_stats),
             "max_players_in_frame": max_players_in_frame,
             "processed_frames": processed_frames,
             "rendered_output_frames": rendered_frames,
@@ -526,6 +879,8 @@ def run_batch_analysis(
         "warnings": warnings,
         "identity_quality": {
             "manual_merge_map": normalized_identity_merge_map,
+            "auto_merge_map": auto_identity_merge_map,
+            "auto_links": auto_identity_links,
             "track_spans": identity_track_spans,
             "merge_conflicts": identity_merge_conflicts,
         },
