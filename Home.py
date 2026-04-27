@@ -4,6 +4,7 @@ Now with REAL model support!
 """
 
 import os
+import json
 import time
 from pathlib import Path
 
@@ -143,6 +144,55 @@ def format_bytes(size: int | float) -> str:
             return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
         size /= 1024
     return f"{size:.1f} TB"
+
+
+def parse_identity_merge_text(text: str) -> dict[int, int]:
+    """Parse manual tracker ID corrections from JSON or compact text."""
+    raw = (text or "").strip()
+    if not raw:
+        return {}
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if isinstance(parsed, dict):
+        items = parsed.items()
+    else:
+        normalized = raw.replace("\n", ",").replace("->", ":")
+        parts = [part.strip() for part in normalized.split(",") if part.strip()]
+        items = []
+        for part in parts:
+            if ":" not in part:
+                raise ValueError(
+                    "صيغة دمج أرقام التتبع غير صحيحة. مثال صحيح: 430:12, 88:7"
+                    if lang == "ar"
+                    else "Invalid ID merge format. Example: 430:12, 88:7"
+                )
+            source, target = part.split(":", 1)
+            items.append((source.strip(), target.strip()))
+
+    merge_map: dict[int, int] = {}
+    for source_id, target_id in items:
+        try:
+            source = int(source_id)
+            target = int(target_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "أرقام الدمج يجب أن تكون أرقاماً فقط. مثال: 430:12"
+                if lang == "ar"
+                else "ID merge values must be numbers only. Example: 430:12"
+            ) from exc
+        if source <= 0 or target <= 0:
+            raise ValueError(
+                "أرقام التتبع يجب أن تكون أكبر من صفر."
+                if lang == "ar"
+                else "Tracking IDs must be greater than zero."
+            )
+        if source != target:
+            merge_map[source] = target
+    return merge_map
 
 
 def save_uploaded_file_stream(uploaded_file, dest_path: str) -> None:
@@ -475,6 +525,20 @@ with st.sidebar:
             "عرض الفريم قبل التحليل" if lang == "ar" else "Resize Width",
             min_value=480, max_value=1920, value=preset_resize_width, step=80
         )
+        if use_runpod_serverless:
+            identity_merge_text_remote = st.text_area(
+                "دمج أرقام التتبع يدوياً (اختياري)" if lang == "ar" else "Manual ID merge map (optional)",
+                value="",
+                height=80,
+                placeholder="430:12, 88:7",
+                help=(
+                    "إذا تغير رقم لاعب، اكتب الرقم الجديد ثم الرقم الأصلي. مثال: 430:12 يعني اجعل 430 هو 12."
+                    if lang == "ar"
+                    else "If a player ID changes, enter new ID then original ID. Example: 430:12 means treat 430 as 12."
+                ),
+            )
+        else:
+            identity_merge_text_remote = ""
         st.caption(
             "السريع مناسب للمباريات الطويلة. الجودة العالية أدق لكنها أبطأ وأغلى. جودة قصوى مخصصة للمقاطع القصيرة."
             if lang == "ar"
@@ -487,6 +551,7 @@ with st.sidebar:
         output_video_fps_remote = 30.0
         max_frames_remote = None
         resize_width_remote = 1280
+        identity_merge_text_remote = ""
 
     st.markdown("---")
     
@@ -901,6 +966,7 @@ if video_path:
                                 else "☁️ Submitting job to RunPod Serverless..."
                             )
 
+                    identity_merge_map = parse_identity_merge_text(identity_merge_text_remote)
                     upload_started_at = time.time()
                     job_id = client.upload_video(
                         video_path=video_path,
@@ -911,6 +977,7 @@ if video_path:
                         output_fps=float(output_video_fps_remote),
                         max_frames=int(max_frames_remote) if max_frames_remote else None,
                         resize_width=int(resize_width_remote),
+                        identity_merge_map=identity_merge_map,
                     )
                     st.session_state.runpod_job_id = job_id
                     upload_elapsed_s = time.time() - upload_started_at

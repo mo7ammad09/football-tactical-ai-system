@@ -76,6 +76,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     max_frames_raw = input_data.get("max_frames")
     max_frames = int(max_frames_raw) if max_frames_raw else None
     batch_size = int(input_data.get("batch_size") or os.environ.get("PROCESSING_BATCH_SIZE", "16"))
+    identity_merge_map = input_data.get("identity_merge_map") or {}
 
     work_dir = TMP_ROOT / job_id
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -129,6 +130,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             resize_width=resize_width,
             max_frames=max_frames,
             batch_size=batch_size,
+            identity_merge_map=identity_merge_map,
         )
         report = result["report"]
         paths = result["paths"]

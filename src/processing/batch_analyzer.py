@@ -123,6 +123,66 @@ def _write_report_files(job_id: str, report: Dict[str, Any], player_stats: List[
     return {"report_json": json_path, "report_csv": csv_path}
 
 
+def _normalize_identity_merge_map(identity_merge_map: Optional[Dict[Any, Any]]) -> Dict[int, int]:
+    """Normalize user-provided source_id -> target_id corrections."""
+    if not identity_merge_map:
+        return {}
+
+    normalized: Dict[int, int] = {}
+    for source_id, target_id in identity_merge_map.items():
+        try:
+            source = int(source_id)
+            target = int(target_id)
+        except (TypeError, ValueError):
+            continue
+        if source > 0 and target > 0 and source != target:
+            normalized[source] = target
+    return normalized
+
+
+def _bbox_area(track: Dict[str, Any]) -> float:
+    """Return bbox area for conflict resolution."""
+    bbox = track.get("bbox") or [0, 0, 0, 0]
+    return max(0.0, float(bbox[2] - bbox[0])) * max(0.0, float(bbox[3] - bbox[1]))
+
+
+def _merge_track_ids(track: Dict[int, Dict[str, Any]], merge_map: Dict[int, int]) -> tuple[Dict[int, Dict[str, Any]], int]:
+    """Apply source_id -> target_id merges to one frame of tracks."""
+    if not merge_map:
+        return track, 0
+
+    merged: Dict[int, Dict[str, Any]] = {}
+    conflicts = 0
+    for track_id, track_data in track.items():
+        source_id = int(track_id)
+        target_id = int(merge_map.get(source_id, source_id))
+        if target_id != source_id:
+            track_data["merged_from_id"] = source_id
+
+        if target_id in merged:
+            conflicts += 1
+            if _bbox_area(track_data) > _bbox_area(merged[target_id]):
+                merged[target_id] = track_data
+            continue
+        merged[target_id] = track_data
+
+    return merged, conflicts
+
+
+def _apply_identity_merge_map(batch_tracks: Dict[str, List[Dict]], merge_map: Dict[int, int]) -> int:
+    """Apply manual identity merges to players and referees in a batch."""
+    conflicts = 0
+    if not merge_map:
+        return conflicts
+
+    for object_type in ("players", "referees"):
+        for frame_idx, frame_tracks in enumerate(batch_tracks.get(object_type, [])):
+            merged, frame_conflicts = _merge_track_ids(frame_tracks, merge_map)
+            batch_tracks[object_type][frame_idx] = merged
+            conflicts += frame_conflicts
+    return conflicts
+
+
 def _resolve_output_fps(props: Dict[str, Any], output_fps: Optional[float], analysis_fps: float) -> float:
     """Choose a smooth but bounded output FPS."""
     source_fps = float(props.get("fps") or 0.0)
@@ -202,9 +262,15 @@ def run_batch_analysis(
     output_fps: Optional[float] = None,
     max_frames: Optional[int] = None,
     batch_size: int = 16,
+    identity_merge_map: Optional[Dict[Any, Any]] = None,
 ) -> Dict[str, Any]:
     """Run a conservative, memory-aware analysis and write local artifacts."""
     warnings: List[str] = []
+    normalized_identity_merge_map = _normalize_identity_merge_map(identity_merge_map)
+    if normalized_identity_merge_map:
+        warnings.append(
+            f"Manual identity merge map applied: {normalized_identity_merge_map}"
+        )
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
     output_path = output_root / f"{job_id}_output.mp4"
@@ -227,6 +293,8 @@ def run_batch_analysis(
     team_ball_counts = {1: 0, 2: 0}
     last_team_control = 0
     player_summary: Dict[int, Dict[str, Any]] = {}
+    identity_spans: Dict[int, Dict[str, Any]] = {}
+    identity_merge_conflicts = 0
     calibration_checked = False
     field_calibration_confidence = 0.0
 
@@ -239,6 +307,7 @@ def run_batch_analysis(
         nonlocal ball_detections
         nonlocal max_players_in_frame
         nonlocal last_team_control
+        nonlocal identity_merge_conflicts
         nonlocal calibration_checked
         nonlocal field_calibration_confidence
 
@@ -247,6 +316,10 @@ def run_batch_analysis(
 
         frames = [entry[1] for entry in entries]
         batch_tracks = tracker.get_object_tracks_for_frames(frames)
+        identity_merge_conflicts += _apply_identity_merge_map(
+            batch_tracks,
+            normalized_identity_merge_map,
+        )
         tracker.add_position_to_tracks(batch_tracks)
 
         if not calibration_checked:
@@ -324,6 +397,26 @@ def run_batch_analysis(
                 if team:
                     summary["team"] = int(team)
 
+                identity_span = identity_spans.setdefault(
+                    int(player_id),
+                    {
+                        "id": int(player_id),
+                        "role": role,
+                        "frames_seen": 0,
+                        "first_sample": int(processed_frames + 1),
+                        "last_sample": int(processed_frames + 1),
+                        "first_source_frame_idx": int(source_frame_idx),
+                        "last_source_frame_idx": int(source_frame_idx),
+                        "merged_from_ids": set(),
+                    },
+                )
+                identity_span["frames_seen"] += 1
+                identity_span["role"] = role
+                identity_span["last_sample"] = int(processed_frames + 1)
+                identity_span["last_source_frame_idx"] = int(source_frame_idx)
+                if track.get("merged_from_id"):
+                    identity_span["merged_from_ids"].add(int(track["merged_from_id"]))
+
             ball_bbox = ball_track.get(1, {}).get("bbox") if ball_track else None
             assigned_player = -1
             if ball_bbox:
@@ -390,6 +483,11 @@ def run_batch_analysis(
     possession_team2 = (team_ball_counts[2] / counted_possession * 100.0) if counted_possession else None
     possession_confidence = counted_possession / processed_frames if processed_frames else 0.0
     player_stats = sorted(player_summary.values(), key=lambda item: item["id"])
+    identity_track_spans = []
+    for span in sorted(identity_spans.values(), key=lambda item: item["id"]):
+        span = dict(span)
+        span["merged_from_ids"] = sorted(span["merged_from_ids"])
+        identity_track_spans.append(span)
 
     report = {
         "job_id": job_id,
@@ -413,6 +511,7 @@ def run_batch_analysis(
             "player_frame_detections": player_frame_detections,
             "goalkeeper_frame_detections": goalkeeper_frame_detections,
             "referee_frame_detections": referee_frame_detections,
+            "identity_merge_conflicts": identity_merge_conflicts,
         },
         "tactical_analysis": {
             "formation_team1": None,
@@ -423,6 +522,11 @@ def run_batch_analysis(
         },
         "player_stats": player_stats,
         "warnings": warnings,
+        "identity_quality": {
+            "manual_merge_map": normalized_identity_merge_map,
+            "track_spans": identity_track_spans,
+            "merge_conflicts": identity_merge_conflicts,
+        },
         "confidence": {
             "field_calibration": field_calibration_confidence,
             "possession": possession_confidence,

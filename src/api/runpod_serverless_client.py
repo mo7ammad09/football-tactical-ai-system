@@ -95,6 +95,7 @@ class RunPodServerlessClient(AnalysisClient):
         output_fps: Optional[float] = None,
         max_frames: Optional[int] = None,
         resize_width: int = 1280,
+        identity_merge_map: Optional[Dict[Any, Any]] = None,
     ) -> str:
         """Submit a serverless job using existing object storage keys."""
         payload: Dict[str, Any] = {
@@ -104,6 +105,7 @@ class RunPodServerlessClient(AnalysisClient):
                 "output_fps": float(output_fps) if output_fps is not None else None,
                 "resize_width": int(resize_width),
                 "max_frames": int(max_frames) if max_frames is not None else None,
+                "identity_merge_map": identity_merge_map or {},
             }
         }
         if model_object_key:
@@ -129,6 +131,7 @@ class RunPodServerlessClient(AnalysisClient):
         output_fps: Optional[float] = None,
         max_frames: Optional[int] = None,
         resize_width: int = 1280,
+        identity_merge_map: Optional[Dict[Any, Any]] = None,
     ) -> str:
         """Upload input artifacts to object storage and submit a RunPod job."""
         video_total_bytes = os.path.getsize(video_path)
@@ -180,6 +183,7 @@ class RunPodServerlessClient(AnalysisClient):
             output_fps=output_fps,
             max_frames=max_frames,
             resize_width=resize_width,
+            identity_merge_map=identity_merge_map,
         )
         self._emit_progress(progress_callback, 95, phase="submitted")
         return job_id

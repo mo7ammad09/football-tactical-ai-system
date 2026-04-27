@@ -6,12 +6,14 @@ import runpod.handler as runpod_handler
 def test_runpod_handler_accepts_legacy_video_url_without_storage(monkeypatch, tmp_path):
     model_path = tmp_path / "model.pt"
     model_path.write_bytes(b"model")
+    captured_kwargs = {}
 
     def fake_download(_url: str, target_path: Path) -> None:
         target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.write_bytes(b"video")
 
     def fake_run_batch_analysis(**kwargs):
+        captured_kwargs.update(kwargs)
         output_dir = Path(kwargs["output_dir"])
         output_dir.mkdir(parents=True, exist_ok=True)
         video = output_dir / "out.mp4"
@@ -40,8 +42,17 @@ def test_runpod_handler_accepts_legacy_video_url_without_storage(monkeypatch, tm
     monkeypatch.setattr(runpod_handler, "_download_url", fake_download)
     monkeypatch.setattr(runpod_handler, "run_batch_analysis", fake_run_batch_analysis)
 
-    result = runpod_handler.handler({"id": "job-1", "input": {"video_url": "https://example.com/video.mp4"}})
+    result = runpod_handler.handler(
+        {
+            "id": "job-1",
+            "input": {
+                "video_url": "https://example.com/video.mp4",
+                "identity_merge_map": {"430": 12},
+            },
+        }
+    )
 
     assert result["status"] == "completed"
     assert result["stats"]["processed_frames"] == 1
     assert "annotated_video" in result["artifacts"]
+    assert captured_kwargs["identity_merge_map"] == {"430": 12}
