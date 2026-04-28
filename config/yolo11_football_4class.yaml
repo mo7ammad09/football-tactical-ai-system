@@ -1,0 +1,13 @@
+# YOLO11 football detector dataset config.
+# Copy this file into Colab and update `path` to your uploaded/exported dataset.
+
+path: /content/football_yolo11_dataset
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: player
+  1: goalkeeper
+  2: referee
+  3: ball

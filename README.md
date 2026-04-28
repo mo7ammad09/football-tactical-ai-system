@@ -132,6 +132,18 @@ python main.py --input input_videos/match.mp4 --output output_videos/analyzed.mp
 runpod/README_RUNPOD.md
 ```
 
+### تدريب كاشف YOLO11 جديد
+مرحلة الكشف التجارية الجديدة موثقة هنا:
+```bash
+docs/YOLO11_TRAINING_PLAN.md
+notebooks/yolo11_football_colab.ipynb
+```
+
+لاستخراج صور annotation من فيديوهات الملاعب المستهدفة:
+```bash
+python scripts/extract_training_frames.py input_videos --every-seconds 2 --max-width 1920
+```
+
 ### مزامنة نسخ `src` (RunPod/Replicate)
 ```bash
 bash scripts/sync_variants.sh

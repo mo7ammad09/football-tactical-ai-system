@@ -44,6 +44,10 @@ jobs.sqlite3-*
 # Data
 data/*.csv
 data/*.json
+datasets/
+training_data/
+runs/
+wandb/
 
 # IDE
 .vscode/
