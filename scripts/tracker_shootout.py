@@ -28,6 +28,15 @@ from src.trackers.tracker import Tracker
 from src.utils.video_utils import iter_video_frames_sampled_with_indices
 
 
+def _reid_strategy_for_backend(backend: str) -> str:
+    """Return the expected Re-ID strategy for a tracker backend."""
+    return {
+        "botsort": "ultralytics_botsort_reid",
+        "strongsort": "boxmot_strongsort_osnet",
+        "bytetrack": "none",
+    }.get(backend, "unknown")
+
+
 def _chunks(items: List[Any], size: int) -> Iterable[List[Any]]:
     """Yield fixed-size chunks."""
     for index in range(0, len(items), max(1, size)):
@@ -46,11 +55,7 @@ def _summarize_tracker(
 ) -> Dict[str, Any]:
     """Run one backend and return ID-stability proxy metrics."""
     tracker = Tracker(model_path, tracker_backend=backend)
-    backend_reid_strategy = {
-        "botsort": "ultralytics_botsort_reid",
-        "strongsort": "boxmot_strongsort_osnet",
-        "bytetrack": "none",
-    }.get(backend, "unknown")
+    backend_reid_strategy = _reid_strategy_for_backend(backend)
     entries = list(
         iter_video_frames_sampled_with_indices(
             video_path,
@@ -158,8 +163,11 @@ def main() -> None:
                 batch_size=args.batch_size,
             )
         except Exception as exc:
+            reid_strategy = _reid_strategy_for_backend(backend)
             result = {
                 "backend": backend,
+                "reid_strategy": reid_strategy,
+                "reid_enabled": reid_strategy != "none",
                 "error": str(exc),
             }
         results.append(result)
