@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from copy import deepcopy
 import csv
 import json
@@ -448,6 +448,26 @@ def _profile_position_distance(profile_a: Dict[str, Any], profile_b: Dict[str, A
     return float(np.linalg.norm(center_a - center_b) / scale)
 
 
+def _reid_candidate_threshold(role_a: str, role_b: str, position_distance: float) -> float:
+    """Return a broad ReID threshold for surfacing human-review candidates."""
+    if role_a == "referee" and role_b == "referee":
+        return 0.32 if position_distance <= 3.0 else 0.28
+    if role_a != role_b:
+        return 0.28
+    return 0.36 if position_distance <= 2.5 else 0.28
+
+
+def _auto_reid_threshold(role_a: str, role_b: str) -> float:
+    """Return the stricter ReID threshold used for automatic merges."""
+    if role_a == "referee" and role_b == "referee":
+        return 0.16
+    if role_a != role_b:
+        return 0.08
+    if role_a in {"player", "goalkeeper"}:
+        return 0.12
+    return 0.10
+
+
 def _identity_candidate(profile_a: Dict[str, Any], profile_b: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Score whether two non-overlapping tracklets are the same person."""
     if int(profile_a["last_source_frame_idx"]) >= int(profile_b["first_source_frame_idx"]):
@@ -467,7 +487,7 @@ def _identity_candidate(profile_a: Dict[str, Any], profile_b: Dict[str, Any]) ->
 
     if reid_count > 0:
         reid_distance = _cosine_distance(profile_a.get("reid_embedding"), profile_b.get("reid_embedding"))
-        threshold = 0.36 if position_distance <= 2.5 else 0.28
+        threshold = _reid_candidate_threshold(str(role_a), str(role_b), position_distance)
         if reid_distance > threshold:
             return None
         return {
@@ -475,7 +495,12 @@ def _identity_candidate(profile_a: Dict[str, Any], profile_b: Dict[str, Any]) ->
             "target_id": int(profile_a["id"]),
             "score": float(reid_distance + min(position_distance, 6.0) * 0.015 + min(gap, 9000) / 9000.0 * 0.025),
             "evidence": "osnet_reid",
+            "role_a": str(role_a),
+            "role_b": str(role_b),
+            "reid_count": int(reid_count),
             "reid_distance": float(reid_distance),
+            "reid_threshold": float(threshold),
+            "auto_reid_threshold": float(_auto_reid_threshold(str(role_a), str(role_b))),
             "position_distance": float(position_distance),
             "gap_source_frames": int(gap),
         }
@@ -543,7 +568,7 @@ def _identity_candidate_debug(profile_a: Dict[str, Any], profile_b: Dict[str, An
 
     if reid_count > 0:
         reid_distance = _cosine_distance(profile_a.get("reid_embedding"), profile_b.get("reid_embedding"))
-        threshold = 0.36 if position_distance <= 2.5 else 0.28
+        threshold = _reid_candidate_threshold(str(role_a), str(role_b), position_distance)
         status = "candidate" if reid_distance <= threshold else "rejected"
         reason = "candidate_reid" if status == "candidate" else "reid_distance_above_threshold"
         score = float(reid_distance + min(position_distance, 6.0) * 0.015 + min(gap, 9000) / 9000.0 * 0.025)
@@ -555,6 +580,7 @@ def _identity_candidate_debug(profile_a: Dict[str, Any], profile_b: Dict[str, An
             "evidence": "osnet_reid",
             "reid_distance": float(reid_distance),
             "reid_threshold": float(threshold),
+            "auto_reid_threshold": float(_auto_reid_threshold(str(role_a), str(role_b))),
         }
 
     if color_count > 0:
@@ -603,9 +629,13 @@ def _build_auto_identity_merge_map(profiles: Dict[int, Dict[str, Any]]) -> tuple
 
     best_previous_for_source: Dict[int, Dict[str, Any]] = {}
     best_next_for_target: Dict[int, Dict[str, Any]] = {}
+    candidates_by_source: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    candidates_by_target: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     for candidate in candidates:
         source_id = int(candidate["source_id"])
         target_id = int(candidate["target_id"])
+        candidates_by_source[source_id].append(candidate)
+        candidates_by_target[target_id].append(candidate)
         if (
             source_id not in best_previous_for_source
             or candidate["score"] < best_previous_for_source[source_id]["score"]
@@ -616,6 +646,31 @@ def _build_auto_identity_merge_map(profiles: Dict[int, Dict[str, Any]]) -> tuple
             or candidate["score"] < best_next_for_target[target_id]["score"]
         ):
             best_next_for_target[target_id] = candidate
+
+    for grouped_candidates in list(candidates_by_source.values()) + list(candidates_by_target.values()):
+        grouped_candidates.sort(key=lambda item: float(item["score"]))
+
+    def is_unambiguous_best(candidate: Dict[str, Any]) -> bool:
+        """Only auto-merge when the best link clearly beats nearby alternatives."""
+        if candidate.get("evidence") != "osnet_reid":
+            return False
+        if int(candidate.get("reid_count", 0)) < 8:
+            return False
+
+        role_a = str(candidate.get("role_a", "player"))
+        role_b = str(candidate.get("role_b", "player"))
+        reid_distance = float(candidate.get("reid_distance", 1.0))
+        if reid_distance > _auto_reid_threshold(role_a, role_b):
+            return False
+
+        margin = 0.035
+        source_candidates = candidates_by_source.get(int(candidate["source_id"]), [])
+        target_candidates = candidates_by_target.get(int(candidate["target_id"]), [])
+        if len(source_candidates) > 1 and float(source_candidates[1]["score"]) - float(candidate["score"]) < margin:
+            return False
+        if len(target_candidates) > 1 and float(target_candidates[1]["score"]) - float(candidate["score"]) < margin:
+            return False
+        return True
 
     parent = {int(profile_id): int(profile_id) for profile_id in profiles}
     intervals = {
@@ -641,6 +696,8 @@ def _build_auto_identity_merge_map(profiles: Dict[int, Dict[str, Any]]) -> tuple
         if best_previous_for_source.get(source_id) is not candidate:
             continue
         if best_next_for_target.get(target_id) is not candidate:
+            continue
+        if not is_unambiguous_best(candidate):
             continue
 
         source_root = find(source_id)

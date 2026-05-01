@@ -65,6 +65,28 @@ def test_auto_identity_reconciliation_does_not_merge_overlapping_tracklets():
     assert links == []
 
 
+def test_auto_identity_reconciliation_rejects_ambiguous_reid_links():
+    old_a_embedding = np.zeros(8, dtype=float)
+    old_a_embedding[2] = 1.0
+    old_b_embedding = np.zeros(8, dtype=float)
+    old_b_embedding[2] = 0.999
+    old_b_embedding[3] = 0.035
+    new_embedding = np.zeros(8, dtype=float)
+    new_embedding[2] = 0.999
+    new_embedding[3] = 0.018
+
+    merge_map, links = _build_auto_identity_merge_map(
+        {
+            12: _profile(12, 0, 100, old_a_embedding),
+            17: _profile(17, 0, 110, old_b_embedding),
+            430: _profile(430, 160, 260, new_embedding),
+        }
+    )
+
+    assert merge_map == {}
+    assert links == []
+
+
 def test_rebuild_player_outputs_after_auto_merge_map():
     states = [
         {
