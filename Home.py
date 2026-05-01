@@ -256,12 +256,12 @@ with st.sidebar:
     
     # Build model options based on availability
     available_models = []
-    
-    if old_data_exists:
-        available_models.append("Tactic Zone (old_data.pt)")
-    
+
     if abdullah_exists:
         available_models.append("Abdullah Tarek (yolov5)")
+
+    if old_data_exists:
+        available_models.append("Tactic Zone (old_data.pt)")
 
     if al_rayyan_exists:
         available_models.append("Al Rayyan YOLO11 v2 (pilot)")
