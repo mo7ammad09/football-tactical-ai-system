@@ -106,6 +106,9 @@ class Tracker:
         self.tracker_backend = (tracker_backend or os.environ.get("TRACKER_BACKEND", "botsort")).lower()
         self.tracker = sv.ByteTrack(**self._bytetrack_kwargs())
         self.strongsort_tracker = None
+        self._reid_feature_tracker = None
+        self._reid_feature_error_logged = False
+        self.enable_reid_embeddings = os.environ.get("ENABLE_REID_EMBEDDINGS", "1").strip() != "0"
         self.botsort_tracker_path = self._create_botsort_yaml()
         if enable_field_filter is None:
             enable_field_filter = os.environ.get("ENABLE_FIELD_FILTER", "1").strip() != "0"
@@ -380,6 +383,50 @@ class Tracker:
             return None
         return hist.astype(float)
 
+    def _extract_reid_embeddings(
+        self,
+        frame: np.ndarray,
+        bboxes: List[np.ndarray],
+    ) -> List[Optional[np.ndarray]]:
+        """Extract OSNet ReID embeddings for offline identity reconciliation.
+
+        BoT-SORT uses ReID internally through Ultralytics, but those embeddings
+        are not exposed in the public result object. This optional side-channel
+        keeps the fast BoT-SORT tracker while still giving the post-match graph
+        optimizer real appearance memory when BoxMOT is available on RunPod.
+        """
+        if not self.enable_reid_embeddings or not bboxes:
+            return [None for _ in bboxes]
+
+        try:
+            if self._reid_feature_tracker is None:
+                if self.tracker_backend == "strongsort" and self.strongsort_tracker is not None:
+                    self._reid_feature_tracker = self.strongsort_tracker
+                else:
+                    self._reid_feature_tracker = self._create_strongsort_tracker()
+
+            features = self._reid_feature_tracker.model.get_features(
+                np.asarray(bboxes, dtype=float),
+                frame,
+            )
+        except Exception as exc:
+            if not self._reid_feature_error_logged:
+                print(f"OSNet ReID embeddings disabled for this run: {exc}")
+                self._reid_feature_error_logged = True
+            return [None for _ in bboxes]
+
+        embeddings: List[Optional[np.ndarray]] = []
+        for feature in np.asarray(features):
+            vector = np.asarray(feature, dtype=float).reshape(-1)
+            if vector.size == 0 or not np.isfinite(vector).all():
+                embeddings.append(None)
+            else:
+                embeddings.append(vector)
+
+        if len(embeddings) < len(bboxes):
+            embeddings.extend([None for _ in range(len(bboxes) - len(embeddings))])
+        return embeddings[: len(bboxes)]
+
     def _appearance_distance(
         self,
         appearance_a: Optional[np.ndarray],
@@ -650,7 +697,11 @@ class Tracker:
                 people_items = self.field_filter.filter_track_items(frame, people_items)
 
             used_display_ids: Set[int] = set()
-            for item in people_items:
+            reid_embeddings = self._extract_reid_embeddings(
+                frame,
+                [np.asarray(item["xyxy"], dtype=float) for item in people_items],
+            )
+            for item, reid_embedding in zip(people_items, reid_embeddings):
                 bbox = np.asarray(item["xyxy"], dtype=float)
                 raw_track_id = int(item["raw_track_id"])
                 raw_role = str(item["role"])
@@ -673,6 +724,8 @@ class Tracker:
                     "raw_track_id": raw_track_id,
                     "confidence": float(item["confidence"]),
                 }
+                if reid_embedding is not None and np.isfinite(reid_embedding).all():
+                    track_data["reid_embedding"] = reid_embedding.tolist()
                 if stable_role == "referee":
                     tracks["referees"][result_index][display_id] = track_data
                 else:
@@ -910,7 +963,13 @@ class Tracker:
                 tracked_ids = []
 
             used_display_ids: Set[int] = set()
-            for bbox, _cls_id, track_id in zip(tracked_xyxy, tracked_class_ids, tracked_ids):
+            reid_embeddings = self._extract_reid_embeddings(
+                frames[frame_num],
+                [np.asarray(bbox, dtype=float) for bbox in tracked_xyxy],
+            )
+            for tracked_index, (bbox, _cls_id, track_id) in enumerate(
+                zip(tracked_xyxy, tracked_class_ids, tracked_ids)
+            ):
                 if track_id is None:
                     continue
                 raw_role = self._role_for_tracked_bbox(np.asarray(bbox), original_boxes, original_roles)
@@ -940,6 +999,10 @@ class Tracker:
                     "detected_role": raw_role,
                     "raw_track_id": raw_track_id,
                 }
+                if tracked_index < len(reid_embeddings):
+                    reid_embedding = reid_embeddings[tracked_index]
+                    if reid_embedding is not None and np.isfinite(reid_embedding).all():
+                        track_data["reid_embedding"] = reid_embedding.tolist()
 
                 if stable_role == "referee":
                     tracks["referees"][frame_num][display_id] = track_data

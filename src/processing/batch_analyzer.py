@@ -184,6 +184,7 @@ def _append_raw_tracklet_records(
 ) -> None:
     """Append frame-level track records for offline ID debugging."""
     for track_id, track in tracks.items():
+        reid_vector = _normalize_vector(track.get("reid_embedding"))
         records.append(
             {
                 "sample_number": int(sample_number),
@@ -209,6 +210,8 @@ def _append_raw_tracklet_records(
                     else None
                 ),
                 "has_ball": bool(track.get("has_ball", False)),
+                "reid_available": reid_vector is not None,
+                "reid_dim": int(reid_vector.size) if reid_vector is not None else 0,
                 "bbox": _as_bbox_array(track.get("bbox")).tolist(),
             }
         )
@@ -692,8 +695,11 @@ def _build_identity_debug_report(
     """Build a post-match identity report for human inspection."""
     profile_values = sorted(profiles.values(), key=lambda item: int(item["first_source_frame_idx"]))
     candidate_links: List[Dict[str, Any]] = []
-    rejected_examples: List[Dict[str, Any]] = []
+    actionable_rejected_examples: List[Dict[str, Any]] = []
+    overlap_rejected_examples: List[Dict[str, Any]] = []
     reject_reason_counts: Counter = Counter()
+    profiles_with_reid = sum(1 for profile in profile_values if int(profile.get("reid_count", 0)) > 0)
+    profiles_with_color = sum(1 for profile in profile_values if int(profile.get("color_count", 0)) > 0)
 
     for old_profile in profile_values:
         for new_profile in profile_values:
@@ -704,12 +710,43 @@ def _build_identity_debug_report(
                 candidate_links.append(audit)
             else:
                 reject_reason_counts[str(audit.get("reason", "unknown"))] += 1
-                if len(rejected_examples) < max_rejected_examples:
-                    rejected_examples.append(audit)
+                if audit.get("reason") == "overlap_or_reverse_time":
+                    if len(overlap_rejected_examples) < 20:
+                        overlap_rejected_examples.append(audit)
+                elif len(actionable_rejected_examples) < max_rejected_examples:
+                    actionable_rejected_examples.append(audit)
+
+    def _rejection_sort_key(item: Dict[str, Any]) -> tuple:
+        return (
+            float(item.get("score", 999.0)),
+            int(item.get("gap_source_frames", 999999)),
+            float(item.get("position_distance", 999.0)),
+        )
+
+    rejected_examples = sorted(actionable_rejected_examples, key=_rejection_sort_key)
+    if len(rejected_examples) < max_rejected_examples:
+        rejected_examples.extend(
+            overlap_rejected_examples[: max_rejected_examples - len(rejected_examples)]
+        )
+
+    warnings = []
+    if profile_values and profiles_with_reid == 0:
+        warnings.append(
+            {
+                "code": "missing_reid_embeddings",
+                "message": (
+                    "No OSNet/ReID embeddings were captured. Automatic identity "
+                    "linking can only use jersey color and position, so conservative "
+                    "auto-merges are expected to be rare."
+                ),
+            }
+        )
 
     return {
         "summary": {
             "tracklet_count": len(profile_values),
+            "profiles_with_reid": profiles_with_reid,
+            "profiles_with_color": profiles_with_color,
             "candidate_link_count": len(candidate_links),
             "accepted_auto_link_count": len(auto_links),
             "manual_merge_count": len(manual_merge_map),
@@ -722,6 +759,7 @@ def _build_identity_debug_report(
         "accepted_auto_links": auto_links,
         "candidate_links": sorted(candidate_links, key=lambda item: float(item.get("score", 999.0))),
         "reject_reason_counts": dict(reject_reason_counts),
+        "warnings": warnings,
         "rejected_examples": rejected_examples,
         "tracklet_profiles": [_identity_profile_summary(profile) for profile in profile_values],
     }
@@ -985,7 +1023,7 @@ def run_batch_analysis(
                 else:
                     track["team_color"] = team_assigner.team_colors.get(team, (128, 128, 128))
 
-                reid_embedding = track.pop("reid_embedding", None)
+                reid_embedding = track.get("reid_embedding")
                 _update_identity_profile(
                     identity_profiles,
                     track_id=int(player_id),
@@ -996,6 +1034,21 @@ def run_batch_analysis(
                     bbox=track["bbox"],
                     reid_embedding=reid_embedding,
                     color_signature=_extract_color_signature(frame, track["bbox"]),
+                )
+
+            for referee_id, referee in referee_track.items():
+                role = str(referee.get("role", "referee"))
+                reid_embedding = referee.get("reid_embedding")
+                _update_identity_profile(
+                    identity_profiles,
+                    track_id=int(referee_id),
+                    role=role,
+                    team=0,
+                    sample_number=int(processed_frames + 1),
+                    source_frame_idx=int(source_frame_idx),
+                    bbox=referee["bbox"],
+                    reid_embedding=reid_embedding,
+                    color_signature=_extract_color_signature(frame, referee["bbox"]),
                 )
 
             ball_bbox = ball_track.get(1, {}).get("bbox") if ball_track else None
@@ -1032,6 +1085,8 @@ def run_batch_analysis(
                 tracks=ball_track,
             )
 
+            for player in player_track.values():
+                player.pop("reid_embedding", None)
             for referee in referee_track.values():
                 referee.pop("reid_embedding", None)
 
