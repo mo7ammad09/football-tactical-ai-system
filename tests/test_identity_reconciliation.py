@@ -4,6 +4,7 @@ import numpy as np
 
 from src.processing.batch_analyzer import (
     _apply_identity_merge_map,
+    _build_identity_debug_report,
     _build_auto_identity_merge_map,
     _rebuild_player_outputs,
 )
@@ -99,3 +100,33 @@ def test_rebuild_player_outputs_after_auto_merge_map():
         }
     ]
     assert spans[0]["merged_from_ids"] == [430]
+
+
+def test_identity_debug_report_explains_candidate_and_rejected_links():
+    base_embedding = np.zeros(8, dtype=float)
+    base_embedding[2] = 1.0
+    similar_embedding = np.zeros(8, dtype=float)
+    similar_embedding[2] = 0.98
+    similar_embedding[3] = 0.02
+    different_embedding = np.zeros(8, dtype=float)
+    different_embedding[6] = 1.0
+
+    profiles = {
+        12: _profile(12, 0, 100, base_embedding),
+        430: _profile(430, 160, 260, similar_embedding),
+        77: _profile(77, 300, 400, different_embedding),
+    }
+    merge_map, links = _build_auto_identity_merge_map(profiles)
+
+    report = _build_identity_debug_report(
+        profiles=profiles,
+        manual_merge_map={},
+        auto_merge_map=merge_map,
+        auto_links=links,
+    )
+
+    assert report["summary"]["tracklet_count"] == 3
+    assert report["summary"]["candidate_link_count"] >= 1
+    assert report["summary"]["accepted_auto_link_count"] == 1
+    assert report["candidate_links"][0]["source_id"] == 430
+    assert "reid_distance_above_threshold" in report["reject_reason_counts"]

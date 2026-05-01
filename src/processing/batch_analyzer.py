@@ -124,6 +124,96 @@ def _write_report_files(job_id: str, report: Dict[str, Any], player_stats: List[
     return {"report_json": json_path, "report_csv": csv_path}
 
 
+def _json_safe(value: Any) -> Any:
+    """Convert numpy/counter values into JSON-serializable primitives."""
+    if isinstance(value, Counter):
+        return {str(key): int(count) for key, count in value.items()}
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _write_jsonl(path: Path, records: List[Dict[str, Any]]) -> None:
+    """Write records as newline-delimited JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as jsonl_f:
+        for record in records:
+            jsonl_f.write(json.dumps(_json_safe(record), ensure_ascii=False) + "\n")
+
+
+def _write_identity_artifacts(
+    job_id: str,
+    *,
+    raw_tracklet_records: List[Dict[str, Any]],
+    identity_debug: Dict[str, Any],
+    output_dir: Path,
+) -> Dict[str, Path]:
+    """Write identity debugging artifacts for offline review."""
+    identity_dir = output_dir / "identity"
+    identity_dir.mkdir(parents=True, exist_ok=True)
+    raw_tracklets_path = identity_dir / f"{job_id}_raw_tracklets.jsonl"
+    identity_debug_path = identity_dir / f"{job_id}_identity_debug.json"
+
+    _write_jsonl(raw_tracklets_path, raw_tracklet_records)
+    identity_debug_path.write_text(
+        json.dumps(_json_safe(identity_debug), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    return {
+        "raw_tracklets_jsonl": raw_tracklets_path,
+        "identity_debug_json": identity_debug_path,
+    }
+
+
+def _append_raw_tracklet_records(
+    records: List[Dict[str, Any]],
+    *,
+    sample_number: int,
+    source_frame_idx: int,
+    object_type: str,
+    tracks: Dict[int, Dict[str, Any]],
+) -> None:
+    """Append frame-level track records for offline ID debugging."""
+    for track_id, track in tracks.items():
+        records.append(
+            {
+                "sample_number": int(sample_number),
+                "source_frame_idx": int(source_frame_idx),
+                "object_type": str(object_type),
+                "track_id": int(track_id),
+                "raw_track_id": (
+                    int(track["raw_track_id"])
+                    if track.get("raw_track_id") is not None
+                    else None
+                ),
+                "merged_from_id": (
+                    int(track["merged_from_id"])
+                    if track.get("merged_from_id") is not None
+                    else None
+                ),
+                "role": track.get("role"),
+                "detected_role": track.get("detected_role"),
+                "team": int(track.get("team", 0) or 0),
+                "confidence": (
+                    float(track["confidence"])
+                    if track.get("confidence") is not None
+                    else None
+                ),
+                "has_ball": bool(track.get("has_ball", False)),
+                "bbox": _as_bbox_array(track.get("bbox")).tolist(),
+            }
+        )
+
+
 def _normalize_identity_merge_map(identity_merge_map: Optional[Dict[Any, Any]]) -> Dict[int, int]:
     """Normalize user-provided source_id -> target_id corrections."""
     if not identity_merge_map:
@@ -404,6 +494,83 @@ def _identity_candidate(profile_a: Dict[str, Any], profile_b: Dict[str, Any]) ->
     return None
 
 
+def _identity_candidate_debug(profile_a: Dict[str, Any], profile_b: Dict[str, Any]) -> Dict[str, Any]:
+    """Explain whether two tracklets are identity-link candidates."""
+    base = {
+        "source_id": int(profile_b["id"]),
+        "target_id": int(profile_a["id"]),
+        "old_tracklet_id": int(profile_a["id"]),
+        "new_tracklet_id": int(profile_b["id"]),
+        "old_last_source_frame_idx": int(profile_a["last_source_frame_idx"]),
+        "new_first_source_frame_idx": int(profile_b["first_source_frame_idx"]),
+    }
+
+    if int(profile_a["last_source_frame_idx"]) >= int(profile_b["first_source_frame_idx"]):
+        return {**base, "status": "rejected", "reason": "overlap_or_reverse_time"}
+
+    role_a, role_confidence_a = _dominant_count_value(profile_a.get("role_counts", Counter()), "player")
+    role_b, role_confidence_b = _dominant_count_value(profile_b.get("role_counts", Counter()), "player")
+    team_a, team_confidence_a = _dominant_count_value(profile_a.get("team_counts", Counter()), 0)
+    team_b, team_confidence_b = _dominant_count_value(profile_b.get("team_counts", Counter()), 0)
+    gap = int(profile_b["first_source_frame_idx"]) - int(profile_a["last_source_frame_idx"])
+    position_distance = _profile_position_distance(profile_a, profile_b)
+    reid_count = min(int(profile_a.get("reid_count", 0)), int(profile_b.get("reid_count", 0)))
+    color_count = min(int(profile_a.get("color_count", 0)), int(profile_b.get("color_count", 0)))
+
+    details = {
+        **base,
+        "role_a": str(role_a),
+        "role_b": str(role_b),
+        "role_confidence_a": float(role_confidence_a),
+        "role_confidence_b": float(role_confidence_b),
+        "team_a": int(team_a or 0),
+        "team_b": int(team_b or 0),
+        "team_confidence_a": float(team_confidence_a),
+        "team_confidence_b": float(team_confidence_b),
+        "gap_source_frames": int(gap),
+        "position_distance": float(position_distance),
+        "reid_count": int(reid_count),
+        "color_count": int(color_count),
+    }
+
+    if not _roles_compatible(str(role_a), str(role_b)):
+        return {**details, "status": "rejected", "reason": "role_incompatible"}
+    if not _teams_compatible(profile_a, profile_b):
+        return {**details, "status": "rejected", "reason": "team_conflict"}
+
+    if reid_count > 0:
+        reid_distance = _cosine_distance(profile_a.get("reid_embedding"), profile_b.get("reid_embedding"))
+        threshold = 0.36 if position_distance <= 2.5 else 0.28
+        status = "candidate" if reid_distance <= threshold else "rejected"
+        reason = "candidate_reid" if status == "candidate" else "reid_distance_above_threshold"
+        score = float(reid_distance + min(position_distance, 6.0) * 0.015 + min(gap, 9000) / 9000.0 * 0.025)
+        return {
+            **details,
+            "status": status,
+            "reason": reason,
+            "score": score,
+            "evidence": "osnet_reid",
+            "reid_distance": float(reid_distance),
+            "reid_threshold": float(threshold),
+        }
+
+    if color_count > 0:
+        color_distance = _cosine_distance(profile_a.get("color_signature"), profile_b.get("color_signature"))
+        is_candidate = color_distance <= 0.08 and position_distance <= 1.25
+        return {
+            **details,
+            "status": "candidate" if is_candidate else "rejected",
+            "reason": "candidate_color_position" if is_candidate else "color_or_position_above_threshold",
+            "score": float(color_distance + position_distance * 0.05),
+            "evidence": "color_position",
+            "color_distance": float(color_distance),
+            "color_threshold": 0.08,
+            "position_threshold": 1.25,
+        }
+
+    return {**details, "status": "rejected", "reason": "no_reid_or_color_signal"}
+
+
 def _intervals_overlap(intervals_a: List[tuple[int, int]], intervals_b: List[tuple[int, int]]) -> bool:
     """Return True if any source-frame intervals overlap."""
     for start_a, end_a in intervals_a:
@@ -490,6 +657,74 @@ def _build_auto_identity_merge_map(profiles: Dict[int, Dict[str, Any]]) -> tuple
         if find(track_id) != track_id
     }
     return merge_map, accepted_links
+
+
+def _identity_profile_summary(profile: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a compact JSON-safe identity profile."""
+    role, role_confidence = _dominant_count_value(profile.get("role_counts", Counter()), "player")
+    team, team_confidence = _dominant_count_value(profile.get("team_counts", Counter()), 0)
+    return {
+        "id": int(profile["id"]),
+        "role": str(role),
+        "role_confidence": float(role_confidence),
+        "team": int(team or 0),
+        "team_confidence": float(team_confidence),
+        "frames_seen": int(profile.get("frames_seen", 0)),
+        "first_sample": int(profile.get("first_sample", 0)),
+        "last_sample": int(profile.get("last_sample", 0)),
+        "first_source_frame_idx": int(profile.get("first_source_frame_idx", 0)),
+        "last_source_frame_idx": int(profile.get("last_source_frame_idx", 0)),
+        "first_bbox": _as_bbox_array(profile.get("first_bbox")).tolist(),
+        "last_bbox": _as_bbox_array(profile.get("last_bbox")).tolist(),
+        "reid_count": int(profile.get("reid_count", 0)),
+        "color_count": int(profile.get("color_count", 0)),
+    }
+
+
+def _build_identity_debug_report(
+    *,
+    profiles: Dict[int, Dict[str, Any]],
+    manual_merge_map: Dict[int, int],
+    auto_merge_map: Dict[int, int],
+    auto_links: List[Dict[str, Any]],
+    max_rejected_examples: int = 500,
+) -> Dict[str, Any]:
+    """Build a post-match identity report for human inspection."""
+    profile_values = sorted(profiles.values(), key=lambda item: int(item["first_source_frame_idx"]))
+    candidate_links: List[Dict[str, Any]] = []
+    rejected_examples: List[Dict[str, Any]] = []
+    reject_reason_counts: Counter = Counter()
+
+    for old_profile in profile_values:
+        for new_profile in profile_values:
+            if int(old_profile["id"]) == int(new_profile["id"]):
+                continue
+            audit = _identity_candidate_debug(old_profile, new_profile)
+            if audit["status"] == "candidate":
+                candidate_links.append(audit)
+            else:
+                reject_reason_counts[str(audit.get("reason", "unknown"))] += 1
+                if len(rejected_examples) < max_rejected_examples:
+                    rejected_examples.append(audit)
+
+    return {
+        "summary": {
+            "tracklet_count": len(profile_values),
+            "candidate_link_count": len(candidate_links),
+            "accepted_auto_link_count": len(auto_links),
+            "manual_merge_count": len(manual_merge_map),
+            "auto_merge_count": len(auto_merge_map),
+            "rejected_pair_count": sum(reject_reason_counts.values()),
+            "rejected_examples_truncated": sum(reject_reason_counts.values()) > len(rejected_examples),
+        },
+        "manual_merge_map": manual_merge_map,
+        "auto_merge_map": auto_merge_map,
+        "accepted_auto_links": auto_links,
+        "candidate_links": sorted(candidate_links, key=lambda item: float(item.get("score", 999.0))),
+        "reject_reason_counts": dict(reject_reason_counts),
+        "rejected_examples": rejected_examples,
+        "tracklet_profiles": [_identity_profile_summary(profile) for profile in profile_values],
+    }
 
 
 def _rebuild_player_outputs(annotation_states: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -662,6 +897,7 @@ def run_batch_analysis(
     team_ball_counts = {1: 0, 2: 0}
     last_team_control = 0
     identity_profiles: Dict[int, Dict[str, Any]] = {}
+    raw_tracklet_records: List[Dict[str, Any]] = []
     identity_merge_conflicts = 0
     auto_identity_merge_map: Dict[int, int] = {}
     auto_identity_links: List[Dict[str, Any]] = []
@@ -772,6 +1008,29 @@ def run_batch_analysis(
 
             if last_team_control in team_ball_counts:
                 team_ball_counts[last_team_control] += 1
+
+            sample_number = int(processed_frames + 1)
+            _append_raw_tracklet_records(
+                raw_tracklet_records,
+                sample_number=sample_number,
+                source_frame_idx=int(source_frame_idx),
+                object_type="player",
+                tracks=player_track,
+            )
+            _append_raw_tracklet_records(
+                raw_tracklet_records,
+                sample_number=sample_number,
+                source_frame_idx=int(source_frame_idx),
+                object_type="referee",
+                tracks=referee_track,
+            )
+            _append_raw_tracklet_records(
+                raw_tracklet_records,
+                sample_number=sample_number,
+                source_frame_idx=int(source_frame_idx),
+                object_type="ball",
+                tracks=ball_track,
+            )
 
             for referee in referee_track.values():
                 referee.pop("reid_embedding", None)
@@ -900,11 +1159,30 @@ def run_batch_analysis(
     }
 
     report_paths = _write_report_files(job_id, report, player_stats, output_root)
+    identity_debug = _build_identity_debug_report(
+        profiles=identity_profiles,
+        manual_merge_map=normalized_identity_merge_map,
+        auto_merge_map=auto_identity_merge_map,
+        auto_links=auto_identity_links,
+    )
+    identity_paths = _write_identity_artifacts(
+        job_id,
+        raw_tracklet_records=raw_tracklet_records,
+        identity_debug=identity_debug,
+        output_dir=output_root,
+    )
+    report_paths.update(identity_paths)
     report["artifacts"] = {
         "annotated_video": {"local_path": str(output_path), "content_type": "video/mp4"},
         "report_json": {"local_path": str(report_paths["report_json"]), "content_type": "application/json"},
         "report_csv": {"local_path": str(report_paths["report_csv"]), "content_type": "text/csv"},
+        "raw_tracklets_jsonl": {"local_path": str(report_paths["raw_tracklets_jsonl"]), "content_type": "application/x-ndjson"},
+        "identity_debug_json": {"local_path": str(report_paths["identity_debug_json"]), "content_type": "application/json"},
     }
+    report_paths["report_json"].write_text(
+        json.dumps(report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     report_paths["annotated_video"] = output_path
 
     return {"report": report, "paths": report_paths}

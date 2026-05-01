@@ -137,15 +137,27 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         report = result["report"]
         paths = result["paths"]
 
-        artifacts = {
-            "annotated_video": _artifact_response(storage, job_id, "annotated_video", paths["annotated_video"], "video/mp4"),
-            "report_json": _artifact_response(storage, job_id, "report_json", paths["report_json"], "application/json"),
-            "report_csv": _artifact_response(storage, job_id, "report_csv", paths["report_csv"], "text/csv"),
+        artifact_specs = {
+            "annotated_video": ("video/mp4", "annotated_video_url"),
+            "report_json": ("application/json", "report_json_url"),
+            "report_csv": ("text/csv", "report_csv_url"),
+            "raw_tracklets_jsonl": ("application/x-ndjson", "raw_tracklets_jsonl_url"),
+            "identity_debug_json": ("application/json", "identity_debug_json_url"),
         }
+        artifacts = {}
+        for artifact_name, (content_type, url_key) in artifact_specs.items():
+            artifact_path = paths.get(artifact_name)
+            if artifact_path is None:
+                continue
+            artifacts[artifact_name] = _artifact_response(
+                storage,
+                job_id,
+                artifact_name,
+                Path(artifact_path),
+                content_type,
+            )
+            report[url_key] = artifacts[artifact_name].get("public_url")
         report["artifacts"] = artifacts
-        report["annotated_video_url"] = artifacts["annotated_video"].get("public_url")
-        report["report_json_url"] = artifacts["report_json"].get("public_url")
-        report["report_csv_url"] = artifacts["report_csv"].get("public_url")
         report["status"] = "completed"
         return report
 

@@ -100,7 +100,9 @@ class Tracker:
             tracker_backend: "strongsort", "botsort", or "bytetrack".
             enable_field_filter: Remove non-pitch detections when True.
         """
+        self.model_path = model_path
         self.model = YOLO(model_path)
+        self._ball_model = None
         self.tracker_backend = (tracker_backend or os.environ.get("TRACKER_BACKEND", "botsort")).lower()
         self.tracker = sv.ByteTrack(**self._bytetrack_kwargs())
         self.strongsort_tracker = None
@@ -171,6 +173,19 @@ class Tracker:
             mc_lambda=float(os.environ.get("STRONGSORT_MC_LAMBDA", "0.995")),
             ema_alpha=float(os.environ.get("STRONGSORT_EMA_ALPHA", "0.90")),
         )
+
+    def _detect_ball_frames(self, frames: List[np.ndarray]) -> List:
+        """Run ball detection on an isolated YOLO instance."""
+        if self._ball_model is None:
+            self._ball_model = YOLO(self.model_path)
+        detections = []
+        for i in range(0, len(frames), 20):
+            detections += self._ball_model.predict(
+                frames[i:i + 20],
+                conf=self.detection_confidence,
+                verbose=False,
+            )
+        return detections
 
     def _create_botsort_yaml(self) -> str:
         """Create a temporary BoT-SORT config for Ultralytics tracking."""
@@ -541,6 +556,7 @@ class Tracker:
 
     def _get_object_tracks_with_botsort(self, frames: List[np.ndarray]) -> Dict:
         """Track frames with Ultralytics BoT-SORT + ReID settings."""
+        separate_ball_detection = os.environ.get("BOTSORT_SEPARATE_BALL_DETECTION", "1").strip() != "0"
         results = self.model.track(
             source=frames,
             conf=self.detection_confidence,
@@ -551,6 +567,7 @@ class Tracker:
             stream=False,
             agnostic_nms=True,
         )
+        raw_ball_results = self._detect_ball_frames(frames) if separate_ball_detection else []
 
         tracks = {
             "players": [],
@@ -566,7 +583,7 @@ class Tracker:
             tracks["ball"].append({})
 
             boxes = getattr(result, "boxes", None)
-            if boxes is None or boxes.id is None:
+            if boxes is None:
                 self._prune_identity_cache()
                 self._frame_index += 1
                 continue
@@ -574,7 +591,10 @@ class Tracker:
             xyxy_values = boxes.xyxy.cpu().numpy()
             class_values = boxes.cls.int().cpu().numpy()
             confidence_values = boxes.conf.cpu().numpy()
-            track_id_values = boxes.id.int().cpu().numpy()
+            if boxes.id is not None:
+                track_id_values = boxes.id.int().cpu().numpy()
+            else:
+                track_id_values = np.full(len(xyxy_values), -1, dtype=int)
 
             people_items = []
             best_ball = None
@@ -590,6 +610,8 @@ class Tracker:
                 confidence = float(confidence)
 
                 if role in self.PERSON_ROLES:
+                    if int(raw_track_id) < 0:
+                        continue
                     if confidence < self.person_confidence:
                         continue
                     people_items.append(
@@ -604,6 +626,25 @@ class Tracker:
                     if confidence > best_ball_confidence:
                         best_ball_confidence = confidence
                         best_ball = np.asarray(bbox, dtype=float)
+
+            if best_ball is None and result_index < len(raw_ball_results):
+                raw_boxes = getattr(raw_ball_results[result_index], "boxes", None)
+                raw_names = getattr(raw_ball_results[result_index], "names", {}) or {}
+                if raw_boxes is not None:
+                    raw_xyxy_values = raw_boxes.xyxy.cpu().numpy()
+                    raw_class_values = raw_boxes.cls.int().cpu().numpy()
+                    raw_confidence_values = raw_boxes.conf.cpu().numpy()
+                    for bbox, class_id, confidence in zip(
+                        raw_xyxy_values,
+                        raw_class_values,
+                        raw_confidence_values,
+                    ):
+                        role = self._normalize_class_name(raw_names.get(int(class_id), ""))
+                        confidence = float(confidence)
+                        if role == "ball" and confidence >= self.ball_confidence:
+                            if confidence > best_ball_confidence:
+                                best_ball_confidence = confidence
+                                best_ball = np.asarray(bbox, dtype=float)
 
             if self.field_filter is not None:
                 people_items = self.field_filter.filter_track_items(frame, people_items)

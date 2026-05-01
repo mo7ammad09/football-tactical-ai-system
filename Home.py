@@ -246,9 +246,11 @@ with st.sidebar:
     base_dir = os.path.dirname(os.path.abspath(__file__))
     
     # Check available models
+    al_rayyan_path = os.path.join(base_dir, "models", "al_rayyan_yolo11_v2_best.pt")
     old_data_path = os.path.join(base_dir, "models", "old_data.pt")
     abdullah_path = os.path.join(base_dir, "models", "abdullah_yolov5.pt")
     
+    al_rayyan_exists = os.path.exists(al_rayyan_path)
     old_data_exists = os.path.exists(old_data_path)
     abdullah_exists = os.path.exists(abdullah_path)
     
@@ -260,6 +262,9 @@ with st.sidebar:
     
     if abdullah_exists:
         available_models.append("Abdullah Tarek (yolov5)")
+
+    if al_rayyan_exists:
+        available_models.append("Al Rayyan YOLO11 v2 (pilot)")
     
     available_models.append("Mock (تجريبي)" if lang == "ar" else "Mock (Demo)")
     
@@ -272,7 +277,10 @@ with st.sidebar:
     # Determine which model to use
     use_real_model = model_choice != "Mock (تجريبي)" and model_choice != "Mock (Demo)"
     
-    if "Tactic Zone" in model_choice:
+    if "Al Rayyan" in model_choice:
+        model_path = al_rayyan_path
+        model_name = "Al Rayyan YOLO11 v2"
+    elif "Tactic Zone" in model_choice:
         model_path = old_data_path
         model_name = "Tactic Zone"
     elif "Abdullah" in model_choice:
@@ -286,11 +294,17 @@ with st.sidebar:
     if use_real_model:
         st.success(f"✅ {model_name} جاهز!" if lang == "ar" else f"✅ {model_name} ready!")
         st.caption(f"المسار: {model_path}" if lang == "ar" else f"Path: {model_path}")
+        if "Al Rayyan" in model_choice:
+            st.warning(
+                "🧪 نموذج الريان v2 تجريبي فقط. الفحص الحالي أظهر ضعفاً واضحاً في الكرة، فلا تعتمد عليه كموديل إنتاج."
+                if lang == "ar"
+                else "🧪 Al Rayyan v2 is experimental only. Current validation showed weak ball detection; do not use it as a production model."
+            )
     else:
         st.info("ℹ️ وضع تجريبي - بيانات وهمية" if lang == "ar" else "ℹ️ Demo mode - fake data")
     
     # Show download instructions for missing models
-    if not old_data_exists and not abdullah_exists:
+    if not al_rayyan_exists and not old_data_exists and not abdullah_exists:
         st.warning("⚠️ لا يوجد نموذج حقيقي!" if lang == "ar" else "⚠️ No real model found!")
         st.info("""
         **لتحميل النماذج:**
@@ -540,7 +554,7 @@ with st.sidebar:
             tracker_backend_label = st.selectbox(
                 "نظام تتبع اللاعبين" if lang == "ar" else "Player Tracking Backend",
                 tracker_backend_options,
-                index=0,
+                index=1 if "Al Rayyan" in model_choice else 0,
                 help=(
                     "StrongSORT أبطأ وأغلى لكنه أفضل لتثبيت أرقام اللاعبين في مباريات طويلة."
                     if lang == "ar"
@@ -863,7 +877,12 @@ if video_path:
                     if video_url and video_url.startswith("/"):
                         video_url = f"{remote_server_url.rstrip('/')}{video_url}"
                     results["output_video"] = video_url
-                    for artifact_url_key in ("report_json_url", "report_csv_url"):
+                    for artifact_url_key in (
+                        "report_json_url",
+                        "report_csv_url",
+                        "raw_tracklets_jsonl_url",
+                        "identity_debug_json_url",
+                    ):
                         artifact_url = results.get(artifact_url_key)
                         if artifact_url and artifact_url.startswith("/"):
                             results[artifact_url_key] = f"{remote_server_url.rstrip('/')}{artifact_url}"
@@ -1334,13 +1353,19 @@ if st.session_state.analysis_done and st.session_state.analysis_results:
 
     report_json_url = results.get("report_json_url")
     report_csv_url = results.get("report_csv_url")
-    if report_json_url or report_csv_url:
+    raw_tracklets_jsonl_url = results.get("raw_tracklets_jsonl_url")
+    identity_debug_json_url = results.get("identity_debug_json_url")
+    if report_json_url or report_csv_url or raw_tracklets_jsonl_url or identity_debug_json_url:
         st.markdown("### 📄 " + ("التقارير" if lang == "ar" else "Reports"))
-        cols = st.columns(2)
+        cols = st.columns(4)
         if report_json_url:
             cols[0].markdown(f"[JSON report]({report_json_url})")
         if report_csv_url:
             cols[1].markdown(f"[CSV player report]({report_csv_url})")
+        if raw_tracklets_jsonl_url:
+            cols[2].markdown(f"[Raw tracklets]({raw_tracklets_jsonl_url})")
+        if identity_debug_json_url:
+            cols[3].markdown(f"[Identity debug]({identity_debug_json_url})")
     
     # Tabs
     tab_labels = ["📊 إحصائيات", "🎯 لوحة تكتيكية", "👥 لاعبين", "🤖 تحليل AI"] if lang == "ar" else ["📊 Stats", "🎯 Tactical", "👥 Players", "🤖 AI"]
