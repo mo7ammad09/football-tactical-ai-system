@@ -46,6 +46,11 @@ def _summarize_tracker(
 ) -> Dict[str, Any]:
     """Run one backend and return ID-stability proxy metrics."""
     tracker = Tracker(model_path, tracker_backend=backend)
+    backend_reid_strategy = {
+        "botsort": "ultralytics_botsort_reid",
+        "strongsort": "boxmot_strongsort_osnet",
+        "bytetrack": "none",
+    }.get(backend, "unknown")
     entries = list(
         iter_video_frames_sampled_with_indices(
             video_path,
@@ -104,6 +109,8 @@ def _summarize_tracker(
 
     return {
         "backend": backend,
+        "reid_strategy": backend_reid_strategy,
+        "reid_enabled": backend_reid_strategy != "none",
         "processed_frames": len(entries),
         "unique_display_ids": unique_ids,
         "max_players_in_frame": max_players,
