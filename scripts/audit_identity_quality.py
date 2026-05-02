@@ -71,7 +71,19 @@ def _iter_person_rows(rows: Iterable[dict[str, Any]]) -> Iterable[dict[str, Any]
 
 def _is_goalkeeper_like(row: dict[str, Any]) -> bool:
     """Return whether a row is visually treated as a goalkeeper."""
-    return str(row.get("role", "")) == GOALKEEPER_ROLE
+    return _visible_role(row) == GOALKEEPER_ROLE
+
+
+def _visible_role(row: dict[str, Any]) -> str:
+    """Return the client-facing role for a row."""
+    return str(row.get("display_role") or row.get("role") or "unknown")
+
+
+def _visible_team(row: dict[str, Any]) -> int:
+    """Return the client-facing team/color bucket for a row."""
+    if row.get("display_team") is not None:
+        return int(row.get("display_team") or 0)
+    return int(row.get("team", 0) or 0)
 
 
 def _visible_identity(row: dict[str, Any]) -> Any:
@@ -101,8 +113,8 @@ def _build_track_profiles(rows: list[dict[str, Any]]) -> dict[Any, dict[str, Any
     profiles: dict[Any, dict[str, Any]] = {}
     for visible_id, track_rows in grouped.items():
         ordered = sorted(track_rows, key=lambda item: int(item.get("source_frame_idx", 0)))
-        roles = Counter(str(row.get("role", "unknown")) for row in ordered)
-        teams = Counter(int(row.get("team", 0) or 0) for row in ordered)
+        roles = Counter(_visible_role(row) for row in ordered)
+        teams = Counter(_visible_team(row) for row in ordered)
         objects = Counter(str(row.get("object_type", "unknown")) for row in ordered)
         source_track_ids = Counter(
             int(row["track_id"])
@@ -118,8 +130,8 @@ def _build_track_profiles(rows: list[dict[str, Any]]) -> dict[Any, dict[str, Any
 
         segments: list[dict[str, Any]] = []
         for row in ordered:
-            role = str(row.get("role", "unknown"))
-            team = int(row.get("team", 0) or 0)
+            role = _visible_role(row)
+            team = _visible_team(row)
             object_type = str(row.get("object_type", "unknown"))
             raw_track_id = (
                 int(row["raw_track_id"])
@@ -201,7 +213,7 @@ def _build_raw_track_fragmentation(rows: list[dict[str, Any]]) -> list[dict[str,
         display_ids = Counter(int(row["track_id"]) for row in raw_rows if row.get("track_id") is not None)
         if len(display_ids) <= 1:
             continue
-        roles = Counter(str(row.get("role", "unknown")) for row in raw_rows)
+        roles = Counter(_visible_role(row) for row in raw_rows)
         source_frames = [int(row.get("source_frame_idx", 0)) for row in raw_rows]
         goalkeeper_rows = [row for row in raw_rows if _is_goalkeeper_like(row)]
         fragments.append(

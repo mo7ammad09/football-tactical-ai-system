@@ -64,8 +64,10 @@ def test_audit_identity_quality_treats_locked_gk_label_as_client_facing_identity
     audit_mod = _load_audit_module()
     rows = []
     for frame, track_id in enumerate([21, 9, 29, 14, 29, 31], start=10):
-        row = _row(track_id, 100 + track_id, frame, "goalkeeper", team=0)
+        row = _row(track_id, 100 + track_id, frame, "player", team=1)
         row["display_label"] = "GK"
+        row["display_role"] = "goalkeeper"
+        row["display_team"] = 0
         row["goalkeeper_display_locked"] = True
         rows.append(row)
 

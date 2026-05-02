@@ -231,22 +231,27 @@ def test_identity_debug_report_flags_goalkeeper_role_flicker():
 def test_goalkeeper_display_lock_suppresses_prelock_flicker_then_labels_gk():
     lock = _GoalkeeperDisplayLock(min_evidence_frames=3)
     frames = [
-        {14: {"role": "goalkeeper", "raw_track_id": 35}},
-        {14: {"role": "goalkeeper", "raw_track_id": 35}},
-        {29: {"role": "goalkeeper", "raw_track_id": 35}},
-        {31: {"role": "goalkeeper", "raw_track_id": 129}},
+        {14: {"role": "goalkeeper", "raw_track_id": 35, "bbox": [0, 0, 10, 20]}},
+        {14: {"role": "goalkeeper", "raw_track_id": 35, "bbox": [1, 0, 11, 20]}},
+        {29: {"role": "goalkeeper", "raw_track_id": 35, "bbox": [2, 0, 12, 20]}},
+        {31: {"role": "goalkeeper", "raw_track_id": 129, "bbox": [3, 0, 13, 20]}},
+        {14: {"role": "player", "detected_role": "player", "raw_track_id": 35, "bbox": [4, 0, 14, 20]}},
     ]
 
-    lock.apply(frames[0])
-    lock.apply(frames[1])
+    lock.apply(frames[0], source_frame_idx=0)
+    lock.apply(frames[1], source_frame_idx=1)
     assert frames[0][14]["role"] == "player"
     assert frames[1][14]["role"] == "player"
     assert frames[0][14]["role_display_suppressed"] is True
 
-    lock.apply(frames[2])
-    lock.apply(frames[3])
+    lock.apply(frames[2], source_frame_idx=2)
+    lock.apply(frames[3], source_frame_idx=3)
+    lock.apply(frames[4], source_frame_idx=4)
 
     assert frames[2][29]["display_label"] == "GK"
     assert frames[2][29]["goalkeeper_display_locked"] is True
     assert frames[3][31]["display_label"] == "GK"
+    assert frames[4][14]["role"] == "player"
+    assert frames[4][14]["display_role"] == "goalkeeper"
+    assert frames[4][14]["display_label"] == "GK"
     assert lock.summary()["locked"] is True

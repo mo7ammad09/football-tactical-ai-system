@@ -58,12 +58,16 @@ def _draw_review_frame(
     out = frame.copy()
 
     for track_id, player in player_track.items():
+        display_role = str(player.get("display_role") or player.get("role") or "player")
         fallback_color = (
             (255, 0, 255)
-            if player.get("role") == "goalkeeper"
+            if display_role == "goalkeeper"
             else (0, 0, 255)
         )
-        color = _normalize_color(player.get("team_color"), fallback_color)
+        color = _normalize_color(
+            player.get("display_color", player.get("team_color")),
+            fallback_color,
+        )
         out = tracker.draw_ellipse(
             out,
             player["bbox"],
@@ -214,6 +218,21 @@ def _append_raw_tracklet_records(
                     if track.get("display_label") is not None
                     else None
                 ),
+                "display_role": (
+                    str(track["display_role"])
+                    if track.get("display_role") is not None
+                    else None
+                ),
+                "display_team": (
+                    int(track["display_team"])
+                    if track.get("display_team") is not None
+                    else None
+                ),
+                "display_color": (
+                    list(_normalize_color(track["display_color"]))
+                    if track.get("display_color") is not None
+                    else None
+                ),
                 "goalkeeper_display_locked": bool(track.get("goalkeeper_display_locked", False)),
                 "role_display_suppressed": bool(track.get("role_display_suppressed", False)),
                 "confidence": (
@@ -232,9 +251,19 @@ def _append_raw_tracklet_records(
 class _GoalkeeperDisplayLock:
     """Stabilize client-facing goalkeeper labels without merging raw identities."""
 
-    def __init__(self, min_evidence_frames: int = 5):
+    def __init__(
+        self,
+        min_evidence_frames: int = 5,
+        max_follow_gap_frames: int = 120,
+        follow_distance_threshold: float = 2.5,
+    ):
         self.min_evidence_frames = max(1, int(min_evidence_frames))
+        self.max_follow_gap_frames = max(1, int(max_follow_gap_frames))
+        self.follow_distance_threshold = max(0.5, float(follow_distance_threshold))
         self._goalkeeper_evidence: Counter = Counter()
+        self._locked_keys: set[tuple[str, int]] = set()
+        self._last_locked_bbox: Optional[List[float]] = None
+        self._last_locked_source_frame_idx: Optional[int] = None
         self.locked = False
         self.suppressed_frames = 0
         self.locked_frames = 0
@@ -246,38 +275,127 @@ class _GoalkeeperDisplayLock:
             return ("raw", int(raw_track_id))
         return ("display", int(track_id))
 
-    def apply(self, player_track: Dict[int, Dict[str, Any]]) -> None:
+    @staticmethod
+    def _is_goalkeeper_evidence(track: Dict[str, Any]) -> bool:
+        """Return whether either raw or smoothed role says goalkeeper."""
+        return (
+            str(track.get("role", "player")) == "goalkeeper"
+            or str(track.get("detected_role", "player")) == "goalkeeper"
+        )
+
+    @staticmethod
+    def _is_referee_like(track: Dict[str, Any]) -> bool:
+        """Avoid promoting referee detections into goalkeeper display locks."""
+        return (
+            str(track.get("role", "player")) == "referee"
+            or str(track.get("detected_role", "player")) == "referee"
+            or str(track.get("object_type", "player")) == "referee"
+        )
+
+    @staticmethod
+    def _bbox_distance(a: Any, b: Any) -> float:
+        """Return normalized center distance between two boxes."""
+        a_bbox = _as_bbox_array(a)
+        b_bbox = _as_bbox_array(b)
+        scale = max(_bbox_scale(a_bbox), _bbox_scale(b_bbox), 1.0)
+        return float(np.linalg.norm(_bbox_center(a_bbox) - _bbox_center(b_bbox)) / scale)
+
+    def _is_recent_spatial_follow(self, track: Dict[str, Any], source_frame_idx: Optional[int]) -> bool:
+        """Return whether a player-classified row continues the active GK path."""
+        if self._last_locked_bbox is None or self._last_locked_source_frame_idx is None:
+            return False
+        if source_frame_idx is None:
+            return False
+        if source_frame_idx - self._last_locked_source_frame_idx > self.max_follow_gap_frames:
+            return False
+        if self._is_referee_like(track):
+            return False
+        distance = self._bbox_distance(self._last_locked_bbox, track.get("bbox"))
+        return distance <= self.follow_distance_threshold
+
+    def _suppress_prelock(self, track: Dict[str, Any]) -> None:
+        """Keep early noisy goalkeeper flashes from becoming client-facing IDs."""
+        track["role_display_suppressed"] = True
+        track["display_role"] = "player"
+        track["display_color"] = (128, 128, 128)
+        if str(track.get("role", "player")) == "goalkeeper":
+            track["role"] = "player"
+            track["team"] = 0
+            track["team_color"] = (128, 128, 128)
+        self.suppressed_frames += 1
+
+    def _apply_locked_display(
+        self,
+        track_id: int,
+        track: Dict[str, Any],
+        key: tuple[str, int],
+        source_frame_idx: Optional[int],
+    ) -> None:
+        """Force the visible goalkeeper identity while preserving internal evidence."""
+        self._locked_keys.add(key)
+        self.locked = True
+        track["display_label"] = "GK"
+        track["display_role"] = "goalkeeper"
+        track["display_team"] = 0
+        track["display_color"] = (255, 0, 255)
+        track["goalkeeper_display_locked"] = True
+        if str(track.get("role", "player")) == "goalkeeper":
+            track["team"] = 0
+            track["team_color"] = (255, 0, 255)
+        self.locked_frames += 1
+        self._last_locked_bbox = _as_bbox_array(track.get("bbox")).tolist()
+        self._last_locked_source_frame_idx = source_frame_idx
+
+    def apply(
+        self,
+        player_track: Dict[int, Dict[str, Any]],
+        source_frame_idx: Optional[int] = None,
+    ) -> None:
         """Mark stable goalkeeper detections with a fixed visible label."""
-        goalkeeper_items = [
-            (int(track_id), track)
-            for track_id, track in player_track.items()
-            if str(track.get("role", "player")) == "goalkeeper"
-        ]
-        if not goalkeeper_items:
+        if not player_track:
             return
 
-        for track_id, track in goalkeeper_items:
-            self._goalkeeper_evidence[self._candidate_key(track_id, track)] += 1
+        goalkeeper_items: List[tuple[int, Dict[str, Any], tuple[str, int]]] = []
+        for track_id, track in player_track.items():
+            if not self._is_goalkeeper_evidence(track):
+                continue
+            key = self._candidate_key(int(track_id), track)
+            self._goalkeeper_evidence[key] += 1
+            goalkeeper_items.append((int(track_id), track, key))
+            if self._goalkeeper_evidence[key] >= self.min_evidence_frames:
+                self._locked_keys.add(key)
 
-        if not self.locked and any(
-            count >= self.min_evidence_frames
-            for count in self._goalkeeper_evidence.values()
-        ):
-            self.locked = True
+        self.locked = bool(self._locked_keys)
+        if not self.locked:
+            for _, track, _ in goalkeeper_items:
+                self._suppress_prelock(track)
+            return
 
-        for _, track in goalkeeper_items:
-            if self.locked:
-                track["display_label"] = "GK"
-                track["goalkeeper_display_locked"] = True
-                track["team"] = 0
-                track["team_color"] = (255, 0, 255)
-                self.locked_frames += 1
-            else:
-                track["role_display_suppressed"] = True
-                track["role"] = "player"
-                track["team"] = 0
-                track["team_color"] = (128, 128, 128)
-                self.suppressed_frames += 1
+        locked_items: List[tuple[int, Dict[str, Any], tuple[str, int]]] = []
+        for track_id, track in player_track.items():
+            key = self._candidate_key(int(track_id), track)
+            if key in self._locked_keys:
+                locked_items.append((int(track_id), track, key))
+                continue
+            if (
+                self._is_goalkeeper_evidence(track)
+                and self._goalkeeper_evidence[key] >= self.min_evidence_frames
+            ):
+                locked_items.append((int(track_id), track, key))
+                continue
+            if (
+                self._is_goalkeeper_evidence(track)
+                and self._is_recent_spatial_follow(track, source_frame_idx)
+            ):
+                locked_items.append((int(track_id), track, key))
+
+        locked_keys_this_frame = {key for _, _, key in locked_items}
+        for _, track, key in goalkeeper_items:
+            if key not in locked_keys_this_frame:
+                self._suppress_prelock(track)
+
+        for track_id, track, key in locked_items:
+            self._apply_locked_display(track_id, track, key, source_frame_idx)
 
     def summary(self) -> Dict[str, Any]:
         """Return report-friendly lock statistics."""
@@ -285,8 +403,14 @@ class _GoalkeeperDisplayLock:
             "enabled": True,
             "locked": bool(self.locked),
             "min_evidence_frames": int(self.min_evidence_frames),
+            "max_follow_gap_frames": int(self.max_follow_gap_frames),
+            "follow_distance_threshold": float(self.follow_distance_threshold),
             "locked_goalkeeper_frames": int(self.locked_frames),
             "suppressed_prelock_frames": int(self.suppressed_frames),
+            "locked_keys": [
+                f"{kind}:{identifier}"
+                for kind, identifier in sorted(self._locked_keys)
+            ],
             "candidate_evidence": {
                 f"{kind}:{identifier}": int(count)
                 for (kind, identifier), count in self._goalkeeper_evidence.items()
@@ -1297,7 +1421,10 @@ def run_batch_analysis(
             player_track = batch_tracks["players"][local_idx]
             referee_track = batch_tracks["referees"][local_idx]
             ball_track = batch_tracks["ball"][local_idx]
-            goalkeeper_display_lock.apply(player_track)
+            goalkeeper_display_lock.apply(
+                player_track,
+                source_frame_idx=int(source_frame_idx),
+            )
 
             max_players_in_frame = max(max_players_in_frame, len(player_track))
             player_frame_detections += len(player_track)
@@ -1323,11 +1450,17 @@ def run_batch_analysis(
                     track["team_color"] = team_assigner.team_colors.get(team, (128, 128, 128))
 
                 reid_embedding = track.get("reid_embedding")
+                profile_role = str(track.get("display_role") or role)
+                profile_team = (
+                    int(track["display_team"])
+                    if track.get("display_team") is not None
+                    else int(team)
+                )
                 _update_identity_profile(
                     identity_profiles,
                     track_id=int(player_id),
-                    role=role,
-                    team=int(team),
+                    role=profile_role,
+                    team=profile_team,
                     sample_number=int(processed_frames + 1),
                     source_frame_idx=int(source_frame_idx),
                     bbox=track["bbox"],

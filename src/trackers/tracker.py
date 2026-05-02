@@ -1209,12 +1209,16 @@ class Tracker:
 
             # Draw Players
             for track_id, player in player_dict.items():
+                display_role = str(player.get("display_role") or player.get("role") or "player")
                 fallback_color = (
                     (255, 0, 255)
-                    if player.get("role") == "goalkeeper"
+                    if display_role == "goalkeeper"
                     else (0, 0, 255)
                 )
-                color = player.get("team_color", fallback_color)
+                color = player.get(
+                    "display_color",
+                    player.get("team_color", fallback_color),
+                )
                 frame = self.draw_ellipse(
                     frame,
                     player["bbox"],
