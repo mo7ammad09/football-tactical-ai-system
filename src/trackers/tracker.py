@@ -9,7 +9,7 @@ import inspect
 import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 import cv2
 import numpy as np
@@ -1054,14 +1054,20 @@ class Tracker:
 
         return tracks
 
-    def draw_ellipse(self, frame: np.ndarray, bbox: list, color: tuple, track_id: Optional[int] = None) -> np.ndarray:
+    def draw_ellipse(
+        self,
+        frame: np.ndarray,
+        bbox: list,
+        color: tuple,
+        track_id: Optional[Any] = None,
+    ) -> np.ndarray:
         """Draw ellipse at player foot position.
 
         Args:
             frame: Video frame.
             bbox: Bounding box [x1, y1, x2, y2].
             color: RGB color tuple.
-            track_id: Player track ID.
+            track_id: Player track ID or display label.
 
         Returns:
             Annotated frame.
@@ -1083,7 +1089,8 @@ class Tracker:
         )
 
         # Draw track ID label
-        rectangle_width = 40
+        label = str(track_id) if track_id is not None else ""
+        rectangle_width = max(40, 18 + (len(label) * 12))
         rectangle_height = 20
         x1_rect = x_center - rectangle_width // 2
         x2_rect = x_center + rectangle_width // 2
@@ -1097,13 +1104,17 @@ class Tracker:
                           color,
                           cv2.FILLED)
 
-            x1_text = x1_rect + 12
-            if track_id > 99:
-                x1_text -= 10
+            text_size, _ = cv2.getTextSize(
+                label,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                2,
+            )
+            x1_text = x_center - (text_size[0] // 2)
 
             cv2.putText(
                 frame,
-                f"{track_id}",
+                label,
                 (int(x1_text), int(y1_rect + 15)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
@@ -1204,7 +1215,12 @@ class Tracker:
                     else (0, 0, 255)
                 )
                 color = player.get("team_color", fallback_color)
-                frame = self.draw_ellipse(frame, player["bbox"], color, track_id)
+                frame = self.draw_ellipse(
+                    frame,
+                    player["bbox"],
+                    color,
+                    player.get("display_label", track_id),
+                )
 
                 if player.get('has_ball', False):
                     frame = self.draw_triangle(frame, player["bbox"], (0, 0, 255))

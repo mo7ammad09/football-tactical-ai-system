@@ -64,7 +64,12 @@ def _draw_review_frame(
             else (0, 0, 255)
         )
         color = _normalize_color(player.get("team_color"), fallback_color)
-        out = tracker.draw_ellipse(out, player["bbox"], color, track_id)
+        out = tracker.draw_ellipse(
+            out,
+            player["bbox"],
+            color,
+            player.get("display_label", track_id),
+        )
         if player.get("has_ball", False):
             out = tracker.draw_triangle(out, player["bbox"], (0, 0, 255))
 
@@ -204,6 +209,13 @@ def _append_raw_tracklet_records(
                 "role": track.get("role"),
                 "detected_role": track.get("detected_role"),
                 "team": int(track.get("team", 0) or 0),
+                "display_label": (
+                    str(track["display_label"])
+                    if track.get("display_label") is not None
+                    else None
+                ),
+                "goalkeeper_display_locked": bool(track.get("goalkeeper_display_locked", False)),
+                "role_display_suppressed": bool(track.get("role_display_suppressed", False)),
                 "confidence": (
                     float(track["confidence"])
                     if track.get("confidence") is not None
@@ -215,6 +227,71 @@ def _append_raw_tracklet_records(
                 "bbox": _as_bbox_array(track.get("bbox")).tolist(),
             }
         )
+
+
+class _GoalkeeperDisplayLock:
+    """Stabilize client-facing goalkeeper labels without merging raw identities."""
+
+    def __init__(self, min_evidence_frames: int = 5):
+        self.min_evidence_frames = max(1, int(min_evidence_frames))
+        self._goalkeeper_evidence: Counter = Counter()
+        self.locked = False
+        self.suppressed_frames = 0
+        self.locked_frames = 0
+
+    @staticmethod
+    def _candidate_key(track_id: int, track: Dict[str, Any]) -> tuple[str, int]:
+        raw_track_id = track.get("raw_track_id")
+        if raw_track_id is not None:
+            return ("raw", int(raw_track_id))
+        return ("display", int(track_id))
+
+    def apply(self, player_track: Dict[int, Dict[str, Any]]) -> None:
+        """Mark stable goalkeeper detections with a fixed visible label."""
+        goalkeeper_items = [
+            (int(track_id), track)
+            for track_id, track in player_track.items()
+            if str(track.get("role", "player")) == "goalkeeper"
+        ]
+        if not goalkeeper_items:
+            return
+
+        for track_id, track in goalkeeper_items:
+            self._goalkeeper_evidence[self._candidate_key(track_id, track)] += 1
+
+        if not self.locked and any(
+            count >= self.min_evidence_frames
+            for count in self._goalkeeper_evidence.values()
+        ):
+            self.locked = True
+
+        for _, track in goalkeeper_items:
+            if self.locked:
+                track["display_label"] = "GK"
+                track["goalkeeper_display_locked"] = True
+                track["team"] = 0
+                track["team_color"] = (255, 0, 255)
+                self.locked_frames += 1
+            else:
+                track["role_display_suppressed"] = True
+                track["role"] = "player"
+                track["team"] = 0
+                track["team_color"] = (128, 128, 128)
+                self.suppressed_frames += 1
+
+    def summary(self) -> Dict[str, Any]:
+        """Return report-friendly lock statistics."""
+        return {
+            "enabled": True,
+            "locked": bool(self.locked),
+            "min_evidence_frames": int(self.min_evidence_frames),
+            "locked_goalkeeper_frames": int(self.locked_frames),
+            "suppressed_prelock_frames": int(self.suppressed_frames),
+            "candidate_evidence": {
+                f"{kind}:{identifier}": int(count)
+                for (kind, identifier), count in self._goalkeeper_evidence.items()
+            },
+        }
 
 
 def _normalize_identity_merge_map(identity_merge_map: Optional[Dict[Any, Any]]) -> Dict[int, int]:
@@ -379,6 +456,8 @@ def _update_identity_profile(
     sample_number: int,
     source_frame_idx: int,
     bbox: Any,
+    raw_track_id: Optional[int] = None,
+    object_type: str = "player",
     reid_embedding: Any = None,
     color_signature: Any = None,
 ) -> None:
@@ -396,6 +475,9 @@ def _update_identity_profile(
             "last_source_frame_idx": int(source_frame_idx),
             "first_bbox": _as_bbox_array(bbox).tolist(),
             "last_bbox": _as_bbox_array(bbox).tolist(),
+            "raw_track_counts": Counter(),
+            "object_type_counts": Counter(),
+            "role_segments": [],
             "reid_embedding": None,
             "reid_count": 0,
             "color_signature": None,
@@ -403,12 +485,41 @@ def _update_identity_profile(
         },
     )
     profile["role_counts"][str(role)] += 1
+    profile["object_type_counts"][str(object_type)] += 1
+    if raw_track_id is not None:
+        profile["raw_track_counts"][int(raw_track_id)] += 1
     if team:
         profile["team_counts"][int(team)] += 1
     profile["frames_seen"] += 1
     profile["last_sample"] = int(sample_number)
     profile["last_source_frame_idx"] = int(source_frame_idx)
     profile["last_bbox"] = _as_bbox_array(bbox).tolist()
+    segments = profile.setdefault("role_segments", [])
+    segment_raw_track_id = int(raw_track_id) if raw_track_id is not None else None
+    if (
+        not segments
+        or segments[-1]["role"] != str(role)
+        or int(segments[-1]["team"]) != int(team)
+        or segments[-1].get("raw_track_id") != segment_raw_track_id
+        or str(segments[-1].get("object_type", object_type)) != str(object_type)
+    ):
+        segments.append(
+            {
+                "role": str(role),
+                "team": int(team),
+                "raw_track_id": segment_raw_track_id,
+                "object_type": str(object_type),
+                "first_sample": int(sample_number),
+                "last_sample": int(sample_number),
+                "first_source_frame_idx": int(source_frame_idx),
+                "last_source_frame_idx": int(source_frame_idx),
+                "frames_seen": 1,
+            }
+        )
+    else:
+        segments[-1]["last_sample"] = int(sample_number)
+        segments[-1]["last_source_frame_idx"] = int(source_frame_idx)
+        segments[-1]["frames_seen"] += 1
     _merge_profile_vector(profile, "reid_embedding", "reid_count", reid_embedding)
     _merge_profile_vector(profile, "color_signature", "color_count", color_signature)
 
@@ -741,6 +852,109 @@ def _identity_profile_summary(profile: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _compact_role_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the fields needed to audit role/color flicker."""
+    return {
+        "role": str(segment.get("role", "player")),
+        "team": int(segment.get("team", 0) or 0),
+        "raw_track_id": (
+            int(segment["raw_track_id"])
+            if segment.get("raw_track_id") is not None
+            else None
+        ),
+        "object_type": str(segment.get("object_type", "player")),
+        "first_sample": int(segment.get("first_sample", 0)),
+        "last_sample": int(segment.get("last_sample", 0)),
+        "first_source_frame_idx": int(segment.get("first_source_frame_idx", 0)),
+        "last_source_frame_idx": int(segment.get("last_source_frame_idx", 0)),
+        "frames_seen": int(segment.get("frames_seen", 0)),
+    }
+
+
+def _build_role_stability_diagnostics(profile_values: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Find role flicker and goalkeeper ID fragmentation visible in tracklets."""
+    role_flicker_tracklets: List[Dict[str, Any]] = []
+    goalkeeper_segments: List[Dict[str, Any]] = []
+
+    for profile in profile_values:
+        track_id = int(profile["id"])
+        frames_seen = int(profile.get("frames_seen", 0))
+        role_counts = Counter(profile.get("role_counts", Counter()))
+        team_counts = Counter(profile.get("team_counts", Counter()))
+        raw_track_counts = Counter(profile.get("raw_track_counts", Counter()))
+        object_type_counts = Counter(profile.get("object_type_counts", Counter()))
+        dominant_role, role_confidence = _dominant_count_value(role_counts, "player")
+        segments = [
+            _compact_role_segment(segment)
+            for segment in profile.get("role_segments", [])
+        ]
+        role_transitions = sum(
+            1
+            for previous, current in zip(segments, segments[1:])
+            if previous["role"] != current["role"]
+        )
+        goalkeeper_like_segments = [
+            segment for segment in segments if segment["role"] == "goalkeeper" or segment["team"] == 0
+        ]
+        goalkeeper_frame_count = sum(int(segment["frames_seen"]) for segment in goalkeeper_like_segments)
+
+        for segment in goalkeeper_like_segments:
+            goalkeeper_segments.append({"track_id": track_id, **segment})
+
+        if (
+            role_transitions > 0
+            or (str(dominant_role) != "goalkeeper" and goalkeeper_frame_count >= 3)
+            or (frames_seen >= 20 and float(role_confidence) < 0.85)
+        ):
+            role_flicker_tracklets.append(
+                {
+                    "id": track_id,
+                    "dominant_role": str(dominant_role),
+                    "role_confidence": float(role_confidence),
+                    "frames_seen": frames_seen,
+                    "first_source_frame_idx": int(profile.get("first_source_frame_idx", 0)),
+                    "last_source_frame_idx": int(profile.get("last_source_frame_idx", 0)),
+                    "role_transition_count": int(role_transitions),
+                    "goalkeeper_frame_count": int(goalkeeper_frame_count),
+                    "role_counts": dict(role_counts),
+                    "team_counts": dict(team_counts),
+                    "object_type_counts": dict(object_type_counts),
+                    "raw_track_counts": dict(raw_track_counts.most_common(8)),
+                    "goalkeeper_segments": goalkeeper_like_segments[:12],
+                    "segments_truncated": len(goalkeeper_like_segments) > 12,
+                }
+            )
+
+    goalkeeper_segments = sorted(
+        goalkeeper_segments,
+        key=lambda item: (
+            int(item.get("first_source_frame_idx", 0)),
+            int(item.get("track_id", 0)),
+        ),
+    )
+    substantial_goalkeeper_ids = {
+        int(segment["track_id"])
+        for segment in goalkeeper_segments
+        if int(segment.get("frames_seen", 0)) >= 3
+    }
+    goalkeeper_id_switch_count = sum(
+        1
+        for previous, current in zip(goalkeeper_segments, goalkeeper_segments[1:])
+        if int(previous["track_id"]) != int(current["track_id"])
+    )
+
+    return {
+        "role_flicker_tracklet_count": len(role_flicker_tracklets),
+        "goalkeeper_segment_count": len(goalkeeper_segments),
+        "goalkeeper_display_id_count": len({int(segment["track_id"]) for segment in goalkeeper_segments}),
+        "substantial_goalkeeper_display_id_count": len(substantial_goalkeeper_ids),
+        "goalkeeper_id_switch_count": int(goalkeeper_id_switch_count),
+        "role_flicker_tracklets": role_flicker_tracklets,
+        "goalkeeper_timeline": goalkeeper_segments[:80],
+        "goalkeeper_timeline_truncated": len(goalkeeper_segments) > 80,
+    }
+
+
 def _build_identity_debug_report(
     *,
     profiles: Dict[int, Dict[str, Any]],
@@ -757,6 +971,7 @@ def _build_identity_debug_report(
     reject_reason_counts: Counter = Counter()
     profiles_with_reid = sum(1 for profile in profile_values if int(profile.get("reid_count", 0)) > 0)
     profiles_with_color = sum(1 for profile in profile_values if int(profile.get("color_count", 0)) > 0)
+    role_stability = _build_role_stability_diagnostics(profile_values)
 
     for old_profile in profile_values:
         for new_profile in profile_values:
@@ -798,6 +1013,30 @@ def _build_identity_debug_report(
                 ),
             }
         )
+    if role_stability["role_flicker_tracklet_count"] > 0:
+        warnings.append(
+            {
+                "code": "role_flicker_detected",
+                "message": (
+                    "Some display IDs switch roles over time. Review "
+                    "role_stability.role_flicker_tracklets before trusting "
+                    "the annotated colors."
+                ),
+                "tracklet_count": role_stability["role_flicker_tracklet_count"],
+            }
+        )
+    if role_stability["substantial_goalkeeper_display_id_count"] > 1:
+        warnings.append(
+            {
+                "code": "goalkeeper_identity_fragmentation",
+                "message": (
+                    "Goalkeeper-like segments appear under multiple display IDs. "
+                    "Review role_stability.goalkeeper_timeline before accepting "
+                    "goalkeeper ID consistency."
+                ),
+                "display_id_count": role_stability["substantial_goalkeeper_display_id_count"],
+            }
+        )
 
     return {
         "summary": {
@@ -817,6 +1056,7 @@ def _build_identity_debug_report(
         "candidate_links": sorted(candidate_links, key=lambda item: float(item.get("score", 999.0))),
         "reject_reason_counts": dict(reject_reason_counts),
         "warnings": warnings,
+        "role_stability": role_stability,
         "rejected_examples": rejected_examples,
         "tracklet_profiles": [_identity_profile_summary(profile) for profile in profile_values],
     }
@@ -978,6 +1218,7 @@ def run_batch_analysis(
     team_assigner = TeamAssigner()
     ball_assigner = BallAssigner()
     view_transformer = ViewTransformer()
+    goalkeeper_display_lock = _GoalkeeperDisplayLock()
 
     props = get_video_properties(video_path)
     resolved_output_fps = _resolve_output_fps(props, output_fps, float(analysis_fps))
@@ -1056,6 +1297,7 @@ def run_batch_analysis(
             player_track = batch_tracks["players"][local_idx]
             referee_track = batch_tracks["referees"][local_idx]
             ball_track = batch_tracks["ball"][local_idx]
+            goalkeeper_display_lock.apply(player_track)
 
             max_players_in_frame = max(max_players_in_frame, len(player_track))
             player_frame_detections += len(player_track)
@@ -1089,6 +1331,12 @@ def run_batch_analysis(
                     sample_number=int(processed_frames + 1),
                     source_frame_idx=int(source_frame_idx),
                     bbox=track["bbox"],
+                    raw_track_id=(
+                        int(track["raw_track_id"])
+                        if track.get("raw_track_id") is not None
+                        else None
+                    ),
+                    object_type="player",
                     reid_embedding=reid_embedding,
                     color_signature=_extract_color_signature(frame, track["bbox"]),
                 )
@@ -1104,6 +1352,12 @@ def run_batch_analysis(
                     sample_number=int(processed_frames + 1),
                     source_frame_idx=int(source_frame_idx),
                     bbox=referee["bbox"],
+                    raw_track_id=(
+                        int(referee["raw_track_id"])
+                        if referee.get("raw_track_id") is not None
+                        else None
+                    ),
+                    object_type="referee",
                     reid_embedding=reid_embedding,
                     color_signature=_extract_color_signature(frame, referee["bbox"]),
                 )
@@ -1254,6 +1508,7 @@ def run_batch_analysis(
             "auto_links": auto_identity_links,
             "track_spans": identity_track_spans,
             "merge_conflicts": identity_merge_conflicts,
+            "goalkeeper_display_lock": goalkeeper_display_lock.summary(),
         },
         "confidence": {
             "field_calibration": field_calibration_confidence,

@@ -6,6 +6,7 @@ from src.processing.batch_analyzer import (
     _apply_identity_merge_map,
     _build_identity_debug_report,
     _build_auto_identity_merge_map,
+    _GoalkeeperDisplayLock,
     _rebuild_player_outputs,
 )
 
@@ -152,3 +153,100 @@ def test_identity_debug_report_explains_candidate_and_rejected_links():
     assert report["summary"]["accepted_auto_link_count"] == 1
     assert report["candidate_links"][0]["source_id"] == 430
     assert "reid_distance_above_threshold" in report["reject_reason_counts"]
+
+
+def test_identity_debug_report_flags_goalkeeper_role_flicker():
+    embedding = np.zeros(8, dtype=float)
+    embedding[2] = 1.0
+
+    profile = _profile(14, 0, 120, embedding)
+    profile["frames_seen"] = 12
+    profile["role_counts"] = Counter({"player": 8, "goalkeeper": 4})
+    profile["team_counts"] = Counter({1: 8})
+    profile["raw_track_counts"] = Counter({35: 12})
+    profile["object_type_counts"] = Counter({"player": 12})
+    profile["role_segments"] = [
+        {
+            "role": "player",
+            "team": 1,
+            "raw_track_id": 35,
+            "object_type": "player",
+            "first_sample": 1,
+            "last_sample": 4,
+            "first_source_frame_idx": 0,
+            "last_source_frame_idx": 30,
+            "frames_seen": 4,
+        },
+        {
+            "role": "goalkeeper",
+            "team": 0,
+            "raw_track_id": 35,
+            "object_type": "player",
+            "first_sample": 5,
+            "last_sample": 6,
+            "first_source_frame_idx": 40,
+            "last_source_frame_idx": 50,
+            "frames_seen": 2,
+        },
+        {
+            "role": "player",
+            "team": 1,
+            "raw_track_id": 35,
+            "object_type": "player",
+            "first_sample": 7,
+            "last_sample": 10,
+            "first_source_frame_idx": 60,
+            "last_source_frame_idx": 90,
+            "frames_seen": 4,
+        },
+        {
+            "role": "goalkeeper",
+            "team": 0,
+            "raw_track_id": 35,
+            "object_type": "player",
+            "first_sample": 11,
+            "last_sample": 12,
+            "first_source_frame_idx": 110,
+            "last_source_frame_idx": 120,
+            "frames_seen": 2,
+        },
+    ]
+
+    report = _build_identity_debug_report(
+        profiles={14: profile},
+        manual_merge_map={},
+        auto_merge_map={},
+        auto_links=[],
+    )
+
+    warning_codes = {warning["code"] for warning in report["warnings"]}
+    assert "role_flicker_detected" in warning_codes
+    assert report["role_stability"]["role_flicker_tracklet_count"] == 1
+    flicker = report["role_stability"]["role_flicker_tracklets"][0]
+    assert flicker["id"] == 14
+    assert flicker["goalkeeper_frame_count"] == 4
+    assert flicker["role_transition_count"] == 3
+
+
+def test_goalkeeper_display_lock_suppresses_prelock_flicker_then_labels_gk():
+    lock = _GoalkeeperDisplayLock(min_evidence_frames=3)
+    frames = [
+        {14: {"role": "goalkeeper", "raw_track_id": 35}},
+        {14: {"role": "goalkeeper", "raw_track_id": 35}},
+        {29: {"role": "goalkeeper", "raw_track_id": 35}},
+        {31: {"role": "goalkeeper", "raw_track_id": 129}},
+    ]
+
+    lock.apply(frames[0])
+    lock.apply(frames[1])
+    assert frames[0][14]["role"] == "player"
+    assert frames[1][14]["role"] == "player"
+    assert frames[0][14]["role_display_suppressed"] is True
+
+    lock.apply(frames[2])
+    lock.apply(frames[3])
+
+    assert frames[2][29]["display_label"] == "GK"
+    assert frames[2][29]["goalkeeper_display_locked"] is True
+    assert frames[3][31]["display_label"] == "GK"
+    assert lock.summary()["locked"] is True
