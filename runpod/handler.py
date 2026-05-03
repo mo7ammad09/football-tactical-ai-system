@@ -143,6 +143,20 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             "report_csv": ("text/csv", "report_csv_url"),
             "raw_tracklets_jsonl": ("application/x-ndjson", "raw_tracklets_jsonl_url"),
             "identity_debug_json": ("application/json", "identity_debug_json_url"),
+            "identity_events_json": ("application/json", "identity_events_json_url"),
+            "render_audit_before_json": ("application/json", "render_audit_before_json_url"),
+            "render_audit_after_json": ("application/json", "render_audit_after_json_url"),
+            "correction_candidates_json": ("application/json", "correction_candidates_json_url"),
+            "correction_plan_json": ("application/json", "correction_plan_json_url"),
+            "correction_applied_json": ("application/json", "correction_applied_json_url"),
+            "vision_review_queue_json": ("application/json", "vision_review_queue_json_url"),
+            "vision_review_results_json": ("application/json", "vision_review_results_json_url"),
+            "final_render_identity_manifest_json": (
+                "application/json",
+                "final_render_identity_manifest_json_url",
+            ),
+            "player_crop_index_json": ("application/json", "player_crop_index_json_url"),
+            "vision_contact_sheets_zip": ("application/zip", "vision_contact_sheets_zip_url"),
         }
         artifacts = {}
         for artifact_name, (content_type, url_key) in artifact_specs.items():

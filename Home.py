@@ -35,6 +35,7 @@ from src.visualizations.tactical_board import TacticalBoard
 from src.utils.video_utils import read_video, read_video_sampled, save_video, get_video_properties
 from src.api.runpod_serverless_client import RunPodServerlessClient
 from src.api.server_client import ServerClient
+from src.identity.reporting import build_identity_artifact_links, summarize_pre_render_identity
 
 
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
@@ -1334,6 +1335,67 @@ if st.session_state.analysis_done and st.session_state.analysis_results:
     if warnings:
         st.warning("\n".join(f"- {warning}" for warning in warnings))
 
+    identity_summary = summarize_pre_render_identity(results)
+    if identity_summary["release_status"] != "unknown" or identity_summary["artifact_links"]:
+        st.markdown("### 🧩 " + ("حالة الهوية قبل الرندر" if lang == "ar" else "Pre-render Identity Status"))
+        status_message = {
+            "success": (
+                "✅ الهوية موثوقة بعد التدقيق النهائي."
+                if lang == "ar"
+                else "✅ Identity is trusted after final audit."
+            ),
+            "warning": (
+                "⚠️ الفيديو خرج، لكن الهوية تحتاج مراجعة قبل اعتبارها نهائية."
+                if lang == "ar"
+                else "⚠️ Video was produced, but identity needs review before it is treated as final."
+            ),
+            "error": (
+                "❌ الرندر أو هوية الرندر غير صالحة للمخرجات النهائية."
+                if lang == "ar"
+                else "❌ Render or render identity is not valid for final output."
+            ),
+            "info": (
+                "ℹ️ حالة الهوية النهائية غير متاحة في هذا التقرير."
+                if lang == "ar"
+                else "ℹ️ Final identity status is not available in this report."
+            ),
+        }[identity_summary["severity"]]
+        if identity_summary["severity"] == "success":
+            st.success(status_message)
+        elif identity_summary["severity"] == "warning":
+            st.warning(status_message)
+        elif identity_summary["severity"] == "error":
+            st.error(status_message)
+        else:
+            st.info(status_message)
+
+        id_cols = st.columns(4)
+        id_cols[0].metric(
+            "الحالة" if lang == "ar" else "Status",
+            identity_summary["release_status"],
+        )
+        id_cols[1].metric(
+            "Audit" if lang == "ar" else "Audit",
+            identity_summary["audit_verdict"],
+        )
+        id_cols[2].metric(
+            "حالات معلقة" if lang == "ar" else "Unresolved",
+            identity_summary["unresolved_case_count"],
+        )
+        id_cols[3].metric(
+            "تصحيح آمن" if lang == "ar" else "Safe Fix",
+            "نعم" if (lang == "ar" and identity_summary["correction_applied"]) else
+            "لا" if lang == "ar" else
+            "Yes" if identity_summary["correction_applied"] else "No",
+        )
+
+        artifact_links = identity_summary["artifact_links"]
+        if artifact_links:
+            with st.expander("ملفات مراجعة الهوية" if lang == "ar" else "Identity review artifacts"):
+                columns = st.columns(3)
+                for idx, link in enumerate(artifact_links):
+                    columns[idx % 3].markdown(f"[{link['label']}]({link['url']})")
+
     if output_video:
         st.subheader("🎬 " + ("الفيديو الناتج" if lang == "ar" else "Output Video"))
         st.video(output_video)
@@ -1355,9 +1417,10 @@ if st.session_state.analysis_done and st.session_state.analysis_results:
     report_csv_url = results.get("report_csv_url")
     raw_tracklets_jsonl_url = results.get("raw_tracklets_jsonl_url")
     identity_debug_json_url = results.get("identity_debug_json_url")
-    if report_json_url or report_csv_url or raw_tracklets_jsonl_url or identity_debug_json_url:
+    identity_artifact_links = build_identity_artifact_links(results)
+    if report_json_url or report_csv_url or raw_tracklets_jsonl_url or identity_debug_json_url or identity_artifact_links:
         st.markdown("### 📄 " + ("التقارير" if lang == "ar" else "Reports"))
-        cols = st.columns(4)
+        cols = st.columns(5)
         if report_json_url:
             cols[0].markdown(f"[JSON report]({report_json_url})")
         if report_csv_url:
@@ -1366,6 +1429,16 @@ if st.session_state.analysis_done and st.session_state.analysis_results:
             cols[2].markdown(f"[Raw tracklets]({raw_tracklets_jsonl_url})")
         if identity_debug_json_url:
             cols[3].markdown(f"[Identity debug]({identity_debug_json_url})")
+        manifest_link = next(
+            (
+                link
+                for link in identity_artifact_links
+                if link["key"] == "final_render_identity_manifest_json_url"
+            ),
+            None,
+        )
+        if manifest_link:
+            cols[4].markdown(f"[Final identity manifest]({manifest_link['url']})")
     
     # Tabs
     tab_labels = ["📊 إحصائيات", "🎯 لوحة تكتيكية", "👥 لاعبين", "🤖 تحليل AI"] if lang == "ar" else ["📊 Stats", "🎯 Tactical", "👥 Players", "🤖 AI"]
