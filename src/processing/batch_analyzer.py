@@ -553,6 +553,26 @@ class _GoalkeeperDisplayLock:
         )
 
     @staticmethod
+    def _current_goalkeeper_score(track: Dict[str, Any]) -> float:
+        """Score one frame's evidence for choosing the visible GK."""
+        score = float(track.get("confidence") or 0.0)
+        role = str(track.get("role", "player"))
+        detected_role = str(track.get("detected_role", role))
+        team = int(track.get("team", 0) or 0)
+
+        if role == "goalkeeper":
+            score += 3.0
+        if detected_role == "goalkeeper":
+            score += 2.0
+        if team == 0:
+            score += 1.0
+        if role == "player" and team not in {0, None}:
+            score -= 2.0
+        if _GoalkeeperDisplayLock._is_referee_like(track):
+            score -= 10.0
+        return score
+
+    @staticmethod
     def _bbox_distance(a: Any, b: Any) -> float:
         """Return normalized center distance between two boxes."""
         a_bbox = _as_bbox_array(a)
@@ -582,6 +602,16 @@ class _GoalkeeperDisplayLock:
             track["role"] = "player"
             track["team"] = 0
             track["team_color"] = (128, 128, 128)
+        self.suppressed_frames += 1
+
+    def _suppress_duplicate_display(self, track_id: int, track: Dict[str, Any]) -> None:
+        """Remove client-facing GK display from duplicate/weak same-frame rows."""
+        track["display_label"] = str(track_id)
+        track["display_role"] = "player"
+        track["display_team"] = int(track.get("team", 0) or 0)
+        track["display_color"] = None
+        track["goalkeeper_display_locked"] = False
+        track["role_display_suppressed"] = True
         self.suppressed_frames += 1
 
     def _apply_locked_display(
@@ -635,7 +665,11 @@ class _GoalkeeperDisplayLock:
         for track_id, track in player_track.items():
             key = self._candidate_key(int(track_id), track)
             if key in self._locked_keys:
-                locked_items.append((int(track_id), track, key))
+                if self._is_goalkeeper_evidence(track) or self._is_recent_spatial_follow(
+                    track,
+                    source_frame_idx,
+                ):
+                    locked_items.append((int(track_id), track, key))
                 continue
             if (
                 self._is_goalkeeper_evidence(track)
@@ -653,6 +687,17 @@ class _GoalkeeperDisplayLock:
         for _, track, key in goalkeeper_items:
             if key not in locked_keys_this_frame:
                 self._suppress_prelock(track)
+
+        if len(locked_items) > 1:
+            same_frame_locked_items = locked_items
+            selected = max(
+                same_frame_locked_items,
+                key=lambda item: self._current_goalkeeper_score(item[1]),
+            )
+            locked_items = [selected]
+            for track_id, track, key in same_frame_locked_items:
+                if track is not selected[1]:
+                    self._suppress_duplicate_display(track_id, track)
 
         for track_id, track, key in locked_items:
             self._apply_locked_display(track_id, track, key, source_frame_idx)

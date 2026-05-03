@@ -255,3 +255,94 @@ def test_goalkeeper_display_lock_suppresses_prelock_flicker_then_labels_gk():
     assert frames[4][14]["display_role"] == "goalkeeper"
     assert frames[4][14]["display_label"] == "GK"
     assert lock.summary()["locked"] is True
+
+
+def test_goalkeeper_display_lock_shows_only_one_gk_per_frame():
+    lock = _GoalkeeperDisplayLock(min_evidence_frames=1)
+    frame = {
+        21: {
+            "role": "player",
+            "detected_role": "goalkeeper",
+            "team": 1,
+            "raw_track_id": 110,
+            "confidence": 0.335,
+            "bbox": [1613.5, 568.0, 1651.9, 637.5],
+        },
+        29: {
+            "role": "goalkeeper",
+            "detected_role": "goalkeeper",
+            "team": 0,
+            "raw_track_id": 114,
+            "confidence": 0.619,
+            "bbox": [1615.7, 508.5, 1651.9, 574.9],
+        },
+    }
+
+    lock.apply(frame, source_frame_idx=485)
+
+    assert frame[29]["display_label"] == "GK"
+    assert frame[29]["goalkeeper_display_locked"] is True
+    assert frame[21]["display_label"] == "21"
+    assert frame[21]["display_role"] == "player"
+    assert frame[21]["goalkeeper_display_locked"] is False
+    assert frame[21]["role_display_suppressed"] is True
+
+
+def test_goalkeeper_display_lock_suppresses_duplicate_same_raw_key():
+    lock = _GoalkeeperDisplayLock(min_evidence_frames=1)
+    frame = {
+        29: {
+            "role": "goalkeeper",
+            "detected_role": "goalkeeper",
+            "team": 0,
+            "raw_track_id": 130,
+            "confidence": 0.92,
+            "bbox": [100, 100, 130, 170],
+        },
+        31: {
+            "role": "goalkeeper",
+            "detected_role": "goalkeeper",
+            "team": 0,
+            "raw_track_id": 130,
+            "confidence": 0.48,
+            "bbox": [101, 101, 131, 171],
+        },
+    }
+
+    lock.apply(frame, source_frame_idx=743)
+
+    assert frame[29]["display_label"] == "GK"
+    assert frame[31]["display_label"] == "31"
+    assert frame[31]["display_role"] == "player"
+    assert frame[31]["goalkeeper_display_locked"] is False
+
+
+def test_goalkeeper_display_lock_does_not_follow_stale_reused_track_key():
+    lock = _GoalkeeperDisplayLock(min_evidence_frames=1, max_follow_gap_frames=10)
+    first_frame = {
+        29: {
+            "role": "goalkeeper",
+            "detected_role": "goalkeeper",
+            "team": 0,
+            "raw_track_id": 130,
+            "confidence": 0.9,
+            "bbox": [0, 0, 10, 20],
+        }
+    }
+    reused_later = {
+        29: {
+            "role": "player",
+            "detected_role": "player",
+            "team": 1,
+            "raw_track_id": 130,
+            "confidence": 0.9,
+            "bbox": [1000, 0, 1010, 20],
+        }
+    }
+
+    lock.apply(first_frame, source_frame_idx=1)
+    lock.apply(reused_later, source_frame_idx=100)
+
+    assert first_frame[29]["display_label"] == "GK"
+    assert reused_later[29].get("display_label") is None
+    assert reused_later[29].get("goalkeeper_display_locked") is None
