@@ -124,6 +124,35 @@ def test_render_audit_passes_single_goalkeeper_display_on_goalkeeper_track():
     assert audit["issues"] == []
 
 
+def test_render_audit_downgrades_raw_role_flicker_when_display_is_clean():
+    rows = [
+        _row(
+            29,
+            130,
+            1,
+            10,
+            "goalkeeper",
+            0,
+            display_label="GK",
+            display_role="goalkeeper",
+            display_team=0,
+            display_color=[255, 0, 255],
+        )
+    ]
+    identity_debug = {
+        "role_stability": {
+            "role_flicker_tracklet_count": 2,
+        }
+    }
+
+    audit = build_render_identity_audit(rows, identity_debug)
+
+    assert audit["verdict"] == "PASS"
+    assert audit["issues"][0]["issue_type"] == "identity_debug_role_flicker"
+    assert audit["issues"][0]["severity"] == "medium"
+    assert audit["issues"][0]["advisory"] is True
+
+
 def test_pre_render_artifacts_create_events_and_dry_run_candidates():
     rows = []
     rows.extend(
@@ -324,6 +353,39 @@ def test_phase4_queues_goalkeeper_fragmentation_for_vision_not_auto_apply():
     assert queue["cases"][0]["question"] == "goalkeeper_identity_fragmentation"
     assert "player_crop_index.json" in queue["cases"][0]["required_artifacts"]
     assert "contact_sheets" in queue["cases"][0]["required_artifacts"]
+
+
+def test_phase4_skips_vision_case_when_source_issue_was_fixed():
+    plan = {
+        "needs_vision": [
+            {
+                "case_id": "candidate_unsafe_gk_display_spread",
+                "source_issue_id": "unsafe_gk_display_spread",
+                "question": "resolve_identity_or_goalkeeper_display_conflict",
+                "reason": "Fixed by deterministic display override.",
+            }
+        ]
+    }
+    before_audit = {
+        "issues": [
+            {
+                "issue_id": "unsafe_gk_display_spread",
+                "issue_type": "unsafe_gk_display_spread",
+                "severity": "critical",
+            }
+        ]
+    }
+    after_audit = {"issues": []}
+
+    queue = build_vision_review_queue(
+        correction_plan=plan,
+        render_audit_before=before_audit,
+        render_audit_after=after_audit,
+        correction_applied={"correction_applied": True},
+    )
+
+    assert queue["case_count"] == 0
+    assert queue["cases"] == []
 
 
 def test_phase5_crop_index_plan_targets_queued_goalkeeper_segments():

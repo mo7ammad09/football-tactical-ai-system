@@ -398,16 +398,36 @@ def build_render_identity_audit(
             )
         )
 
+    visible_risk_issue_types = {
+        "gk_false_positive_segment",
+        "unsafe_gk_display_spread",
+        "simultaneous_goalkeeper_display",
+    }
+    has_visible_identity_risk = any(
+        str(issue.get("issue_type")) in visible_risk_issue_types
+        for issue in issues
+    )
+
     role_stability = identity_debug.get("role_stability") or {}
     if int(role_stability.get("role_flicker_tracklet_count", 0) or 0) > 0:
+        severity = "high" if has_visible_identity_risk else "medium"
+        reason = (
+            "Role flicker must be resolved or downgraded before trusting rendered colors."
+            if has_visible_identity_risk
+            else (
+                "Raw identity debug still reports role flicker, but the client-facing "
+                "goalkeeper display has no remaining high-risk spread or false-positive issue."
+            )
+        )
         issues.append(
             _issue(
                 issue_id="identity_debug_role_flicker",
                 issue_type="identity_debug_role_flicker",
-                severity="high",
+                severity=severity,
                 title="Identity debug reports role flicker",
-                reason="Role flicker must be resolved or downgraded before trusting rendered colors.",
+                reason=reason,
                 tracklet_count=int(role_stability.get("role_flicker_tracklet_count", 0) or 0),
+                advisory=not has_visible_identity_risk,
             )
         )
 
@@ -915,6 +935,8 @@ def build_vision_review_queue(
 
     for item in correction_plan.get("needs_vision", []):
         source_issue_id = str(item.get("source_issue_id") or "")
+        if source_issue_id and source_issue_id not in unresolved_issue_ids:
+            continue
         priority = "high" if source_issue_id in unresolved_issue_ids else "medium"
         question = str(item.get("question") or "identity_review")
         required_artifacts = list(item.get("required_artifacts") or [])
