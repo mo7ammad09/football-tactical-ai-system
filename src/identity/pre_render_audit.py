@@ -866,7 +866,7 @@ def apply_safe_correction_plan_to_raw_records(
             row["display_role"] = str(action.get("set_display_role", "player"))
             row["display_label"] = str(action.get("set_display_label", row.get("track_id")))
             row["display_team"] = row.get("team")
-            row["display_color"] = None
+            row["display_color"] = row.get("team_color")
             row["goalkeeper_display_locked"] = False
             row["role_display_suppressed"] = False
             action_update_count += 1

@@ -19,6 +19,7 @@ import supervision as sv
 import yaml
 
 from src.field_filter import FieldFilter
+from src.utils.annotation_colors import resolve_player_annotation_color
 from src.utils.bbox_utils import get_center_of_bbox, get_foot_position, get_bbox_width
 
 
@@ -1209,16 +1210,7 @@ class Tracker:
 
             # Draw Players
             for track_id, player in player_dict.items():
-                display_role = str(player.get("display_role") or player.get("role") or "player")
-                fallback_color = (
-                    (255, 0, 255)
-                    if display_role == "goalkeeper"
-                    else (0, 0, 255)
-                )
-                color = player.get(
-                    "display_color",
-                    player.get("team_color", fallback_color),
-                )
+                color = resolve_player_annotation_color(player)
                 frame = self.draw_ellipse(
                     frame,
                     player["bbox"],

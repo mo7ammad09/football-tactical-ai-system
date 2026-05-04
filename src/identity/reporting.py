@@ -18,6 +18,7 @@ IDENTITY_ARTIFACTS: tuple[tuple[str, str], ...] = (
     ("player_crop_index_json_url", "Player crop index"),
     ("vision_review_results_json_url", "Vision review results"),
     ("final_render_identity_manifest_json_url", "Final identity manifest"),
+    ("identity_review_decisions_json_url", "Identity review decisions"),
     ("vision_contact_sheets_zip_url", "Vision contact sheets"),
 )
 

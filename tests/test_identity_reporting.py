@@ -36,12 +36,15 @@ def test_identity_summary_reports_review_required_and_links_manifest():
 def test_identity_artifact_links_read_runpod_artifact_metadata():
     results = {
         "artifacts": {
-            "final_render_identity_manifest_json": {
-                "public_url": "https://cdn.example/manifest.json"
-            },
-            "vision_contact_sheets_zip": {
-                "public_url": "https://cdn.example/sheets.zip"
-            },
+        "final_render_identity_manifest_json": {
+            "public_url": "https://cdn.example/manifest.json"
+        },
+        "identity_review_decisions_json": {
+            "public_url": "https://cdn.example/review.json"
+        },
+        "vision_contact_sheets_zip": {
+            "public_url": "https://cdn.example/sheets.zip"
+        },
         }
     }
 
@@ -49,5 +52,6 @@ def test_identity_artifact_links_read_runpod_artifact_metadata():
 
     assert [link["key"] for link in links] == [
         "final_render_identity_manifest_json_url",
+        "identity_review_decisions_json_url",
         "vision_contact_sheets_zip_url",
     ]

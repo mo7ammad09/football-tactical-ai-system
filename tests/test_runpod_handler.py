@@ -135,3 +135,6 @@ def test_runpod_handler_uploads_all_identity_artifacts_when_present(monkeypatch,
     assert result["vision_review_results_json_url"].endswith(
         "/vision_review_results_json.json"
     )
+    assert result["identity_review_decisions_json_url"].endswith(
+        "/identity_review_decisions_json.json"
+    )

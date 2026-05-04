@@ -28,8 +28,10 @@ from src.identity.pre_render_audit import (
     build_vision_review_queue,
     post_fix_audit_improved,
 )
+from src.identity.review_engine import build_identity_review_decisions
 from src.team_assigner.team_assigner import TeamAssigner
 from src.trackers.tracker import Tracker
+from src.utils.annotation_colors import resolve_player_annotation_color
 from src.utils.video_utils import get_video_properties, iter_video_frames_sampled_with_indices
 from src.view_transformer.view_transformer import ViewTransformer
 
@@ -73,16 +75,7 @@ def _draw_review_frame(
     out = frame.copy()
 
     for track_id, player in player_track.items():
-        display_role = str(player.get("display_role") or player.get("role") or "player")
-        fallback_color = (
-            (255, 0, 255)
-            if display_role == "goalkeeper"
-            else (0, 0, 255)
-        )
-        color = _normalize_color(
-            player.get("display_color", player.get("team_color")),
-            fallback_color,
-        )
+        color = resolve_player_annotation_color(player)
         out = tracker.draw_ellipse(
             out,
             player["bbox"],
@@ -187,6 +180,7 @@ def _write_identity_artifacts(
     vision_review_queue: Dict[str, Any],
     vision_review_results: Dict[str, Any],
     final_render_identity_manifest: Dict[str, Any],
+    identity_review_decisions: Dict[str, Any],
     output_dir: Path,
 ) -> Dict[str, Path]:
     """Write identity debugging artifacts for offline review."""
@@ -203,6 +197,7 @@ def _write_identity_artifacts(
     vision_review_queue_path = identity_dir / f"{job_id}_vision_review_queue.json"
     vision_review_results_path = identity_dir / f"{job_id}_vision_review_results.json"
     final_render_identity_manifest_path = identity_dir / f"{job_id}_final_render_identity_manifest.json"
+    identity_review_decisions_path = identity_dir / f"{job_id}_identity_review_decisions.json"
 
     _write_jsonl(raw_tracklets_path, raw_tracklet_records)
     identity_debug_path.write_text(
@@ -245,6 +240,10 @@ def _write_identity_artifacts(
         json.dumps(_json_safe(final_render_identity_manifest), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    identity_review_decisions_path.write_text(
+        json.dumps(_json_safe(identity_review_decisions), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     return {
         "raw_tracklets_jsonl": raw_tracklets_path,
@@ -258,6 +257,7 @@ def _write_identity_artifacts(
         "vision_review_queue_json": vision_review_queue_path,
         "vision_review_results_json": vision_review_results_path,
         "final_render_identity_manifest_json": final_render_identity_manifest_path,
+        "identity_review_decisions_json": identity_review_decisions_path,
     }
 
 
@@ -491,6 +491,16 @@ def _append_raw_tracklet_records(
                 "display_color": (
                     list(_normalize_color(track["display_color"]))
                     if track.get("display_color") is not None
+                    else None
+                ),
+                "team_color": (
+                    list(_normalize_color(track["team_color"]))
+                    if track.get("team_color") is not None
+                    else None
+                ),
+                "render_color": (
+                    list(resolve_player_annotation_color(track))
+                    if object_type == "player"
                     else None
                 ),
                 "goalkeeper_display_locked": bool(track.get("goalkeeper_display_locked", False)),
@@ -2046,6 +2056,15 @@ def run_batch_analysis(
         rendered_output_frames=rendered_frames,
         baseline_image=RUNPOD_BASELINE_IMAGE,
     )
+    identity_review_decisions = build_identity_review_decisions(
+        identity_debug=identity_debug,
+        render_audit_after=render_audit_after,
+        correction_applied=correction_applied,
+        vision_review_queue=vision_review_queue,
+        vision_review_results=vision_review_results,
+        final_render_identity_manifest=final_render_identity_manifest,
+        player_crop_index=player_crop_index,
+    )
 
     if team_assigner.kmeans is None:
         warnings.append("Team assignment was unavailable because not enough players were detected in any sampled frame.")
@@ -2146,6 +2165,10 @@ def run_batch_analysis(
             "vision_review_unresolved_count": vision_review_results.get("unresolved_count", 0),
             "vision_review_validation": vision_review_results.get("validation", {}),
             "vision_model_invoked": vision_review_results.get("vision_model_invoked", False),
+            "identity_review_engine_phase": identity_review_decisions.get("phase"),
+            "identity_review_recommendation": identity_review_decisions.get("recommendation"),
+            "identity_review_next_step": identity_review_decisions.get("next_step"),
+            "identity_review_summary": identity_review_decisions.get("summary", {}),
             "crop_evidence_prepared": bool(vision_evidence_paths.get("player_crop_index_json")),
         }
     )
@@ -2162,6 +2185,7 @@ def run_batch_analysis(
         vision_review_queue=vision_review_queue,
         vision_review_results=vision_review_results,
         final_render_identity_manifest=final_render_identity_manifest,
+        identity_review_decisions=identity_review_decisions,
         output_dir=output_root,
     )
     report_paths.update(identity_paths)
@@ -2180,6 +2204,7 @@ def run_batch_analysis(
         "vision_review_queue_json": {"local_path": str(report_paths["vision_review_queue_json"]), "content_type": "application/json"},
         "vision_review_results_json": {"local_path": str(report_paths["vision_review_results_json"]), "content_type": "application/json"},
         "final_render_identity_manifest_json": {"local_path": str(report_paths["final_render_identity_manifest_json"]), "content_type": "application/json"},
+        "identity_review_decisions_json": {"local_path": str(report_paths["identity_review_decisions_json"]), "content_type": "application/json"},
         "player_crop_index_json": {"local_path": str(report_paths["player_crop_index_json"]), "content_type": "application/json"},
         "vision_contact_sheets_zip": {"local_path": str(report_paths["vision_contact_sheets_zip"]), "content_type": "application/zip"},
     }

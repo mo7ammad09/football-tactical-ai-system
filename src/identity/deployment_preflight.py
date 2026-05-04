@@ -24,12 +24,14 @@ REQUIRED_RUNPOD_ARTIFACTS: tuple[str, ...] = (
     "player_crop_index_json",
     "vision_review_results_json",
     "final_render_identity_manifest_json",
+    "identity_review_decisions_json",
     "vision_contact_sheets_zip",
 )
 
 REQUIRED_SOURCE_FILES: tuple[str, ...] = (
     "src/identity/__init__.py",
     "src/identity/pre_render_audit.py",
+    "src/identity/review_engine.py",
     "src/identity/reporting.py",
     "src/identity/deployment_preflight.py",
     "src/processing/batch_analyzer.py",

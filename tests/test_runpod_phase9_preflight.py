@@ -26,6 +26,7 @@ def test_phase9_preflight_tracks_final_identity_manifest_artifact():
     result = run_phase9_preflight(repo_root)
 
     assert "final_render_identity_manifest_json" in result["required_artifacts"]
+    assert "identity_review_decisions_json" in result["required_artifacts"]
     assert "vision_review_results_json" in result["required_artifacts"]
     assert result["baseline_image"].endswith(":sha-bbe8dec")
     assert any(
