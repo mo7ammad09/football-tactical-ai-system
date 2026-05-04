@@ -33,6 +33,20 @@ def normalize_color(
         return fallback
 
 
+def is_goalkeeper_color(color: Any) -> bool:
+    """Return whether a color is the client-facing goalkeeper color."""
+    if color is None:
+        return False
+    try:
+        values = list(color)
+        if len(values) < 3:
+            return False
+        blue, green, red = (int(values[0]), int(values[1]), int(values[2]))
+    except Exception:
+        return False
+    return blue >= 220 and red >= 220 and green <= 80
+
+
 def resolve_player_annotation_color(player: dict[str, Any]) -> tuple[int, int, int]:
     """Return the client-facing player annotation color.
 
@@ -45,4 +59,6 @@ def resolve_player_annotation_color(player: dict[str, Any]) -> tuple[int, int, i
     color = player.get("display_color")
     if color is None:
         color = player.get("team_color")
+    if display_role != "goalkeeper" and is_goalkeeper_color(color):
+        return PLAYER_FALLBACK_COLOR
     return normalize_color(color, fallback)

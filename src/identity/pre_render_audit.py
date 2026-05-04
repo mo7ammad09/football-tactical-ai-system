@@ -19,6 +19,7 @@ KNOWN_BAD_RUNPOD_IMAGES = [
 ]
 
 GOALKEEPER_ROLE = "goalkeeper"
+PLAYER_FALLBACK_COLOR = [128, 128, 128]
 PERSON_OBJECT_TYPES = {"player", "referee", "goalkeeper"}
 VISION_REVIEW_VERDICTS = {
     "same_player",
@@ -115,13 +116,98 @@ def _visible_label(row: dict[str, Any]) -> str:
 
 def _is_magenta_display(row: dict[str, Any]) -> bool:
     """Return whether display_color looks like the current goalkeeper color."""
-    color = row.get("display_color")
+    return _is_goalkeeper_color(row.get("display_color"))
+
+
+def _is_goalkeeper_color(color: Any) -> bool:
+    """Return whether a color value looks like the client-facing goalkeeper color."""
     if not isinstance(color, (list, tuple)) or len(color) < 3:
         return False
     blue = _as_int(color[0])
     green = _as_int(color[1])
     red = _as_int(color[2])
     return blue >= 220 and red >= 220 and green <= 80
+
+
+def _safe_color_tuple(color: Any) -> tuple[int, int, int] | None:
+    """Return a non-GK BGR color tuple, or None when it is unsafe/missing."""
+    if not isinstance(color, (list, tuple)) or len(color) < 3:
+        return None
+    if _is_goalkeeper_color(color):
+        return None
+    try:
+        return tuple(int(max(0, min(255, value))) for value in list(color)[:3])
+    except Exception:
+        return None
+
+
+def _source_player_display_defaults(rows: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    """Build dominant non-GK display team/color defaults per source track."""
+    team_counts: dict[int, Counter] = defaultdict(Counter)
+    color_counts: dict[int, Counter] = defaultdict(Counter)
+    for row in _iter_person_rows(rows):
+        if _raw_role(row) == GOALKEEPER_ROLE or _detected_role(row) == GOALKEEPER_ROLE:
+            continue
+        source_id = _source_track_id(row)
+        if source_id < 0:
+            continue
+        team = _as_int(row.get("team"), 0)
+        if team > 0:
+            team_counts[source_id][team] += 1
+        color = _safe_color_tuple(row.get("team_color"))
+        if color is not None:
+            color_counts[source_id][color] += 1
+
+    defaults: dict[int, dict[str, Any]] = {}
+    for source_id in set(team_counts) | set(color_counts):
+        team, _ = _dominant(team_counts[source_id], fallback=None)
+        color, _ = _dominant(color_counts[source_id], fallback=None)
+        defaults[source_id] = {
+            "team": int(team) if team is not None else None,
+            "color": list(color) if color is not None else None,
+        }
+    return defaults
+
+
+def _display_override_team_color(
+    row: dict[str, Any],
+    defaults_by_source: dict[int, dict[str, Any]],
+) -> tuple[int | None, list[int]]:
+    """Choose the team/color to show after removing a false GK display."""
+    defaults = defaults_by_source.get(_source_track_id(row), {})
+    team = defaults.get("team")
+    color = defaults.get("color")
+    if color is None:
+        candidate = _safe_color_tuple(row.get("team_color"))
+        if candidate is not None:
+            color = list(candidate)
+            if team is None and _as_int(row.get("team"), 0) > 0:
+                team = _as_int(row.get("team"))
+    if color is None:
+        color = list(PLAYER_FALLBACK_COLOR)
+    return (int(team) if team is not None else None, color)
+
+
+def _sanitize_non_goalkeeper_display_colors(
+    rows: list[dict[str, Any]],
+    defaults_by_source: dict[int, dict[str, Any]],
+) -> int:
+    """Remove leaked GK magenta from rows rendered as non-goalkeepers."""
+    updated = 0
+    for row in _iter_person_rows(rows):
+        if _visible_role(row) == GOALKEEPER_ROLE or _visible_label(row).upper() == "GK":
+            continue
+        display_color = row.get("display_color")
+        team_color = row.get("team_color")
+        if not _is_goalkeeper_color(display_color) and not (
+            display_color is None and _is_goalkeeper_color(team_color)
+        ):
+            continue
+        display_team, safe_color = _display_override_team_color(row, defaults_by_source)
+        row["display_team"] = display_team
+        row["display_color"] = safe_color
+        updated += 1
+    return updated
 
 
 def _is_display_goalkeeper(row: dict[str, Any]) -> bool:
@@ -845,6 +931,7 @@ def apply_safe_correction_plan_to_raw_records(
             "correction_applied": False,
             "applied_action_count": 0,
             "updated_record_count": 0,
+            "sanitized_display_color_count": 0,
             "skipped_reason": "plan_validation_not_pass",
             "applied_actions": [],
         }
@@ -855,6 +942,7 @@ def apply_safe_correction_plan_to_raw_records(
     }
     applied_actions: list[dict[str, Any]] = []
     updated_record_count = 0
+    display_defaults = _source_player_display_defaults(corrected_rows)
     for action in correction_plan.get("actions", []):
         if not _safe_display_override_action(action, accepted_action_ids):
             continue
@@ -865,8 +953,9 @@ def apply_safe_correction_plan_to_raw_records(
                 continue
             row["display_role"] = str(action.get("set_display_role", "player"))
             row["display_label"] = str(action.get("set_display_label", row.get("track_id")))
-            row["display_team"] = row.get("team")
-            row["display_color"] = row.get("team_color")
+            display_team, display_color = _display_override_team_color(row, display_defaults)
+            row["display_team"] = display_team
+            row["display_color"] = display_color
             row["goalkeeper_display_locked"] = False
             row["role_display_suppressed"] = False
             action_update_count += 1
@@ -885,12 +974,17 @@ def apply_safe_correction_plan_to_raw_records(
                 }
             )
 
+    sanitized_display_color_count = _sanitize_non_goalkeeper_display_colors(
+        corrected_rows,
+        display_defaults,
+    )
     return corrected_rows, {
         "schema_version": "1.0",
         "phase": "phase_3_safe_apply",
         "correction_applied": bool(applied_actions),
         "applied_action_count": len(applied_actions),
         "updated_record_count": updated_record_count,
+        "sanitized_display_color_count": sanitized_display_color_count,
         "applied_actions": applied_actions,
     }
 

@@ -31,7 +31,12 @@ from src.identity.pre_render_audit import (
 from src.identity.review_engine import build_identity_review_decisions
 from src.team_assigner.team_assigner import TeamAssigner
 from src.trackers.tracker import Tracker
-from src.utils.annotation_colors import resolve_player_annotation_color
+from src.utils.annotation_colors import (
+    PLAYER_FALLBACK_COLOR,
+    is_goalkeeper_color,
+    normalize_color,
+    resolve_player_annotation_color,
+)
 from src.utils.video_utils import get_video_properties, iter_video_frames_sampled_with_indices
 from src.view_transformer.view_transformer import ViewTransformer
 
@@ -806,6 +811,97 @@ def _safe_plan_action_ids(correction_plan: Dict[str, Any]) -> set[str]:
     }
 
 
+def _dominant_player_display_defaults_from_states(
+    annotation_states: List[Dict[str, Any]],
+) -> Dict[int, Dict[str, Any]]:
+    """Return non-GK team/color defaults for each rendered track id."""
+    team_counts: Dict[int, Counter] = defaultdict(Counter)
+    color_counts: Dict[int, Counter] = defaultdict(Counter)
+    for state in annotation_states:
+        for track_id, track in state.get("players", {}).items():
+            try:
+                source_id = int(track_id)
+            except (TypeError, ValueError):
+                continue
+            role = str(track.get("role") or "")
+            detected_role = str(track.get("detected_role") or role)
+            if role == "goalkeeper" or detected_role == "goalkeeper":
+                continue
+            try:
+                team = int(track.get("team", 0) or 0)
+            except (TypeError, ValueError):
+                team = 0
+            if team > 0:
+                team_counts[source_id][team] += 1
+            color = track.get("team_color")
+            if color is None or is_goalkeeper_color(color):
+                continue
+            color_counts[source_id][normalize_color(color)] += 1
+
+    defaults: Dict[int, Dict[str, Any]] = {}
+    for source_id in set(team_counts) | set(color_counts):
+        team = team_counts[source_id].most_common(1)[0][0] if team_counts[source_id] else None
+        color = color_counts[source_id].most_common(1)[0][0] if color_counts[source_id] else None
+        defaults[source_id] = {
+            "team": int(team) if team is not None else None,
+            "color": tuple(color) if color is not None else None,
+        }
+    return defaults
+
+
+def _safe_player_display_team_color(
+    track_id: int,
+    track: Dict[str, Any],
+    defaults_by_track: Dict[int, Dict[str, Any]],
+) -> tuple[Optional[int], tuple[int, int, int]]:
+    """Choose a non-GK display team/color for a corrected player row."""
+    defaults = defaults_by_track.get(int(track_id), {})
+    team = defaults.get("team")
+    color = defaults.get("color")
+    if color is None:
+        candidate = track.get("team_color")
+        if candidate is not None and not is_goalkeeper_color(candidate):
+            color = normalize_color(candidate)
+            if team is None:
+                try:
+                    raw_team = int(track.get("team", 0) or 0)
+                except (TypeError, ValueError):
+                    raw_team = 0
+                team = raw_team if raw_team > 0 else None
+    if color is None:
+        color = PLAYER_FALLBACK_COLOR
+    return (int(team) if team is not None else None, tuple(color))
+
+
+def _sanitize_non_goalkeeper_display_colors_in_states(
+    annotation_states: List[Dict[str, Any]],
+    defaults_by_track: Dict[int, Dict[str, Any]],
+) -> int:
+    """Remove leaked GK magenta from annotations rendered as non-goalkeepers."""
+    updated = 0
+    for state in annotation_states:
+        for track_id, track in state.get("players", {}).items():
+            visible_role = str(track.get("display_role") or track.get("role") or "player")
+            visible_label = str(track.get("display_label") or track_id)
+            if visible_role == "goalkeeper" or visible_label.upper() == "GK":
+                continue
+            display_color = track.get("display_color")
+            team_color = track.get("team_color")
+            if not is_goalkeeper_color(display_color) and not (
+                display_color is None and is_goalkeeper_color(team_color)
+            ):
+                continue
+            display_team, display_color = _safe_player_display_team_color(
+                int(track_id),
+                track,
+                defaults_by_track,
+            )
+            track["display_team"] = display_team
+            track["display_color"] = display_color
+            updated += 1
+    return updated
+
+
 def _apply_safe_correction_plan_to_annotation_states(
     annotation_states: List[Dict[str, Any]],
     correction_plan: Dict[str, Any],
@@ -816,6 +912,7 @@ def _apply_safe_correction_plan_to_annotation_states(
         return 0
 
     updated_tracks = 0
+    display_defaults = _dominant_player_display_defaults_from_states(annotation_states)
     for action in correction_plan.get("actions", []):
         if str(action.get("action_id")) not in accepted_action_ids:
             continue
@@ -850,11 +947,20 @@ def _apply_safe_correction_plan_to_annotation_states(
                     continue
             track["display_role"] = str(action.get("set_display_role", "player"))
             track["display_label"] = str(action.get("set_display_label", target_track_id))
-            track["display_team"] = int(track.get("team", 0) or 0)
-            track["display_color"] = track.get("team_color")
+            display_team, display_color = _safe_player_display_team_color(
+                target_track_id,
+                track,
+                display_defaults,
+            )
+            track["display_team"] = display_team
+            track["display_color"] = display_color
             track["goalkeeper_display_locked"] = False
             track["role_display_suppressed"] = False
             updated_tracks += 1
+    updated_tracks += _sanitize_non_goalkeeper_display_colors_in_states(
+        annotation_states,
+        display_defaults,
+    )
     return updated_tracks
 
 

@@ -30,6 +30,7 @@ def _row(
     display_team=None,
     display_color=None,
 ):
+    team_color = [27, 35, 31] if team == 1 else [255, 0, 255] if team == 0 else None
     return {
         "sample_number": sample,
         "source_frame_idx": frame,
@@ -43,6 +44,7 @@ def _row(
         "display_role": display_role,
         "display_team": display_team,
         "display_color": display_color,
+        "team_color": team_color,
         "bbox": [0, 0, 10, 20],
         "reid_available": True,
         "reid_dim": 512,
@@ -259,9 +261,63 @@ def test_phase3_applies_safe_display_override_and_improves_post_fix_audit():
     assert applied["updated_record_count"] == 1
     assert corrected_rows[-1]["display_role"] == "player"
     assert corrected_rows[-1]["display_label"] == "14"
-    assert corrected_rows[-1]["display_color"] is None
+    assert corrected_rows[-1]["display_color"] == [27, 35, 31]
     assert after["summary"]["gk_false_positive_segment_count"] == 0
     assert post_fix_audit_improved(before, after) is True
+
+
+def test_phase3_restores_dominant_team_color_for_misclassified_gk_flash():
+    rows = [
+        _row(14, 14, 1, 93, "player", 1),
+        _row(14, 36, 2, 100, "player", 1),
+        _row(14, 36, 3, 103, "player", 1),
+        _row(14, 36, 4, 105, "player", 1),
+        _row(14, 36, 5, 108, "player", 1),
+        _row(
+            14,
+            138,
+            6,
+            705,
+            "goalkeeper",
+            0,
+            display_label="GK",
+            display_role="goalkeeper",
+            display_team=0,
+            display_color=[255, 0, 255],
+        ),
+        _row(
+            14,
+            138,
+            7,
+            708,
+            "goalkeeper",
+            0,
+            display_role="player",
+            display_color=None,
+        ),
+    ]
+
+    before = build_render_identity_audit(rows)
+    events = build_identity_events(rows, before)
+    candidates = build_correction_candidates(before, {"warnings": []})
+    plan = build_dry_run_correction_plan(
+        correction_candidates=candidates,
+        render_audit=before,
+        identity_events=events,
+    )
+
+    corrected_rows, applied = apply_safe_correction_plan_to_raw_records(rows, plan)
+    after = build_render_identity_audit(corrected_rows)
+
+    corrected_flash = corrected_rows[5]
+    suppressed_flash = corrected_rows[6]
+    assert corrected_flash["display_role"] == "player"
+    assert corrected_flash["display_label"] == "14"
+    assert corrected_flash["display_team"] == 1
+    assert corrected_flash["display_color"] == [27, 35, 31]
+    assert suppressed_flash["display_color"] == [27, 35, 31]
+    assert applied["sanitized_display_color_count"] == 1
+    assert after["summary"]["gk_false_positive_segment_count"] == 0
 
 
 def test_phase3_does_not_apply_rejected_plan():
