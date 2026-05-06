@@ -28,7 +28,18 @@ from src.identity.pre_render_audit import (
     build_vision_review_queue,
     post_fix_audit_improved,
 )
+from src.identity.model_review import (
+    build_identity_model_review_request,
+    invoke_identity_review_provider,
+    normalize_identity_review_model_outputs,
+    resolve_identity_review_model_config,
+)
 from src.identity.review_engine import build_identity_review_decisions
+from src.identity.resolver import build_identity_resolution_plan
+from src.identity.safe_apply import (
+    apply_identity_resolution_plan_to_annotation_states,
+    apply_identity_resolution_plan_to_raw_records,
+)
 from src.team_assigner.team_assigner import TeamAssigner
 from src.trackers.tracker import Tracker
 from src.utils.annotation_colors import (
@@ -183,9 +194,12 @@ def _write_identity_artifacts(
     correction_plan: Dict[str, Any],
     correction_applied: Dict[str, Any],
     vision_review_queue: Dict[str, Any],
+    identity_model_review_request: Dict[str, Any],
     vision_review_results: Dict[str, Any],
     final_render_identity_manifest: Dict[str, Any],
     identity_review_decisions: Dict[str, Any],
+    identity_resolution_plan: Dict[str, Any],
+    identity_resolution_applied: Dict[str, Any],
     output_dir: Path,
 ) -> Dict[str, Path]:
     """Write identity debugging artifacts for offline review."""
@@ -200,9 +214,12 @@ def _write_identity_artifacts(
     correction_plan_path = identity_dir / f"{job_id}_correction_plan.json"
     correction_applied_path = identity_dir / f"{job_id}_correction_applied.json"
     vision_review_queue_path = identity_dir / f"{job_id}_vision_review_queue.json"
+    identity_model_review_request_path = identity_dir / f"{job_id}_identity_model_review_request.json"
     vision_review_results_path = identity_dir / f"{job_id}_vision_review_results.json"
     final_render_identity_manifest_path = identity_dir / f"{job_id}_final_render_identity_manifest.json"
     identity_review_decisions_path = identity_dir / f"{job_id}_identity_review_decisions.json"
+    identity_resolution_plan_path = identity_dir / f"{job_id}_identity_resolution_plan.json"
+    identity_resolution_applied_path = identity_dir / f"{job_id}_identity_resolution_applied.json"
 
     _write_jsonl(raw_tracklets_path, raw_tracklet_records)
     identity_debug_path.write_text(
@@ -237,6 +254,10 @@ def _write_identity_artifacts(
         json.dumps(_json_safe(vision_review_queue), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    identity_model_review_request_path.write_text(
+        json.dumps(_json_safe(identity_model_review_request), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     vision_review_results_path.write_text(
         json.dumps(_json_safe(vision_review_results), ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -247,6 +268,14 @@ def _write_identity_artifacts(
     )
     identity_review_decisions_path.write_text(
         json.dumps(_json_safe(identity_review_decisions), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    identity_resolution_plan_path.write_text(
+        json.dumps(_json_safe(identity_resolution_plan), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    identity_resolution_applied_path.write_text(
+        json.dumps(_json_safe(identity_resolution_applied), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
@@ -260,9 +289,12 @@ def _write_identity_artifacts(
         "correction_plan_json": correction_plan_path,
         "correction_applied_json": correction_applied_path,
         "vision_review_queue_json": vision_review_queue_path,
+        "identity_model_review_request_json": identity_model_review_request_path,
         "vision_review_results_json": vision_review_results_path,
         "final_render_identity_manifest_json": final_render_identity_manifest_path,
         "identity_review_decisions_json": identity_review_decisions_path,
+        "identity_resolution_plan_json": identity_resolution_plan_path,
+        "identity_resolution_applied_json": identity_resolution_applied_path,
     }
 
 
@@ -1810,6 +1842,10 @@ def run_batch_analysis(
     batch_size: int = 16,
     identity_merge_map: Optional[Dict[Any, Any]] = None,
     tracker_backend: str = "botsort",
+    identity_review_provider: Optional[str] = None,
+    identity_review_model: Optional[str] = None,
+    identity_review_provider_enabled: Optional[bool] = None,
+    identity_review_model_outputs: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Run a conservative, memory-aware analysis and write local artifacts."""
     warnings: List[str] = []
@@ -2137,9 +2173,49 @@ def run_batch_analysis(
         player_crop_index = json.loads(Path(player_crop_index_path).read_text(encoding="utf-8"))
     else:
         player_crop_index = {"schema_version": "1.0", "phase": "phase_5_crop_evidence", "cases": []}
+    normalized_model_outputs = normalize_identity_review_model_outputs(
+        identity_review_model_outputs
+    )
+    model_review_config = resolve_identity_review_model_config(
+        provider=identity_review_provider,
+        model=identity_review_model,
+        provider_enabled=identity_review_provider_enabled,
+        model_outputs=normalized_model_outputs,
+    )
+    identity_model_review_request = build_identity_model_review_request(
+        vision_review_queue=vision_review_queue,
+        player_crop_index=player_crop_index,
+        provider=model_review_config.get("provider"),
+        model=model_review_config.get("model"),
+    )
+    provider_invocation = invoke_identity_review_provider(
+        request=identity_model_review_request,
+        provider=model_review_config.get("provider"),
+        model=model_review_config.get("model"),
+        provider_enabled=bool(model_review_config.get("provider_enabled")),
+        model_outputs=normalized_model_outputs,
+    )
+    normalized_model_outputs = provider_invocation.get("model_outputs")
+    model_review_config = resolve_identity_review_model_config(
+        provider=model_review_config.get("provider"),
+        model=model_review_config.get("model"),
+        provider_enabled=model_review_config.get("provider_enabled"),
+        model_outputs=normalized_model_outputs,
+    )
+    identity_model_review_request["provider"] = model_review_config.get("provider")
+    identity_model_review_request["model"] = model_review_config.get("model")
+    identity_model_review_request["provider_invocation"] = {
+        key: value
+        for key, value in provider_invocation.items()
+        if key != "model_outputs"
+    }
     vision_review_results = build_vision_review_results(
         vision_review_queue=vision_review_queue,
         player_crop_index=player_crop_index,
+        provider=model_review_config.get("provider"),
+        model=model_review_config.get("model"),
+        provider_enabled=bool(model_review_config.get("provider_enabled")),
+        model_outputs=normalized_model_outputs,
     )
 
     rendered_frames = _render_smooth_review_video(
@@ -2171,6 +2247,54 @@ def run_batch_analysis(
         final_render_identity_manifest=final_render_identity_manifest,
         player_crop_index=player_crop_index,
     )
+    identity_resolution_plan = build_identity_resolution_plan(
+        identity_review_decisions=identity_review_decisions,
+        vision_review_queue=vision_review_queue,
+        vision_review_results=vision_review_results,
+        player_crop_index=player_crop_index,
+        render_audit_after=render_audit_after,
+        final_render_identity_manifest=final_render_identity_manifest,
+    )
+    candidate_resolution_records, identity_resolution_applied = (
+        apply_identity_resolution_plan_to_raw_records(
+            raw_tracklet_records,
+            identity_resolution_plan,
+        )
+    )
+    if identity_resolution_applied.get("safe_apply_candidate"):
+        candidate_resolution_audit = build_render_identity_audit(
+            candidate_resolution_records,
+            identity_debug,
+            baseline_image=RUNPOD_BASELINE_IMAGE,
+        )
+        if post_fix_audit_improved(render_audit_after, candidate_resolution_audit):
+            raw_tracklet_records = candidate_resolution_records
+            identity_resolution_applied["kept"] = True
+            identity_resolution_applied["post_apply_audit_verdict"] = (
+                candidate_resolution_audit.get("verdict")
+            )
+            identity_resolution_applied["post_apply_audit_score"] = (
+                candidate_resolution_audit.get("score")
+            )
+            identity_resolution_applied["updated_annotation_track_count"] = (
+                apply_identity_resolution_plan_to_annotation_states(
+                    annotation_states,
+                    identity_resolution_plan,
+                )
+            )
+            warnings.append(
+                "Phase 10 identity safe apply recorded "
+                f"{identity_resolution_applied['applied_proposal_count']} "
+                "validated resolution proposal(s)."
+            )
+        else:
+            identity_resolution_applied["safe_apply_status"] = "rolled_back"
+            identity_resolution_applied["kept"] = False
+            identity_resolution_applied["rollback_reason"] = "post_apply_audit_not_improved"
+            identity_resolution_applied["updated_annotation_track_count"] = 0
+    else:
+        identity_resolution_applied["kept"] = False
+        identity_resolution_applied["updated_annotation_track_count"] = 0
 
     if team_assigner.kmeans is None:
         warnings.append("Team assignment was unavailable because not enough players were detected in any sampled frame.")
@@ -2271,10 +2395,52 @@ def run_batch_analysis(
             "vision_review_unresolved_count": vision_review_results.get("unresolved_count", 0),
             "vision_review_validation": vision_review_results.get("validation", {}),
             "vision_model_invoked": vision_review_results.get("vision_model_invoked", False),
+            "identity_model_review_phase": identity_model_review_request.get("phase"),
+            "identity_model_review_provider": model_review_config.get("provider"),
+            "identity_model_review_model": model_review_config.get("model"),
+            "identity_model_review_enabled": model_review_config.get("provider_enabled"),
+            "identity_model_review_case_count": identity_model_review_request.get(
+                "case_count",
+                0,
+            ),
+            "identity_model_review_output_count": model_review_config.get(
+                "model_output_count",
+                0,
+            ),
+            "identity_model_review_provider_status": provider_invocation.get("status"),
             "identity_review_engine_phase": identity_review_decisions.get("phase"),
             "identity_review_recommendation": identity_review_decisions.get("recommendation"),
             "identity_review_next_step": identity_review_decisions.get("next_step"),
             "identity_review_summary": identity_review_decisions.get("summary", {}),
+            "identity_resolution_phase": identity_resolution_plan.get("phase"),
+            "identity_resolution_recommendation": identity_resolution_plan.get(
+                "recommendation"
+            ),
+            "identity_resolution_summary": identity_resolution_plan.get("summary", {}),
+            "identity_resolution_validation": identity_resolution_plan.get("validation", {}),
+            "identity_safe_apply_phase": identity_resolution_applied.get("phase"),
+            "identity_safe_apply_status": identity_resolution_applied.get(
+                "safe_apply_status"
+            ),
+            "identity_safe_apply_summary": {
+                "applied_proposal_count": identity_resolution_applied.get(
+                    "applied_proposal_count",
+                    0,
+                ),
+                "updated_record_count": identity_resolution_applied.get(
+                    "updated_record_count",
+                    0,
+                ),
+                "updated_annotation_track_count": identity_resolution_applied.get(
+                    "updated_annotation_track_count",
+                    0,
+                ),
+                "kept": identity_resolution_applied.get("kept", False),
+            },
+            "identity_safe_apply_validation": identity_resolution_applied.get(
+                "validation",
+                {},
+            ),
             "crop_evidence_prepared": bool(vision_evidence_paths.get("player_crop_index_json")),
         }
     )
@@ -2289,9 +2455,12 @@ def run_batch_analysis(
         correction_plan=correction_plan,
         correction_applied=correction_applied,
         vision_review_queue=vision_review_queue,
+        identity_model_review_request=identity_model_review_request,
         vision_review_results=vision_review_results,
         final_render_identity_manifest=final_render_identity_manifest,
         identity_review_decisions=identity_review_decisions,
+        identity_resolution_plan=identity_resolution_plan,
+        identity_resolution_applied=identity_resolution_applied,
         output_dir=output_root,
     )
     report_paths.update(identity_paths)
@@ -2308,9 +2477,12 @@ def run_batch_analysis(
         "correction_plan_json": {"local_path": str(report_paths["correction_plan_json"]), "content_type": "application/json"},
         "correction_applied_json": {"local_path": str(report_paths["correction_applied_json"]), "content_type": "application/json"},
         "vision_review_queue_json": {"local_path": str(report_paths["vision_review_queue_json"]), "content_type": "application/json"},
+        "identity_model_review_request_json": {"local_path": str(report_paths["identity_model_review_request_json"]), "content_type": "application/json"},
         "vision_review_results_json": {"local_path": str(report_paths["vision_review_results_json"]), "content_type": "application/json"},
         "final_render_identity_manifest_json": {"local_path": str(report_paths["final_render_identity_manifest_json"]), "content_type": "application/json"},
         "identity_review_decisions_json": {"local_path": str(report_paths["identity_review_decisions_json"]), "content_type": "application/json"},
+        "identity_resolution_plan_json": {"local_path": str(report_paths["identity_resolution_plan_json"]), "content_type": "application/json"},
+        "identity_resolution_applied_json": {"local_path": str(report_paths["identity_resolution_applied_json"]), "content_type": "application/json"},
         "player_crop_index_json": {"local_path": str(report_paths["player_crop_index_json"]), "content_type": "application/json"},
         "vision_contact_sheets_zip": {"local_path": str(report_paths["vision_contact_sheets_zip"]), "content_type": "application/zip"},
     }

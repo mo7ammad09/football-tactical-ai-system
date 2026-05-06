@@ -102,6 +102,9 @@ class RunPodServerlessClient(AnalysisClient):
         resize_width: int = 1280,
         identity_merge_map: Optional[Dict[Any, Any]] = None,
         tracker_backend: str = "botsort",
+        identity_review_provider: Optional[str] = None,
+        identity_review_model: Optional[str] = None,
+        identity_review_provider_enabled: Optional[bool] = None,
         execution_timeout_ms: Optional[int] = None,
         ttl_ms: Optional[int] = None,
     ) -> str:
@@ -134,6 +137,14 @@ class RunPodServerlessClient(AnalysisClient):
             payload["input"]["model_object_key"] = model_object_key
         if model_path:
             payload["input"]["model_path"] = model_path
+        if identity_review_provider:
+            payload["input"]["identity_review_provider"] = identity_review_provider
+        if identity_review_model:
+            payload["input"]["identity_review_model"] = identity_review_model
+        if identity_review_provider_enabled is not None:
+            payload["input"]["identity_review_provider_enabled"] = bool(
+                identity_review_provider_enabled
+            )
 
         response = self.session.post(self._url("run"), headers=self.headers, json=payload, timeout=60)
         response.raise_for_status()
@@ -155,6 +166,9 @@ class RunPodServerlessClient(AnalysisClient):
         resize_width: int = 1280,
         identity_merge_map: Optional[Dict[Any, Any]] = None,
         tracker_backend: str = "botsort",
+        identity_review_provider: Optional[str] = None,
+        identity_review_model: Optional[str] = None,
+        identity_review_provider_enabled: Optional[bool] = None,
         execution_timeout_ms: Optional[int] = None,
         ttl_ms: Optional[int] = None,
     ) -> str:
@@ -210,6 +224,9 @@ class RunPodServerlessClient(AnalysisClient):
             resize_width=resize_width,
             identity_merge_map=identity_merge_map,
             tracker_backend=tracker_backend,
+            identity_review_provider=identity_review_provider,
+            identity_review_model=identity_review_model,
+            identity_review_provider_enabled=identity_review_provider_enabled,
             execution_timeout_ms=execution_timeout_ms,
             ttl_ms=ttl_ms,
         )

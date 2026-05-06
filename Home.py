@@ -147,6 +147,43 @@ def format_bytes(size: int | float) -> str:
     return f"{size:.1f} TB"
 
 
+def identity_phase_label(value: object, language_code: str) -> str:
+    """Return compact UI labels for identity pipeline states."""
+    raw = str(value or "").strip()
+    if not raw:
+        return "-"
+
+    labels_ar = {
+        "identity_trusted": "موثوق",
+        "review_required": "مراجعة",
+        "invalid_render": "غير صالح",
+        "safe_apply_available": "جاهز",
+        "partial_safe_apply_available": "جزئي",
+        "keep_review_required_until_evidence": "ينتظر دليل",
+        "no_resolution_needed": "لا يحتاج",
+        "no_ready_proposals": "لا يوجد",
+        "applied": "تم",
+        "not_applied": "لم يطبق",
+        "rolled_back": "تراجع",
+        "validation_failed": "فشل تحقق",
+        "skipped": "تخطي",
+    }
+    labels_en = {
+        "safe_apply_available": "Ready",
+        "partial_safe_apply_available": "Partial",
+        "keep_review_required_until_evidence": "Needs evidence",
+        "no_resolution_needed": "No action",
+        "no_ready_proposals": "None ready",
+        "applied": "Applied",
+        "not_applied": "Not applied",
+        "rolled_back": "Rolled back",
+        "validation_failed": "Validation failed",
+        "skipped": "Skipped",
+    }
+    labels = labels_ar if language_code == "ar" else labels_en
+    return labels.get(raw, raw)
+
+
 def parse_identity_merge_text(text: str) -> dict[int, int]:
     """Parse manual tracker ID corrections from JSON or compact text."""
     raw = (text or "").strip()
@@ -593,10 +630,33 @@ with st.sidebar:
                     else "If a player ID changes, enter new ID then original ID. Example: 430:12 means treat 430 as 12."
                 ),
             )
+            with st.expander("Gemma Identity Review", expanded=False):
+                identity_review_provider_enabled_remote = st.checkbox(
+                    "تفعيل Gemma API لمراجعة الهوية"
+                    if lang == "ar"
+                    else "Enable Gemma API identity review",
+                    value=False,
+                    help=(
+                        "يتطلب GOOGLE_API_KEY داخل إعدادات RunPod endpoint. إذا فشل، يبقى النظام على review_required."
+                        if lang == "ar"
+                        else "Requires GOOGLE_API_KEY in the RunPod endpoint environment. If it fails, the system stays review_required."
+                    ),
+                )
+                identity_review_model_remote = st.text_input(
+                    "Gemma model id" if lang == "ar" else "Gemma model id",
+                    value=os.environ.get("IDENTITY_REVIEW_MODEL", "gemma-4-31b-it"),
+                    help=(
+                        "يمكن تغييره إذا كان اسم Gemma 4 في حساب Google مختلفاً."
+                        if lang == "ar"
+                        else "Change this if the Gemma 4 model id differs in your Google account."
+                    ),
+                )
         else:
             identity_merge_text_remote = ""
             tracker_backend_remote = "botsort"
             runpod_execution_timeout_hours = 2.0
+            identity_review_provider_enabled_remote = False
+            identity_review_model_remote = "gemma-4-31b-it"
         st.caption(
             "السريع مناسب للمباريات الطويلة. الجودة العالية أدق لكنها أبطأ وأغلى. جودة قصوى مخصصة للمقاطع القصيرة."
             if lang == "ar"
@@ -612,6 +672,8 @@ with st.sidebar:
         identity_merge_text_remote = ""
         tracker_backend_remote = "botsort"
         runpod_execution_timeout_hours = 2.0
+        identity_review_provider_enabled_remote = False
+        identity_review_model_remote = "gemma-4-31b-it"
 
     st.markdown("---")
     
@@ -1044,6 +1106,17 @@ if video_path:
                         resize_width=int(resize_width_remote),
                         identity_merge_map=identity_merge_map,
                         tracker_backend=tracker_backend_remote,
+                        identity_review_provider=(
+                            "google_gemma_api"
+                            if identity_review_provider_enabled_remote
+                            else None
+                        ),
+                        identity_review_model=(
+                            identity_review_model_remote.strip()
+                            if identity_review_provider_enabled_remote
+                            else None
+                        ),
+                        identity_review_provider_enabled=identity_review_provider_enabled_remote,
                         execution_timeout_ms=int(float(runpod_execution_timeout_hours) * 60 * 60 * 1000),
                     )
                     st.session_state.runpod_job_id = job_id
@@ -1387,6 +1460,46 @@ if st.session_state.analysis_done and st.session_state.analysis_results:
             "نعم" if (lang == "ar" and identity_summary["correction_applied"]) else
             "لا" if lang == "ar" else
             "Yes" if identity_summary["correction_applied"] else "No",
+        )
+
+        phase_cols = st.columns(4)
+        model_review_active = bool(
+            identity_summary["identity_model_review_enabled"]
+            or identity_summary["vision_model_invoked"]
+            or identity_summary["identity_model_review_output_count"]
+        )
+        phase_cols[0].metric(
+            "Model Review",
+            "نعم" if (lang == "ar" and model_review_active) else
+            "لا" if lang == "ar" else
+            "Yes" if model_review_active else "No",
+            delta=identity_summary["identity_model_review_output_count"],
+            help=(
+                "عدد قرارات النموذج المستلمة"
+                if lang == "ar"
+                else "Number of received model decisions"
+            ),
+        )
+        phase_cols[1].metric(
+            "Resolver",
+            identity_phase_label(
+                identity_summary["identity_resolution_recommendation"],
+                lang,
+            ),
+        )
+        phase_cols[2].metric(
+            "جاهز للتطبيق" if lang == "ar" else "Ready",
+            identity_summary["identity_resolution_ready_count"],
+        )
+        phase_cols[3].metric(
+            "Safe Apply",
+            identity_phase_label(identity_summary["identity_safe_apply_status"], lang),
+            delta=identity_summary["identity_safe_apply_applied_count"],
+            help=(
+                "عدد قرارات الهوية التي تم تطبيقها بأمان"
+                if lang == "ar"
+                else "Number of identity decisions safely applied"
+            ),
         )
 
         artifact_links = identity_summary["artifact_links"]

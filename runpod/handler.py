@@ -6,6 +6,7 @@ import os
 import sys
 import uuid
 import urllib.request
+import json
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -64,6 +65,36 @@ def _artifact_response(storage: Optional[ObjectStorageClient], job_id: str, name
     return artifact
 
 
+def _parse_bool(value: Any) -> Optional[bool]:
+    """Parse optional boolean RunPod input values."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def _parse_model_outputs(value: Any) -> Any:
+    """Parse optional structured identity-review model outputs."""
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            return []
+    return value
+
+
 def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     """RunPod queue-based serverless entrypoint."""
     input_data = event.get("input", {}) or {}
@@ -78,6 +109,22 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     batch_size = int(input_data.get("batch_size") or os.environ.get("PROCESSING_BATCH_SIZE", "16"))
     identity_merge_map = input_data.get("identity_merge_map") or {}
     tracker_backend = str(input_data.get("tracker_backend") or os.environ.get("TRACKER_BACKEND", "botsort")).lower()
+    identity_review_provider = (
+        input_data.get("identity_review_provider")
+        or os.environ.get("IDENTITY_REVIEW_PROVIDER")
+    )
+    identity_review_model = (
+        input_data.get("identity_review_model")
+        or os.environ.get("IDENTITY_REVIEW_MODEL")
+    )
+    identity_review_provider_enabled = _parse_bool(
+        input_data.get("identity_review_provider_enabled")
+        if "identity_review_provider_enabled" in input_data
+        else os.environ.get("IDENTITY_REVIEW_PROVIDER_ENABLED")
+    )
+    identity_review_model_outputs = _parse_model_outputs(
+        input_data.get("identity_review_model_outputs")
+    )
 
     work_dir = TMP_ROOT / job_id
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -133,6 +180,10 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             batch_size=batch_size,
             identity_merge_map=identity_merge_map,
             tracker_backend=tracker_backend,
+            identity_review_provider=identity_review_provider,
+            identity_review_model=identity_review_model,
+            identity_review_provider_enabled=identity_review_provider_enabled,
+            identity_review_model_outputs=identity_review_model_outputs,
         )
         report = result["report"]
         paths = result["paths"]
@@ -150,6 +201,10 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             "correction_plan_json": ("application/json", "correction_plan_json_url"),
             "correction_applied_json": ("application/json", "correction_applied_json_url"),
             "vision_review_queue_json": ("application/json", "vision_review_queue_json_url"),
+            "identity_model_review_request_json": (
+                "application/json",
+                "identity_model_review_request_json_url",
+            ),
             "vision_review_results_json": ("application/json", "vision_review_results_json_url"),
             "final_render_identity_manifest_json": (
                 "application/json",
@@ -158,6 +213,14 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             "identity_review_decisions_json": (
                 "application/json",
                 "identity_review_decisions_json_url",
+            ),
+            "identity_resolution_plan_json": (
+                "application/json",
+                "identity_resolution_plan_json_url",
+            ),
+            "identity_resolution_applied_json": (
+                "application/json",
+                "identity_resolution_applied_json_url",
             ),
             "player_crop_index_json": ("application/json", "player_crop_index_json_url"),
             "vision_contact_sheets_zip": ("application/zip", "vision_contact_sheets_zip_url"),

@@ -21,17 +21,23 @@ REQUIRED_RUNPOD_ARTIFACTS: tuple[str, ...] = (
     "correction_plan_json",
     "correction_applied_json",
     "vision_review_queue_json",
+    "identity_model_review_request_json",
     "player_crop_index_json",
     "vision_review_results_json",
     "final_render_identity_manifest_json",
     "identity_review_decisions_json",
+    "identity_resolution_plan_json",
+    "identity_resolution_applied_json",
     "vision_contact_sheets_zip",
 )
 
 REQUIRED_SOURCE_FILES: tuple[str, ...] = (
     "src/identity/__init__.py",
     "src/identity/pre_render_audit.py",
+    "src/identity/model_review.py",
     "src/identity/review_engine.py",
+    "src/identity/resolver.py",
+    "src/identity/safe_apply.py",
     "src/identity/reporting.py",
     "src/identity/deployment_preflight.py",
     "src/processing/batch_analyzer.py",

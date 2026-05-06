@@ -15,10 +15,13 @@ IDENTITY_ARTIFACTS: tuple[tuple[str, str], ...] = (
     ("correction_plan_json_url", "Correction plan"),
     ("correction_applied_json_url", "Correction applied"),
     ("vision_review_queue_json_url", "Vision review queue"),
+    ("identity_model_review_request_json_url", "Identity model review request"),
     ("player_crop_index_json_url", "Player crop index"),
     ("vision_review_results_json_url", "Vision review results"),
     ("final_render_identity_manifest_json_url", "Final identity manifest"),
     ("identity_review_decisions_json_url", "Identity review decisions"),
+    ("identity_resolution_plan_json_url", "Identity resolution plan"),
+    ("identity_resolution_applied_json_url", "Identity resolution applied"),
     ("vision_contact_sheets_zip_url", "Vision contact sheets"),
 )
 
@@ -63,6 +66,13 @@ def summarize_pre_render_identity(results: dict[str, Any]) -> dict[str, Any]:
     queue_count = int(correction.get("vision_review_queue_count") or 0)
     correction_applied = bool(correction.get("correction_applied"))
     vision_invoked = bool(correction.get("vision_model_invoked"))
+    model_review_enabled = bool(correction.get("identity_model_review_enabled"))
+    model_review_case_count = int(correction.get("identity_model_review_case_count") or 0)
+    model_review_output_count = int(
+        correction.get("identity_model_review_output_count") or 0
+    )
+    resolution = correction.get("identity_resolution_summary") or {}
+    safe_apply = correction.get("identity_safe_apply_summary") or {}
 
     if release_status == "identity_trusted":
         severity = "success"
@@ -92,5 +102,18 @@ def summarize_pre_render_identity(results: dict[str, Any]) -> dict[str, Any]:
         "queued_case_count": queue_count,
         "correction_applied": correction_applied,
         "vision_model_invoked": vision_invoked,
+        "identity_model_review_enabled": model_review_enabled,
+        "identity_model_review_case_count": model_review_case_count,
+        "identity_model_review_output_count": model_review_output_count,
+        "identity_resolution_recommendation": correction.get(
+            "identity_resolution_recommendation"
+        ),
+        "identity_resolution_ready_count": int(
+            resolution.get("ready_for_safe_apply_count") or 0
+        ),
+        "identity_safe_apply_status": correction.get("identity_safe_apply_status"),
+        "identity_safe_apply_applied_count": int(
+            safe_apply.get("applied_proposal_count") or 0
+        ),
         "artifact_links": build_identity_artifact_links(results),
     }

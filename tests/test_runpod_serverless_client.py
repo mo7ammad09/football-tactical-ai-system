@@ -71,6 +71,9 @@ def test_runpod_client_uploads_to_storage_and_submits_job(tmp_path):
         model_path="models/model.pt",
         identity_merge_map={430: 12},
         tracker_backend="strongsort",
+        identity_review_provider="google_gemma_api",
+        identity_review_model="gemma-test",
+        identity_review_provider_enabled=True,
         execution_timeout_ms=7_200_000,
     )
 
@@ -85,6 +88,9 @@ def test_runpod_client_uploads_to_storage_and_submits_job(tmp_path):
     assert payload["model_path"] == "models/model.pt"
     assert payload["identity_merge_map"] == {430: 12}
     assert payload["tracker_backend"] == "strongsort"
+    assert payload["identity_review_provider"] == "google_gemma_api"
+    assert payload["identity_review_model"] == "gemma-test"
+    assert payload["identity_review_provider_enabled"] is True
     assert dummy_session.posts[0]["json"]["policy"]["executionTimeout"] == 7_200_000
     assert dummy_session.posts[0]["json"]["policy"]["ttl"] == 86_400_000
 

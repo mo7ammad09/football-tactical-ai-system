@@ -50,6 +50,19 @@ def test_runpod_handler_accepts_legacy_video_url_without_storage(monkeypatch, tm
                 "video_url": "https://example.com/video.mp4",
                 "identity_merge_map": {"430": 12},
                 "tracker_backend": "strongsort",
+                "identity_review_provider": "external_structured",
+                "identity_review_model": "test-reviewer",
+                "identity_review_provider_enabled": True,
+                "identity_review_model_outputs": [
+                    {
+                        "case_id": "candidate_goalkeeper_identity_fragmentation",
+                        "status": "reviewed",
+                        "verdict": "same_player",
+                        "confidence": 0.91,
+                        "reason": "same goalkeeper",
+                        "evidence": [{"tracks": [21, 29, 31]}],
+                    }
+                ],
             },
         }
     )
@@ -59,6 +72,10 @@ def test_runpod_handler_accepts_legacy_video_url_without_storage(monkeypatch, tm
     assert "annotated_video" in result["artifacts"]
     assert captured_kwargs["identity_merge_map"] == {"430": 12}
     assert captured_kwargs["tracker_backend"] == "strongsort"
+    assert captured_kwargs["identity_review_provider"] == "external_structured"
+    assert captured_kwargs["identity_review_model"] == "test-reviewer"
+    assert captured_kwargs["identity_review_provider_enabled"] is True
+    assert captured_kwargs["identity_review_model_outputs"][0]["verdict"] == "same_player"
 
 
 def test_runpod_handler_uploads_all_identity_artifacts_when_present(monkeypatch, tmp_path):
@@ -132,9 +149,18 @@ def test_runpod_handler_uploads_all_identity_artifacts_when_present(monkeypatch,
     assert result["final_render_identity_manifest_json_url"].endswith(
         "/final_render_identity_manifest_json.json"
     )
+    assert result["identity_model_review_request_json_url"].endswith(
+        "/identity_model_review_request_json.json"
+    )
     assert result["vision_review_results_json_url"].endswith(
         "/vision_review_results_json.json"
     )
     assert result["identity_review_decisions_json_url"].endswith(
         "/identity_review_decisions_json.json"
+    )
+    assert result["identity_resolution_plan_json_url"].endswith(
+        "/identity_resolution_plan_json.json"
+    )
+    assert result["identity_resolution_applied_json_url"].endswith(
+        "/identity_resolution_applied_json.json"
     )
