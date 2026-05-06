@@ -22,6 +22,8 @@ IDENTITY_ARTIFACTS: tuple[tuple[str, str], ...] = (
     ("identity_review_decisions_json_url", "Identity review decisions"),
     ("identity_resolution_plan_json_url", "Identity resolution plan"),
     ("identity_resolution_applied_json_url", "Identity resolution applied"),
+    ("identity_stability_plan_json_url", "Identity stability plan"),
+    ("identity_stability_applied_json_url", "Identity stability applied"),
     ("vision_contact_sheets_zip_url", "Vision contact sheets"),
 )
 

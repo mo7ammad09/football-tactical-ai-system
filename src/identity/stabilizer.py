@@ -1,0 +1,483 @@
+"""Global identity display stabilizer for pre-render output.
+
+This phase does not merge identities and does not claim uncertain identities.
+It only writes stable client-facing display metadata when the raw tracklet
+history contains enough evidence for a player role and team.
+"""
+
+from __future__ import annotations
+
+from collections import Counter, defaultdict
+from copy import deepcopy
+from typing import Any, Iterable
+
+from src.utils.annotation_colors import PLAYER_FALLBACK_COLOR, is_goalkeeper_color, normalize_color
+
+
+PERSON_OBJECT_TYPES = {"player", "referee", "goalkeeper"}
+READY_STATUS = "ready_for_safe_apply"
+REVIEW_STATUS = "needs_review"
+APPLIED_STATUS = "applied"
+NOOP_STATUS = "no_ready_actions"
+REJECTED_STATUS = "rejected"
+
+
+def _as_int(value: Any, fallback: int = 0) -> int:
+    """Convert values to int while keeping dirty rows safe."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _as_float(value: Any, fallback: float = 0.0) -> float:
+    """Convert values to float while keeping dirty rows safe."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _counter_dict(counter: Counter) -> dict[str, int]:
+    """Return a JSON-safe counter dict."""
+    return {str(key): int(value) for key, value in counter.items()}
+
+
+def _dominant(counter: Counter, fallback: Any = None) -> tuple[Any, float, int, int]:
+    """Return dominant value, confidence, top count, and runner-up count."""
+    total = sum(counter.values())
+    if total <= 0:
+        return fallback, 0.0, 0, 0
+    values = counter.most_common(2)
+    top_value, top_count = values[0]
+    runner_up = values[1][1] if len(values) > 1 else 0
+    return top_value, float(top_count) / float(total), int(top_count), int(runner_up)
+
+
+def _iter_person_rows(rows: Iterable[dict[str, Any]]) -> Iterable[dict[str, Any]]:
+    """Yield person-like records."""
+    for row in rows:
+        if str(row.get("object_type", "")) in PERSON_OBJECT_TYPES:
+            yield row
+
+
+def _source_track_id(row: dict[str, Any]) -> int:
+    """Return the source track id."""
+    return _as_int(row.get("track_id"), -1)
+
+
+def _frame_idx(row: dict[str, Any]) -> int:
+    """Return the source frame index."""
+    return _as_int(row.get("source_frame_idx"))
+
+
+def _sample_number(row: dict[str, Any]) -> int:
+    """Return the sampled frame number."""
+    return _as_int(row.get("sample_number"), _frame_idx(row))
+
+
+def _raw_role(row: dict[str, Any]) -> str:
+    """Return raw role evidence."""
+    object_type = str(row.get("object_type") or "")
+    if object_type == "referee":
+        return "referee"
+    return str(row.get("role") or row.get("detected_role") or object_type or "unknown")
+
+
+def _display_role(row: dict[str, Any]) -> str:
+    """Return client-facing role evidence."""
+    return str(row.get("display_role") or row.get("role") or row.get("detected_role") or "unknown")
+
+
+def _display_team(row: dict[str, Any]) -> int:
+    """Return client-facing team evidence."""
+    if row.get("display_team") is not None:
+        return _as_int(row.get("display_team"))
+    return _as_int(row.get("team"))
+
+
+def _display_label(row: dict[str, Any]) -> str:
+    """Return client-facing label."""
+    if row.get("display_label") is not None:
+        return str(row.get("display_label"))
+    return str(row.get("track_id"))
+
+
+def _is_display_goalkeeper(row: dict[str, Any]) -> bool:
+    """Return whether the row is rendered as goalkeeper-like."""
+    return (
+        _display_role(row) == "goalkeeper"
+        or _display_label(row).upper() == "GK"
+        or is_goalkeeper_color(row.get("display_color"))
+    )
+
+
+def _safe_color(color: Any) -> tuple[int, int, int] | None:
+    """Return a non-goalkeeper color tuple."""
+    if color is None or is_goalkeeper_color(color):
+        return None
+    normalized = normalize_color(color)
+    if is_goalkeeper_color(normalized):
+        return None
+    return normalized
+
+
+def _transition_count(values: list[Any]) -> int:
+    """Count adjacent transitions in an ordered value stream."""
+    return sum(1 for before, after in zip(values, values[1:]) if before != after)
+
+
+def _safe_player_role_decision(
+    *,
+    role_counts: Counter,
+    frames_seen: int,
+    min_role_confidence: float,
+    min_role_margin_ratio: float,
+) -> tuple[bool, str, float, int]:
+    """Return whether the track has enough evidence to render as a player."""
+    role, confidence, top_count, runner_up = _dominant(role_counts, "unknown")
+    margin = top_count - runner_up
+    margin_ratio = (margin / float(frames_seen)) if frames_seen else 0.0
+    is_safe = (
+        str(role) == "player"
+        and confidence >= min_role_confidence
+        and margin_ratio >= min_role_margin_ratio
+    )
+    return is_safe, str(role), float(confidence), int(margin)
+
+
+def _safe_player_team_decision(
+    *,
+    team_counts: Counter,
+    frames_seen: int,
+    min_team_confidence: float,
+    min_team_margin_ratio: float,
+    min_team_frames: int,
+) -> tuple[bool, int, float, int]:
+    """Return whether the track has enough evidence for a player team."""
+    team, confidence, top_count, runner_up = _dominant(team_counts, 0)
+    margin = top_count - runner_up
+    margin_ratio = (margin / float(frames_seen)) if frames_seen else 0.0
+    team_int = _as_int(team, 0)
+    is_safe = (
+        team_int in {1, 2}
+        and top_count >= min_team_frames
+        and confidence >= min_team_confidence
+        and margin_ratio >= min_team_margin_ratio
+    )
+    return is_safe, int(team_int), float(confidence), int(margin)
+
+
+def _track_profiles(raw_tracklet_rows: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    """Build display-stability profiles by track id."""
+    grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for row in _iter_person_rows(raw_tracklet_rows):
+        track_id = _source_track_id(row)
+        if track_id >= 0:
+            grouped[track_id].append(row)
+
+    profiles: dict[int, dict[str, Any]] = {}
+    for track_id, rows in grouped.items():
+        ordered = sorted(rows, key=lambda item: (_sample_number(item), _frame_idx(item)))
+        frames_seen = len(ordered)
+        raw_roles = Counter(_raw_role(row) for row in ordered)
+        display_roles = Counter(_display_role(row) for row in ordered)
+        display_teams = Counter(_display_team(row) for row in ordered)
+        object_types = Counter(str(row.get("object_type") or "unknown") for row in ordered)
+        player_team_counts: Counter = Counter()
+        colors_by_team: dict[int, Counter] = defaultdict(Counter)
+
+        for row in ordered:
+            raw_role = _raw_role(row)
+            team = _as_int(row.get("team"), 0)
+            if raw_role == "player" and team in {1, 2}:
+                player_team_counts[team] += 1
+                color = _safe_color(row.get("team_color"))
+                if color is not None:
+                    colors_by_team[team][color] += 1
+
+        display_role_sequence = [_display_role(row) for row in ordered]
+        display_team_sequence = [_display_team(row) for row in ordered]
+        player_role_safe, dominant_role, role_confidence, role_margin = _safe_player_role_decision(
+            role_counts=raw_roles,
+            frames_seen=frames_seen,
+            min_role_confidence=0.65,
+            min_role_margin_ratio=0.10,
+        )
+        player_team_safe, dominant_team, team_confidence, team_margin = _safe_player_team_decision(
+            team_counts=player_team_counts,
+            frames_seen=max(1, sum(player_team_counts.values())),
+            min_team_confidence=0.60,
+            min_team_margin_ratio=0.10,
+            min_team_frames=3,
+        )
+        display_role, display_role_confidence, _, _ = _dominant(display_roles, "unknown")
+        display_team, display_team_confidence, _, _ = _dominant(display_teams, 0)
+        color, _, _, _ = _dominant(colors_by_team.get(dominant_team, Counter()), None)
+
+        profiles[track_id] = {
+            "track_id": int(track_id),
+            "frames_seen": int(frames_seen),
+            "first_source_frame_idx": _frame_idx(ordered[0]) if ordered else 0,
+            "last_source_frame_idx": _frame_idx(ordered[-1]) if ordered else 0,
+            "raw_role_counts": _counter_dict(raw_roles),
+            "display_role_counts": _counter_dict(display_roles),
+            "display_team_counts": _counter_dict(display_teams),
+            "player_team_counts": _counter_dict(player_team_counts),
+            "object_type_counts": _counter_dict(object_types),
+            "dominant_raw_role": dominant_role,
+            "raw_role_confidence": float(role_confidence),
+            "raw_role_margin": int(role_margin),
+            "dominant_player_team": int(dominant_team),
+            "player_team_confidence": float(team_confidence),
+            "player_team_margin": int(team_margin),
+            "dominant_display_role": str(display_role),
+            "display_role_confidence": float(display_role_confidence),
+            "dominant_display_team": int(_as_int(display_team, 0)),
+            "display_team_confidence": float(display_team_confidence),
+            "display_role_transition_count": int(_transition_count(display_role_sequence)),
+            "display_team_transition_count": int(_transition_count(display_team_sequence)),
+            "display_goalkeeper_frame_count": sum(1 for row in ordered if _is_display_goalkeeper(row)),
+            "player_role_safe": bool(player_role_safe),
+            "player_team_safe": bool(player_team_safe),
+            "canonical_display_color": list(color) if color is not None else list(PLAYER_FALLBACK_COLOR),
+        }
+    return profiles
+
+
+def validate_global_identity_stability_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    """Validate that the stabilizer plan can be safely applied."""
+    rejected: list[dict[str, Any]] = []
+    for action in plan.get("actions", []) or []:
+        reasons: list[str] = []
+        if action.get("status") != READY_STATUS:
+            continue
+        if str(action.get("action_type")) != "stable_player_display_override":
+            reasons.append("unsupported_action_type")
+        if str(action.get("set_display_role")) != "player":
+            reasons.append("only_player_display_overrides_are_supported")
+        if _as_int(action.get("set_display_team"), 0) not in {1, 2}:
+            reasons.append("player_display_team_must_be_team_1_or_2")
+        if _as_float(action.get("role_confidence"), 0.0) < 0.65:
+            reasons.append("role_confidence_below_threshold")
+        if _as_float(action.get("team_confidence"), 0.0) < 0.60:
+            reasons.append("team_confidence_below_threshold")
+        if action.get("track_id") is None:
+            reasons.append("missing_track_id")
+        if reasons:
+            rejected.append(
+                {
+                    "action_id": action.get("action_id"),
+                    "track_id": action.get("track_id"),
+                    "reasons": reasons,
+                }
+            )
+
+    return {
+        "schema_version": "1.0",
+        "validator": "global_identity_stability_validator",
+        "verdict": "PASS" if not rejected else "FAIL",
+        "accepted_action_count": len(
+            [
+                action
+                for action in plan.get("actions", []) or []
+                if action.get("status") == READY_STATUS
+            ]
+        )
+        - len(rejected),
+        "rejected_action_count": len(rejected),
+        "rejected_actions": rejected,
+    }
+
+
+def build_global_identity_stability_plan(
+    raw_tracklet_rows: list[dict[str, Any]],
+    *,
+    min_frames: int = 4,
+) -> dict[str, Any]:
+    """Build a deterministic plan to stabilize player display role/team."""
+    profiles = _track_profiles(raw_tracklet_rows)
+    actions: list[dict[str, Any]] = []
+    review: list[dict[str, Any]] = []
+
+    for track_id in sorted(profiles):
+        profile = profiles[track_id]
+        frames_seen = _as_int(profile.get("frames_seen"), 0)
+        display_role_transitions = _as_int(profile.get("display_role_transition_count"), 0)
+        display_team_transitions = _as_int(profile.get("display_team_transition_count"), 0)
+        has_visible_flicker = display_role_transitions > 0 or display_team_transitions > 0
+        has_gk_leak = _as_int(profile.get("display_goalkeeper_frame_count"), 0) > 0
+
+        if frames_seen < min_frames:
+            if has_visible_flicker or has_gk_leak:
+                review.append(
+                    {
+                        "track_id": int(track_id),
+                        "status": REVIEW_STATUS,
+                        "reason": "track_too_short_for_safe_stabilization",
+                        "profile": profile,
+                    }
+                )
+            continue
+
+        if profile.get("player_role_safe") and profile.get("player_team_safe"):
+            action = {
+                "action_id": f"stable_player_display_{track_id}",
+                "action_type": "stable_player_display_override",
+                "status": READY_STATUS,
+                "track_id": int(track_id),
+                "set_display_role": "player",
+                "set_display_label": str(track_id),
+                "set_display_team": int(profile.get("dominant_player_team", 0)),
+                "set_display_color": profile.get("canonical_display_color"),
+                "role_confidence": float(profile.get("raw_role_confidence", 0.0)),
+                "team_confidence": float(profile.get("player_team_confidence", 0.0)),
+                "role_margin": int(profile.get("raw_role_margin", 0)),
+                "team_margin": int(profile.get("player_team_margin", 0)),
+                "reason": (
+                    "Track has enough raw player-role and team evidence to keep "
+                    "client-facing role/team stable across rendered frames."
+                ),
+                "evidence": {
+                    "raw_role_counts": profile.get("raw_role_counts", {}),
+                    "player_team_counts": profile.get("player_team_counts", {}),
+                    "display_role_counts": profile.get("display_role_counts", {}),
+                    "display_team_counts": profile.get("display_team_counts", {}),
+                },
+            }
+            actions.append(action)
+            continue
+
+        if has_visible_flicker or has_gk_leak:
+            reasons: list[str] = []
+            if not profile.get("player_role_safe"):
+                reasons.append("insufficient_role_evidence")
+            if not profile.get("player_team_safe"):
+                reasons.append("insufficient_team_evidence")
+            review.append(
+                {
+                    "track_id": int(track_id),
+                    "status": REVIEW_STATUS,
+                    "reason": ",".join(reasons) if reasons else "display_flicker_needs_review",
+                    "profile": profile,
+                }
+            )
+
+    plan = {
+        "schema_version": "1.0",
+        "phase": "phase_12_global_identity_stabilizer",
+        "summary": {
+            "profile_count": len(profiles),
+            "ready_action_count": len(actions),
+            "review_track_count": len(review),
+        },
+        "actions": actions,
+        "needs_review": review[:120],
+        "needs_review_truncated": len(review) > 120,
+        "source_profiles": [profiles[track_id] for track_id in sorted(profiles)],
+    }
+    plan["validation"] = validate_global_identity_stability_plan(plan)
+    return plan
+
+
+def _ready_actions(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return validator-approved stabilizer actions."""
+    if plan.get("validation", {}).get("verdict") != "PASS":
+        return []
+    return [
+        action
+        for action in plan.get("actions", []) or []
+        if isinstance(action, dict) and action.get("status") == READY_STATUS
+    ]
+
+
+def apply_global_identity_stability_plan_to_raw_records(
+    raw_tracklet_rows: list[dict[str, Any]],
+    stability_plan: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Apply safe display stabilization to raw-tracklet rows."""
+    rows = deepcopy(raw_tracklet_rows)
+    validation = stability_plan.get("validation") or {}
+    if validation.get("verdict") != "PASS":
+        return rows, {
+            "schema_version": "1.0",
+            "phase": "phase_12_global_identity_stabilizer_apply",
+            "status": REJECTED_STATUS,
+            "applied_action_count": 0,
+            "updated_record_count": 0,
+            "validation": validation,
+        }
+
+    updated_record_count = 0
+    applied_actions: list[dict[str, Any]] = []
+    for action in _ready_actions(stability_plan):
+        track_id = _as_int(action.get("track_id"), -1)
+        action_updates = 0
+        color = normalize_color(action.get("set_display_color"), PLAYER_FALLBACK_COLOR)
+        for row in rows:
+            if str(row.get("object_type")) != "player":
+                continue
+            if _source_track_id(row) != track_id:
+                continue
+            row["display_role"] = "player"
+            row["display_label"] = str(action.get("set_display_label", track_id))
+            row["display_team"] = int(action.get("set_display_team"))
+            row["display_color"] = list(color)
+            row["goalkeeper_display_locked"] = False
+            row["role_display_suppressed"] = False
+            row["identity_stability_status"] = "phase12_safe_applied"
+            row["identity_stability_action_id"] = action.get("action_id")
+            row["identity_stability_role_confidence"] = float(action.get("role_confidence", 0.0))
+            row["identity_stability_team_confidence"] = float(action.get("team_confidence", 0.0))
+            action_updates += 1
+        if action_updates:
+            updated_record_count += action_updates
+            applied_actions.append(
+                {
+                    "action_id": action.get("action_id"),
+                    "track_id": track_id,
+                    "updated_record_count": action_updates,
+                    "set_display_team": int(action.get("set_display_team")),
+                }
+            )
+
+    return rows, {
+        "schema_version": "1.0",
+        "phase": "phase_12_global_identity_stabilizer_apply",
+        "status": APPLIED_STATUS if applied_actions else NOOP_STATUS,
+        "applied_action_count": len(applied_actions),
+        "updated_record_count": updated_record_count,
+        "applied_actions": applied_actions,
+        "validation": validation,
+    }
+
+
+def apply_global_identity_stability_plan_to_annotation_states(
+    annotation_states: list[dict[str, Any]],
+    stability_plan: dict[str, Any],
+) -> int:
+    """Apply safe display stabilization to render annotation states."""
+    ready = _ready_actions(stability_plan)
+    if not ready:
+        return 0
+
+    updated = 0
+    for action in ready:
+        track_id = _as_int(action.get("track_id"), -1)
+        color = normalize_color(action.get("set_display_color"), PLAYER_FALLBACK_COLOR)
+        for state in annotation_states:
+            track = (state.get("players") or {}).get(track_id)
+            if track is None:
+                continue
+            track["display_role"] = "player"
+            track["display_label"] = str(action.get("set_display_label", track_id))
+            track["display_team"] = int(action.get("set_display_team"))
+            track["display_color"] = tuple(color)
+            track["goalkeeper_display_locked"] = False
+            track["role_display_suppressed"] = False
+            track["identity_stability_status"] = "phase12_safe_applied"
+            track["identity_stability_action_id"] = action.get("action_id")
+            track["identity_stability_role_confidence"] = float(action.get("role_confidence", 0.0))
+            track["identity_stability_team_confidence"] = float(action.get("team_confidence", 0.0))
+            updated += 1
+    return updated

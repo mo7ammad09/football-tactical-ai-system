@@ -222,6 +222,14 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
                 "application/json",
                 "identity_resolution_applied_json_url",
             ),
+            "identity_stability_plan_json": (
+                "application/json",
+                "identity_stability_plan_json_url",
+            ),
+            "identity_stability_applied_json": (
+                "application/json",
+                "identity_stability_applied_json_url",
+            ),
             "player_crop_index_json": ("application/json", "player_crop_index_json_url"),
             "vision_contact_sheets_zip": ("application/zip", "vision_contact_sheets_zip_url"),
         }

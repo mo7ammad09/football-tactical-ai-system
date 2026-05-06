@@ -28,6 +28,8 @@ REQUIRED_RUNPOD_ARTIFACTS: tuple[str, ...] = (
     "identity_review_decisions_json",
     "identity_resolution_plan_json",
     "identity_resolution_applied_json",
+    "identity_stability_plan_json",
+    "identity_stability_applied_json",
     "vision_contact_sheets_zip",
 )
 
@@ -38,6 +40,7 @@ REQUIRED_SOURCE_FILES: tuple[str, ...] = (
     "src/identity/review_engine.py",
     "src/identity/resolver.py",
     "src/identity/safe_apply.py",
+    "src/identity/stabilizer.py",
     "src/identity/reporting.py",
     "src/identity/deployment_preflight.py",
     "src/processing/batch_analyzer.py",

@@ -15,6 +15,11 @@ from src.identity.pre_render_audit import (
     validate_final_render_identity_manifest,
     validate_vision_review_results,
 )
+from src.identity.stabilizer import (
+    apply_global_identity_stability_plan_to_annotation_states,
+    apply_global_identity_stability_plan_to_raw_records,
+    build_global_identity_stability_plan,
+)
 
 
 def _row(
@@ -780,3 +785,71 @@ def test_bad_runpod_image_is_registered_as_regression_not_baseline():
 
     assert RUNPOD_BASELINE_IMAGE.endswith(":sha-bbe8dec")
     assert "ghcr.io/mo7ammad09/football-tactical-ai-runpod:sha-5f969e6" in bad_images
+
+
+def test_render_audit_flags_display_team_flicker_even_when_goalkeeper_is_clean():
+    rows = []
+    rows.extend(_row(18, 18, sample, sample * 10, "player", 1) for sample in range(1, 7))
+    rows.extend(_row(18, 18, sample, sample * 10, "player", 2) for sample in range(7, 12))
+
+    audit = build_render_identity_audit(rows)
+
+    issue_types = {issue["issue_type"] for issue in audit["issues"]}
+    assert "display_team_uncertain" in issue_types
+    assert audit["verdict"] == "REVIEW"
+    assert audit["summary"]["display_team_uncertain_count"] == 1
+
+
+def test_global_identity_stabilizer_locks_only_when_team_and_role_have_evidence():
+    rows = []
+    rows.extend(_row(14, 14, sample, sample * 10, "player", 1) for sample in range(1, 8))
+    rows.extend(_row(14, 36, sample, sample * 10, "goalkeeper", 0) for sample in range(8, 10))
+    rows.extend(_row(18, 18, sample, sample * 10, "player", 1) for sample in range(1, 6))
+    rows.extend(_row(18, 18, sample, sample * 10, "player", 2) for sample in range(6, 11))
+
+    plan = build_global_identity_stability_plan(rows)
+    corrected_rows, applied = apply_global_identity_stability_plan_to_raw_records(rows, plan)
+
+    assert plan["validation"]["verdict"] == "PASS"
+    assert any(action["track_id"] == 14 for action in plan["actions"])
+    assert all(action["track_id"] != 18 for action in plan["actions"])
+    assert any(item["track_id"] == 18 for item in plan["needs_review"])
+    assert applied["status"] == "applied"
+    track14_rows = [row for row in corrected_rows if row["track_id"] == 14]
+    assert {row["display_role"] for row in track14_rows} == {"player"}
+    assert {row["display_team"] for row in track14_rows} == {1}
+    track18_rows = [row for row in corrected_rows if row["track_id"] == 18]
+    assert {row["display_team"] for row in track18_rows} == {None}
+
+
+def test_global_identity_stabilizer_updates_annotation_states_for_final_render():
+    states = [
+        {
+            "players": {
+                14: {
+                    "bbox": [0, 0, 10, 20],
+                    "role": "goalkeeper",
+                    "detected_role": "goalkeeper",
+                    "team": 0,
+                    "team_color": [255, 0, 255],
+                    "display_label": "GK",
+                    "display_role": "goalkeeper",
+                    "display_team": 0,
+                    "display_color": [255, 0, 255],
+                    "goalkeeper_display_locked": True,
+                }
+            }
+        }
+    ]
+    rows = []
+    rows.extend(_row(14, 14, sample, sample * 10, "player", 1) for sample in range(1, 8))
+    rows.extend(_row(14, 36, sample, sample * 10, "goalkeeper", 0) for sample in range(8, 10))
+
+    plan = build_global_identity_stability_plan(rows)
+    updated = apply_global_identity_stability_plan_to_annotation_states(states, plan)
+
+    assert updated == 1
+    assert states[0]["players"][14]["display_role"] == "player"
+    assert states[0]["players"][14]["display_label"] == "14"
+    assert states[0]["players"][14]["display_team"] == 1
+    assert states[0]["players"][14]["goalkeeper_display_locked"] is False

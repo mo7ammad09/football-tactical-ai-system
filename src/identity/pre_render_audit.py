@@ -229,6 +229,11 @@ def _sample_number(row: dict[str, Any]) -> int:
     return _as_int(row.get("sample_number"), _frame_idx(row))
 
 
+def _transition_count(values: list[Any]) -> int:
+    """Count adjacent transitions in an ordered value stream."""
+    return sum(1 for previous, current in zip(values, values[1:]) if previous != current)
+
+
 def _build_source_profiles(rows: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
     """Build profiles by underlying track id, not by visible label."""
     grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -246,6 +251,11 @@ def _build_source_profiles(rows: list[dict[str, Any]]) -> dict[int, dict[str, An
         visible_labels = Counter(_visible_label(row) for row in ordered)
         teams = Counter(_as_int(row.get("team")) for row in ordered)
         visible_teams = Counter(_visible_team(row) for row in ordered)
+        player_teams = Counter(
+            _as_int(row.get("team"))
+            for row in ordered
+            if _raw_role(row) == "player" and _as_int(row.get("team")) in {1, 2}
+        )
         raw_ids = Counter(
             _raw_track_id(row)
             for row in ordered
@@ -254,6 +264,11 @@ def _build_source_profiles(rows: list[dict[str, Any]]) -> dict[int, dict[str, An
         frames = [_frame_idx(row) for row in ordered]
         dominant_raw_role, raw_role_confidence = _dominant(raw_roles, "unknown")
         dominant_detected_role, detected_role_confidence = _dominant(detected_roles, "unknown")
+        dominant_visible_role, visible_role_confidence = _dominant(visible_roles, "unknown")
+        dominant_visible_team, visible_team_confidence = _dominant(visible_teams, 0)
+        dominant_player_team, player_team_confidence = _dominant(player_teams, 0)
+        visible_role_sequence = [_visible_role(row) for row in ordered]
+        visible_team_sequence = [_visible_team(row) for row in ordered]
         display_goalkeeper_frames = sum(1 for row in ordered if _is_display_goalkeeper(row))
         raw_goalkeeper_frames = sum(
             1
@@ -269,15 +284,24 @@ def _build_source_profiles(rows: list[dict[str, Any]]) -> dict[int, dict[str, An
             "raw_role_confidence": float(raw_role_confidence),
             "dominant_detected_role": str(dominant_detected_role),
             "detected_role_confidence": float(detected_role_confidence),
+            "dominant_visible_role": str(dominant_visible_role),
+            "visible_role_confidence": float(visible_role_confidence),
+            "dominant_visible_team": int(dominant_visible_team or 0),
+            "visible_team_confidence": float(visible_team_confidence),
+            "dominant_player_team": int(dominant_player_team or 0),
+            "player_team_confidence": float(player_team_confidence),
             "raw_role_counts": _counter_dict(raw_roles),
             "detected_role_counts": _counter_dict(detected_roles),
             "visible_role_counts": _counter_dict(visible_roles),
             "visible_label_counts": _counter_dict(visible_labels),
             "team_counts": _counter_dict(teams),
             "visible_team_counts": _counter_dict(visible_teams),
+            "player_team_counts": _counter_dict(player_teams),
             "raw_track_counts": _counter_dict(raw_ids),
             "display_goalkeeper_frame_count": int(display_goalkeeper_frames),
             "raw_goalkeeper_frame_count": int(raw_goalkeeper_frames),
+            "display_role_transition_count": int(_transition_count(visible_role_sequence)),
+            "display_team_transition_count": int(_transition_count(visible_team_sequence)),
         }
     return profiles
 
@@ -484,10 +508,102 @@ def build_render_identity_audit(
             )
         )
 
+    for track_id in sorted(source_profiles):
+        profile = source_profiles[track_id]
+        frames_seen = _as_int(profile.get("frames_seen"))
+        if frames_seen < 8:
+            continue
+
+        dominant_raw_role = str(profile.get("dominant_raw_role", "unknown"))
+        raw_role_confidence = _as_float(profile.get("raw_role_confidence"))
+        visible_role_counts = profile.get("visible_role_counts") or {}
+        visible_team_counts = profile.get("visible_team_counts") or {}
+        player_team_counts = profile.get("player_team_counts") or {}
+        display_role_transitions = _as_int(profile.get("display_role_transition_count"))
+        display_team_transitions = _as_int(profile.get("display_team_transition_count"))
+        visible_team_count_values = [
+            _as_int(count)
+            for team, count in visible_team_counts.items()
+            if _as_int(team, -1) in {1, 2} and _as_int(count) > 0
+        ]
+        player_team_count_values = [
+            _as_int(count)
+            for team, count in player_team_counts.items()
+            if _as_int(team, -1) in {1, 2} and _as_int(count) > 0
+        ]
+        player_team_total = sum(player_team_count_values)
+        player_team_confidence = (
+            max(player_team_count_values) / float(player_team_total)
+            if player_team_total
+            else 0.0
+        )
+
+        if (
+            dominant_raw_role == "player"
+            and raw_role_confidence >= 0.65
+            and display_role_transitions > 0
+        ):
+            includes_goalkeeper = _as_int(visible_role_counts.get(GOALKEEPER_ROLE), 0) > 0
+            issues.append(
+                _issue(
+                    issue_id=f"display_role_flicker_{track_id}",
+                    issue_type="display_role_flicker",
+                    severity="high" if includes_goalkeeper else "medium",
+                    title="Rendered role flickers on a player-dominant track",
+                    reason=(
+                        "The same underlying player-dominant track changes its "
+                        "client-facing role over time. The output should not be "
+                        "treated as fully trusted until display role is stabilized."
+                    ),
+                    track_id=int(track_id),
+                    frames_seen=int(frames_seen),
+                    dominant_raw_role=dominant_raw_role,
+                    raw_role_confidence=float(raw_role_confidence),
+                    display_role_transition_count=int(display_role_transitions),
+                    visible_role_counts=visible_role_counts,
+                )
+            )
+
+        if (
+            dominant_raw_role == "player"
+            and raw_role_confidence >= 0.65
+            and display_team_transitions > 0
+            and len(visible_team_count_values) > 1
+        ):
+            severity = "high" if player_team_confidence < 0.60 else "medium"
+            issue_type = (
+                "display_team_uncertain"
+                if player_team_confidence < 0.60
+                else "display_team_flicker"
+            )
+            issues.append(
+                _issue(
+                    issue_id=f"{issue_type}_{track_id}",
+                    issue_type=issue_type,
+                    severity=severity,
+                    title="Rendered team flickers on a player-dominant track",
+                    reason=(
+                        "The same underlying player track changes visible team/color. "
+                        "If team evidence is weak this must remain review-required; "
+                        "if evidence is strong the stabilizer may safely lock display team."
+                    ),
+                    track_id=int(track_id),
+                    frames_seen=int(frames_seen),
+                    dominant_raw_role=dominant_raw_role,
+                    raw_role_confidence=float(raw_role_confidence),
+                    display_team_transition_count=int(display_team_transitions),
+                    visible_team_counts=visible_team_counts,
+                    player_team_counts=player_team_counts,
+                    player_team_confidence=float(player_team_confidence),
+                )
+            )
+
     visible_risk_issue_types = {
         "gk_false_positive_segment",
         "unsafe_gk_display_spread",
         "simultaneous_goalkeeper_display",
+        "display_role_flicker",
+        "display_team_uncertain",
     }
     has_visible_identity_risk = any(
         str(issue.get("issue_type")) in visible_risk_issue_types
@@ -533,6 +649,9 @@ def build_render_identity_audit(
             "visible_goalkeeper_segment_count": len(gk_segments),
             "underlying_gk_source_track_count": len(gk_source_ids),
             "gk_false_positive_segment_count": int(issue_counts.get("gk_false_positive_segment", 0)),
+            "display_role_flicker_count": int(issue_counts.get("display_role_flicker", 0)),
+            "display_team_flicker_count": int(issue_counts.get("display_team_flicker", 0)),
+            "display_team_uncertain_count": int(issue_counts.get("display_team_uncertain", 0)),
             "simultaneous_goalkeeper_conflict_count": int(
                 issue_counts.get("simultaneous_goalkeeper_display", 0)
             ),
@@ -1000,6 +1119,8 @@ def post_fix_audit_improved(
         "gk_false_positive_segment_count",
         "unsafe_gk_display_spread_count",
         "simultaneous_goalkeeper_conflict_count",
+        "display_role_flicker_count",
+        "display_team_uncertain_count",
     ]
     for key in critical_issue_types:
         if _as_int(after_summary.get(key)) > _as_int(before_summary.get(key)):
@@ -1669,6 +1790,8 @@ def build_final_render_identity_manifest(
             "vision_review_queue.json",
             "player_crop_index.json",
             "vision_review_results.json",
+            "identity_stability_plan.json",
+            "identity_stability_applied.json",
         ],
     }
     manifest["validation"] = validate_final_render_identity_manifest(manifest)

@@ -40,6 +40,11 @@ from src.identity.safe_apply import (
     apply_identity_resolution_plan_to_annotation_states,
     apply_identity_resolution_plan_to_raw_records,
 )
+from src.identity.stabilizer import (
+    apply_global_identity_stability_plan_to_annotation_states,
+    apply_global_identity_stability_plan_to_raw_records,
+    build_global_identity_stability_plan,
+)
 from src.team_assigner.team_assigner import TeamAssigner
 from src.trackers.tracker import Tracker
 from src.utils.annotation_colors import (
@@ -200,6 +205,8 @@ def _write_identity_artifacts(
     identity_review_decisions: Dict[str, Any],
     identity_resolution_plan: Dict[str, Any],
     identity_resolution_applied: Dict[str, Any],
+    identity_stability_plan: Dict[str, Any],
+    identity_stability_applied: Dict[str, Any],
     output_dir: Path,
 ) -> Dict[str, Path]:
     """Write identity debugging artifacts for offline review."""
@@ -220,6 +227,8 @@ def _write_identity_artifacts(
     identity_review_decisions_path = identity_dir / f"{job_id}_identity_review_decisions.json"
     identity_resolution_plan_path = identity_dir / f"{job_id}_identity_resolution_plan.json"
     identity_resolution_applied_path = identity_dir / f"{job_id}_identity_resolution_applied.json"
+    identity_stability_plan_path = identity_dir / f"{job_id}_identity_stability_plan.json"
+    identity_stability_applied_path = identity_dir / f"{job_id}_identity_stability_applied.json"
 
     _write_jsonl(raw_tracklets_path, raw_tracklet_records)
     identity_debug_path.write_text(
@@ -278,6 +287,14 @@ def _write_identity_artifacts(
         json.dumps(_json_safe(identity_resolution_applied), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    identity_stability_plan_path.write_text(
+        json.dumps(_json_safe(identity_stability_plan), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    identity_stability_applied_path.write_text(
+        json.dumps(_json_safe(identity_stability_applied), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     return {
         "raw_tracklets_jsonl": raw_tracklets_path,
@@ -295,6 +312,8 @@ def _write_identity_artifacts(
         "identity_review_decisions_json": identity_review_decisions_path,
         "identity_resolution_plan_json": identity_resolution_plan_path,
         "identity_resolution_applied_json": identity_resolution_applied_path,
+        "identity_stability_plan_json": identity_stability_plan_path,
+        "identity_stability_applied_json": identity_stability_applied_path,
     }
 
 
@@ -2153,6 +2172,49 @@ def run_batch_analysis(
             correction_applied["kept"] = False
         correction_applied["updated_annotation_track_count"] = 0
         render_audit_after = render_audit_before
+    identity_stability_plan = build_global_identity_stability_plan(raw_tracklet_records)
+    candidate_stability_records, identity_stability_applied = (
+        apply_global_identity_stability_plan_to_raw_records(
+            raw_tracklet_records,
+            identity_stability_plan,
+        )
+    )
+    if identity_stability_applied.get("status") == "applied":
+        candidate_stability_audit = build_render_identity_audit(
+            candidate_stability_records,
+            identity_debug,
+            baseline_image=RUNPOD_BASELINE_IMAGE,
+        )
+        if post_fix_audit_improved(render_audit_after, candidate_stability_audit):
+            raw_tracklet_records = candidate_stability_records
+            render_audit_after = candidate_stability_audit
+            identity_stability_applied["kept"] = True
+            identity_stability_applied["post_apply_audit_verdict"] = render_audit_after.get(
+                "verdict"
+            )
+            identity_stability_applied["post_apply_audit_score"] = render_audit_after.get(
+                "score"
+            )
+            identity_stability_applied["updated_annotation_track_count"] = (
+                apply_global_identity_stability_plan_to_annotation_states(
+                    annotation_states,
+                    identity_stability_plan,
+                )
+            )
+            warnings.append(
+                "Global identity stabilizer applied "
+                f"{identity_stability_applied['applied_action_count']} "
+                "safe role/team display lock(s)."
+            )
+        else:
+            identity_stability_applied["status"] = "rolled_back"
+            identity_stability_applied["kept"] = False
+            identity_stability_applied["rollback_reason"] = "post_apply_audit_not_improved"
+            identity_stability_applied["updated_annotation_track_count"] = 0
+    else:
+        identity_stability_applied["kept"] = False
+        identity_stability_applied["updated_annotation_track_count"] = 0
+    identity_events = build_identity_events(raw_tracklet_records, render_audit_after)
     vision_review_queue = build_vision_review_queue(
         correction_plan=correction_plan,
         render_audit_before=render_audit_before,
@@ -2441,6 +2503,28 @@ def run_batch_analysis(
                 "validation",
                 {},
             ),
+            "identity_stability_phase": identity_stability_plan.get("phase"),
+            "identity_stability_summary": identity_stability_plan.get("summary", {}),
+            "identity_stability_status": identity_stability_applied.get("status"),
+            "identity_stability_applied_summary": {
+                "applied_action_count": identity_stability_applied.get(
+                    "applied_action_count",
+                    0,
+                ),
+                "updated_record_count": identity_stability_applied.get(
+                    "updated_record_count",
+                    0,
+                ),
+                "updated_annotation_track_count": identity_stability_applied.get(
+                    "updated_annotation_track_count",
+                    0,
+                ),
+                "kept": identity_stability_applied.get("kept", False),
+            },
+            "identity_stability_validation": identity_stability_applied.get(
+                "validation",
+                {},
+            ),
             "crop_evidence_prepared": bool(vision_evidence_paths.get("player_crop_index_json")),
         }
     )
@@ -2461,6 +2545,8 @@ def run_batch_analysis(
         identity_review_decisions=identity_review_decisions,
         identity_resolution_plan=identity_resolution_plan,
         identity_resolution_applied=identity_resolution_applied,
+        identity_stability_plan=identity_stability_plan,
+        identity_stability_applied=identity_stability_applied,
         output_dir=output_root,
     )
     report_paths.update(identity_paths)
@@ -2483,6 +2569,8 @@ def run_batch_analysis(
         "identity_review_decisions_json": {"local_path": str(report_paths["identity_review_decisions_json"]), "content_type": "application/json"},
         "identity_resolution_plan_json": {"local_path": str(report_paths["identity_resolution_plan_json"]), "content_type": "application/json"},
         "identity_resolution_applied_json": {"local_path": str(report_paths["identity_resolution_applied_json"]), "content_type": "application/json"},
+        "identity_stability_plan_json": {"local_path": str(report_paths["identity_stability_plan_json"]), "content_type": "application/json"},
+        "identity_stability_applied_json": {"local_path": str(report_paths["identity_stability_applied_json"]), "content_type": "application/json"},
         "player_crop_index_json": {"local_path": str(report_paths["player_crop_index_json"]), "content_type": "application/json"},
         "vision_contact_sheets_zip": {"local_path": str(report_paths["vision_contact_sheets_zip"]), "content_type": "application/zip"},
     }
