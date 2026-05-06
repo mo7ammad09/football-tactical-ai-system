@@ -41,6 +41,10 @@ IDENTITY_REVIEW_OUTPUT_SCHEMA = {
                 "different_player",
                 "goalkeeper",
                 "not_goalkeeper",
+                "player",
+                "referee",
+                "team_1",
+                "team_2",
                 "unresolved",
             ],
         },
@@ -87,6 +91,12 @@ def _compact_crop_evidence(crop_case: dict[str, Any]) -> list[dict[str, Any]]:
                 "detected_role": crop.get("detected_role"),
                 "display_label": crop.get("display_label"),
                 "display_role": crop.get("display_role"),
+                "display_team": crop.get("display_team"),
+                "team": crop.get("team"),
+                "team_color": crop.get("team_color"),
+                "display_color": crop.get("display_color"),
+                "bbox": crop.get("bbox"),
+                "confidence": crop.get("confidence"),
                 "crop_path": crop.get("crop_path"),
             }
         )
@@ -104,6 +114,22 @@ def _case_prompt(case: dict[str, Any], crop_case: dict[str, Any]) -> str:
             "the same real goalkeeper. Return only JSON matching the schema. "
             "Use same_player only when visual evidence is strong; otherwise "
             "return unresolved."
+        )
+    if question == "team_assignment_uncertain":
+        return (
+            "Review the audit evidence, crop metadata, and contact sheet for case "
+            f"{case_id}. Decide whether the track has strong evidence for team_1 "
+            "or team_2. Do not treat KMeans/team counts as ground truth when they "
+            "are split or weak. Return team_1 or team_2 only when evidence is "
+            "strong; otherwise return unresolved."
+        )
+    if question == "role_stability_flicker":
+        return (
+            "Review the audit evidence, crop metadata, and contact sheet for case "
+            f"{case_id}. Decide whether the visible role should be player, "
+            "referee, goalkeeper, or unresolved. Treat isolated flicker as "
+            "uncertain unless neighboring metadata and visual evidence strongly "
+            "support one role."
         )
     return (
         f"Review identity case {case_id}. Decide only the requested identity "
@@ -162,6 +188,8 @@ def build_identity_model_review_request(
                 "contact_sheet_path": crop_case.get("contact_sheet_path"),
                 "crop_count": len(crop_evidence),
                 "target_count": _as_int(crop_case.get("target_count"), 0),
+                "reason": case.get("reason"),
+                "audit_evidence": case.get("audit_evidence", {}),
                 "crop_evidence": crop_evidence,
                 "output_schema": IDENTITY_REVIEW_OUTPUT_SCHEMA,
             }
@@ -189,8 +217,10 @@ def _case_payload_for_prompt(case: dict[str, Any]) -> dict[str, Any]:
         "case_id": case.get("case_id"),
         "question": case.get("question"),
         "priority": case.get("priority"),
+        "reason": case.get("reason"),
         "crop_count": case.get("crop_count"),
         "target_count": case.get("target_count"),
+        "audit_evidence": case.get("audit_evidence", {}),
         "crop_evidence": case.get("crop_evidence", []),
     }
 
@@ -204,7 +234,7 @@ def _google_prompt(case: dict[str, Any]) -> str:
         "Decide only the identity question in this one case.\n"
         "Return exactly one JSON object. No markdown. No extra text.\n"
         "Allowed verdict values: same_player, different_player, goalkeeper, "
-        "not_goalkeeper, unresolved.\n"
+        "not_goalkeeper, player, referee, team_1, team_2, unresolved.\n"
         "Use unresolved when the evidence is weak, cropped poorly, or ambiguous.\n"
         "Do not rename track IDs. Do not change render colors.\n\n"
         f"Required JSON schema:\n{schema}\n\n"

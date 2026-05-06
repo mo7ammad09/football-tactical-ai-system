@@ -449,6 +449,68 @@ def test_phase4_skips_vision_case_when_source_issue_was_fixed():
     assert queue["cases"] == []
 
 
+def test_phase4_queues_unresolved_team_and_role_audit_issues_for_model_review():
+    rows = []
+    rows.extend(_row(18, 18, sample, sample * 10, "player", 1) for sample in range(1, 7))
+    rows.extend(_row(18, 18, sample, sample * 10, "player", 2) for sample in range(7, 12))
+    rows.extend(
+        _row(
+            20,
+            20,
+            sample,
+            sample * 10,
+            "player",
+            1,
+            display_role="player",
+            display_team=1,
+        )
+        for sample in range(1, 5)
+    )
+    rows.append(
+        _row(
+            20,
+            20,
+            5,
+            50,
+            "player",
+            1,
+            display_role="referee",
+            display_team=1,
+        )
+    )
+    rows.extend(
+        _row(
+            20,
+            20,
+            sample,
+            sample * 10,
+            "player",
+            1,
+            display_role="player",
+            display_team=1,
+        )
+        for sample in range(6, 10)
+    )
+
+    audit = build_render_identity_audit(rows)
+    queue = build_vision_review_queue(
+        correction_plan={"needs_vision": []},
+        render_audit_before=audit,
+        render_audit_after=audit,
+        correction_applied={"correction_applied": True},
+    )
+
+    questions = {case["question"] for case in queue["cases"]}
+    assert "team_assignment_uncertain" in questions
+    assert "role_stability_flicker" in questions
+    team_case = next(
+        case for case in queue["cases"] if case["question"] == "team_assignment_uncertain"
+    )
+    assert team_case["source_issue_id"] == "display_team_uncertain_18"
+    assert team_case["audit_evidence"]["player_team_counts"] == {"1": 6, "2": 5}
+    assert "identity_stability_plan.json" in team_case["required_artifacts"]
+
+
 def test_phase5_crop_index_plan_targets_queued_goalkeeper_segments():
     rows = [
         _row(

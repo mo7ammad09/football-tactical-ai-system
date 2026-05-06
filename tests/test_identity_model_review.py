@@ -59,6 +59,58 @@ def test_phase11_builds_provider_neutral_model_review_request():
     ]
 
 
+def test_phase11_includes_audit_evidence_for_team_uncertain_review_cases():
+    request = build_identity_model_review_request(
+        vision_review_queue={
+            "cases": [
+                {
+                    "case_id": "review_display_team_uncertain_18",
+                    "question": "team_assignment_uncertain",
+                    "priority": "high",
+                    "reason": "Rendered team flickers on a player-dominant track.",
+                    "audit_evidence": {
+                        "track_id": 18,
+                        "visible_team_counts": {"1": 145, "2": 141},
+                        "player_team_confidence": 0.5069,
+                    },
+                }
+            ]
+        },
+        player_crop_index={
+            "cases": [
+                {
+                    "case_id": "review_display_team_uncertain_18",
+                    "contact_sheet_path": "/tmp/team.jpg",
+                    "target_count": 1,
+                    "crop_requests": [
+                        {
+                            "crop_id": "c1",
+                            "track_id": 18,
+                            "source_frame_idx": 120,
+                            "team": 1,
+                            "display_team": 2,
+                            "team_color": [27, 35, 31],
+                            "display_color": [0, 0, 0],
+                            "confidence": 0.82,
+                            "crop_path": "/tmp/c1.jpg",
+                        }
+                    ],
+                }
+            ]
+        },
+        provider="google_gemma_api",
+        model="gemma-test",
+    )
+
+    case = request["cases"][0]
+    assert case["status"] == "ready_for_model_review"
+    assert case["audit_evidence"]["track_id"] == 18
+    assert "team_1" in case["prompt"]
+    assert "team_1" in case["output_schema"]["properties"]["verdict"]["enum"]
+    assert case["crop_evidence"][0]["display_team"] == 2
+    assert case["crop_evidence"][0]["team_color"] == [27, 35, 31]
+
+
 def test_phase11_normalizes_model_outputs_from_string_and_dict():
     outputs = normalize_identity_review_model_outputs(
         '{"results": [{"case_id": "case-1", "verdict": "same_player"}]}'

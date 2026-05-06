@@ -26,6 +26,10 @@ VISION_REVIEW_VERDICTS = {
     "different_player",
     "goalkeeper",
     "not_goalkeeper",
+    "player",
+    "referee",
+    "team_1",
+    "team_2",
     "unresolved",
 }
 VISION_REVIEW_STATUSES = {
@@ -1141,6 +1145,7 @@ def build_vision_review_queue(
     render_audit_after = render_audit_after or render_audit_before
     correction_applied = correction_applied or {}
     cases: list[dict[str, Any]] = []
+    seen_case_ids: set[str] = set()
 
     unresolved_issue_ids = {
         str(issue.get("issue_id"))
@@ -1159,9 +1164,13 @@ def build_vision_review_queue(
             required_artifacts.append("player_crop_index.json")
         if "contact_sheets" not in required_artifacts:
             required_artifacts.append("contact_sheets")
+        case_id = str(item.get("case_id") or item.get("candidate_id") or "unknown_case")
+        if case_id in seen_case_ids:
+            continue
+        seen_case_ids.add(case_id)
         cases.append(
             {
-                "case_id": item.get("case_id") or item.get("candidate_id"),
+                "case_id": case_id,
                 "source_issue_id": source_issue_id or None,
                 "question": question,
                 "priority": priority,
@@ -1175,13 +1184,58 @@ def build_vision_review_queue(
             }
         )
 
+    audit_review_question_by_issue_type = {
+        "display_team_uncertain": "team_assignment_uncertain",
+        "display_team_flicker": "team_assignment_uncertain",
+        "display_role_flicker": "role_stability_flicker",
+    }
+    for issue in render_audit_after.get("issues", []) or []:
+        if not isinstance(issue, dict):
+            continue
+        issue_id = str(issue.get("issue_id") or "")
+        issue_type = str(issue.get("issue_type") or "")
+        question = audit_review_question_by_issue_type.get(issue_type)
+        if not issue_id or question is None:
+            continue
+        case_id = f"review_{issue_id}"
+        if case_id in seen_case_ids:
+            continue
+        seen_case_ids.add(case_id)
+        required_artifacts = [
+            "player_crop_index.json",
+            "contact_sheets",
+            "render_audit_after.json",
+            "identity_stability_plan.json",
+        ]
+        cases.append(
+            {
+                "case_id": case_id,
+                "source_issue_id": issue_id,
+                "question": question,
+                "priority": "high" if str(issue.get("severity")) == "high" else "medium",
+                "status": "pending_vision",
+                "reason": issue.get("reason"),
+                "required_artifacts": required_artifacts,
+                "audit_evidence": _compact_audit_issue_for_review(issue),
+                "instructions": (
+                    "Review this unresolved render-audit issue using numeric evidence "
+                    "first and crops/contact sheets only as supporting evidence. "
+                    "Return unresolved when team, role, or identity evidence is weak."
+                ),
+            }
+        )
+
     if (
         correction_applied.get("candidate_correction_applied")
         and not correction_applied.get("correction_applied")
     ):
+        case_id = "rollback_post_fix_audit_not_improved"
+        if case_id in seen_case_ids:
+            case_id = "rollback_post_fix_audit_not_improved_duplicate"
+        seen_case_ids.add(case_id)
         cases.append(
             {
-                "case_id": "rollback_post_fix_audit_not_improved",
+                "case_id": case_id,
                 "source_issue_id": None,
                 "question": "review_rollback_reason",
                 "priority": "high",
@@ -1219,6 +1273,35 @@ def build_vision_review_queue(
             "This queue prepares Vision-on-demand; it does not run a vision model.",
             "Only unresolved or unsafe cases should enter this queue.",
         ],
+    }
+
+
+def _compact_audit_issue_for_review(issue: dict[str, Any]) -> dict[str, Any]:
+    """Return compact numeric issue evidence for model/human review."""
+    allowed_keys = {
+        "issue_id",
+        "issue_type",
+        "severity",
+        "title",
+        "reason",
+        "track_id",
+        "raw_track_id",
+        "frames_seen",
+        "first_source_frame_idx",
+        "last_source_frame_idx",
+        "dominant_raw_role",
+        "raw_role_confidence",
+        "display_role_transition_count",
+        "display_team_transition_count",
+        "visible_role_counts",
+        "visible_team_counts",
+        "player_team_counts",
+        "player_team_confidence",
+    }
+    return {
+        key: issue.get(key)
+        for key in allowed_keys
+        if key in issue
     }
 
 
@@ -1399,6 +1482,8 @@ def build_player_crop_index_plan(
                         "display_label": _visible_label(row),
                         "display_role": _visible_role(row),
                         "display_team": _visible_team(row),
+                        "team_color": row.get("team_color"),
+                        "display_color": row.get("display_color"),
                         "confidence": row.get("confidence"),
                         "crop_path": None,
                     }
@@ -1460,6 +1545,11 @@ def _vision_evidence_for_case(crop_case: dict[str, Any]) -> list[dict[str, Any]]
                 "detected_role": crop.get("detected_role"),
                 "display_label": crop.get("display_label"),
                 "display_role": crop.get("display_role"),
+                "display_team": crop.get("display_team"),
+                "team": crop.get("team"),
+                "team_color": crop.get("team_color"),
+                "display_color": crop.get("display_color"),
+                "confidence": crop.get("confidence"),
             }
         )
     return evidence
