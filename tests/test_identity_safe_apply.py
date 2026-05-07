@@ -1,4 +1,9 @@
-from src.identity.resolver import MERGE_GOALKEEPER_ACTION, READY_STATUS
+from src.identity.resolver import (
+    LOCK_DISPLAY_ROLE_ACTION,
+    LOCK_DISPLAY_TEAM_ACTION,
+    MERGE_GOALKEEPER_ACTION,
+    READY_STATUS,
+)
 from src.identity.safe_apply import (
     apply_identity_resolution_plan_to_annotation_states,
     apply_identity_resolution_plan_to_raw_records,
@@ -163,3 +168,94 @@ def test_phase10_validator_rejects_invalid_phase9_plan():
     assert "phase9_resolution_plan_failed_validation" in validation[
         "rejected_proposals"
     ][0]["reasons"]
+
+
+def test_phase10_applies_display_team_lock_to_raw_and_annotation_rows():
+    plan = {
+        "validation": {"verdict": "PASS"},
+        "resolution_proposals": [
+            {
+                "proposal_id": "resolve_team_16",
+                "case_id": "review_display_team_flicker_16",
+                "status": READY_STATUS,
+                "proposed_action": LOCK_DISPLAY_TEAM_ACTION,
+                "confidence": 0.95,
+                "target_track_ids": [16],
+                "evidence": {
+                    "vision_status": "reviewed",
+                    "vision_verdict": "team_2",
+                    "target_display_team": 2,
+                },
+                "apply_policy": {
+                    "dry_run_only": True,
+                    "requires_safe_apply_validator": True,
+                    "display_only": True,
+                },
+            }
+        ],
+    }
+    rows, applied = apply_identity_resolution_plan_to_raw_records(
+        [
+            {"track_id": 16, "team": 2, "team_color": [240, 240, 240]},
+            {"track_id": 16, "team": 1, "team_color": [20, 20, 20]},
+            {"track_id": 7, "team": 1, "team_color": [20, 20, 20]},
+        ],
+        plan,
+    )
+
+    assert applied["safe_apply_status"] == "applied"
+    assert applied["updated_record_count"] == 2
+    assert rows[0]["display_team"] == 2
+    assert rows[1]["display_team"] == 2
+    assert rows[1]["display_color"] == [240, 240, 240]
+    assert rows[2].get("display_team") is None
+
+    states = [{"players": {16: {"team_color": (240, 240, 240)}}}]
+    updated = apply_identity_resolution_plan_to_annotation_states(states, plan)
+
+    assert updated == 1
+    assert states[0]["players"][16]["display_team"] == 2
+
+
+def test_phase10_applies_display_role_lock_to_player_rows():
+    plan = {
+        "validation": {"verdict": "PASS"},
+        "resolution_proposals": [
+            {
+                "proposal_id": "resolve_role_24",
+                "case_id": "review_display_role_flicker_24",
+                "status": READY_STATUS,
+                "proposed_action": LOCK_DISPLAY_ROLE_ACTION,
+                "confidence": 1.0,
+                "target_track_ids": [24],
+                "evidence": {
+                    "vision_status": "reviewed",
+                    "vision_verdict": "player",
+                    "target_display_role": "player",
+                },
+                "apply_policy": {
+                    "dry_run_only": True,
+                    "requires_safe_apply_validator": True,
+                    "display_only": True,
+                },
+            }
+        ],
+    }
+    rows, applied = apply_identity_resolution_plan_to_raw_records(
+        [
+            {
+                "track_id": 24,
+                "role": "referee",
+                "display_role": "referee",
+                "team": 1,
+                "display_team": 0,
+                "team_color": [10, 10, 10],
+            }
+        ],
+        plan,
+    )
+
+    assert applied["safe_apply_status"] == "applied"
+    assert rows[0]["display_role"] == "player"
+    assert rows[0]["display_team"] == 1
+    assert rows[0]["display_color"] == [10, 10, 10]

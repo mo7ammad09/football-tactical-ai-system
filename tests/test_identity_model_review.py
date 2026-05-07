@@ -3,6 +3,7 @@ from src.identity.model_review import (
     invoke_identity_review_provider,
     normalize_identity_review_model_outputs,
     resolve_identity_review_model_config,
+    sanitize_provider_error_text,
 )
 
 
@@ -266,3 +267,60 @@ def test_phase11_google_gemma_missing_key_fails_closed(monkeypatch):
     assert result["status"] == "missing_api_key"
     assert result["model_outputs"][0]["verdict"] == "unresolved"
     assert "API key" in result["model_outputs"][0]["reason"]
+
+
+def test_phase11_sanitizes_google_provider_errors():
+    text = sanitize_provider_error_text(
+        "500 Server Error for url: "
+        "https://generativelanguage.googleapis.com/v1beta/models/gemma:generateContent"
+        "?key=AIzaSyDjbIjOuR8SJb_7Qq0rl3Lsq4ZWOmZE44c"
+    )
+
+    assert "AIza" not in text
+    assert "key=" not in text
+    assert "generativelanguage.googleapis.com/v1beta" not in text
+
+
+def test_phase11_retries_google_gemma_case_failures(monkeypatch):
+    request = {
+        "case_count": 1,
+        "cases": [
+            {
+                "case_id": "case-1",
+                "status": "ready_for_model_review",
+                "prompt": "review",
+            }
+        ],
+    }
+    calls = {"count": 0}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            raise RuntimeError(
+                "500 Server Error for url: "
+                "https://generativelanguage.googleapis.com/v1beta/models/gemma-test"
+                ":generateContent?key=AIzaSyDjbIjOuR8SJb_7Qq0rl3Lsq4ZWOmZE44c"
+            )
+
+    def fake_post(url, params, json, timeout):
+        calls["count"] += 1
+        return FakeResponse()
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+    monkeypatch.setenv("IDENTITY_REVIEW_PROVIDER_RETRIES", "2")
+    monkeypatch.setenv("IDENTITY_REVIEW_PROVIDER_RETRY_BACKOFF", "0")
+    monkeypatch.setattr("requests.post", fake_post)
+
+    result = invoke_identity_review_provider(
+        request=request,
+        provider="google_gemma_api",
+        model="gemma-test",
+        provider_enabled=True,
+        model_outputs=None,
+    )
+
+    assert calls["count"] == 2
+    output = result["model_outputs"][0]
+    assert output["verdict"] == "unresolved"
+    assert "AIza" not in output["reason"]
+    assert "key=" not in output["reason"]

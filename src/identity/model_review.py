@@ -11,6 +11,8 @@ import base64
 import json
 import mimetypes
 import os
+import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +28,10 @@ GOOGLE_GEMMA_PROVIDERS = {
 DEFAULT_GOOGLE_GEMMA_MODEL = "gemma-4-31b-it"
 GOOGLE_GENERATE_CONTENT_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+)
+PROVIDER_ERROR_REDACTION_PATTERNS = (
+    re.compile(r"key=[^&\s)]+"),
+    re.compile(r"AIza[0-9A-Za-z_\-]{20,}"),
 )
 
 IDENTITY_REVIEW_OUTPUT_SCHEMA = {
@@ -304,6 +310,33 @@ def _clamp_confidence(value: Any) -> float:
     return max(0.0, min(1.0, confidence))
 
 
+def sanitize_provider_error_text(value: Any) -> str:
+    """Return provider text safe to persist in public review artifacts."""
+    text = str(value or "")
+    for pattern in PROVIDER_ERROR_REDACTION_PATTERNS:
+        text = pattern.sub(
+            "key=REDACTED" if pattern.pattern.startswith("key=") else "API_KEY_REDACTED",
+            text,
+        )
+    # Requests HTTPError strings include the full URL; keep only the useful status.
+    text = re.sub(
+        r" for url: https://generativelanguage\.googleapis\.com/[^\s)]+",
+        " for Google Generative Language API",
+        text,
+    )
+    return text
+
+
+def _provider_failure_reason(exc: Exception, *, attempt: int, max_attempts: int) -> str:
+    """Return a sanitized, retry-aware failure reason for a provider exception."""
+    exc_name = exc.__class__.__name__
+    detail = sanitize_provider_error_text(exc)
+    return (
+        "Google Gemma API failed "
+        f"after attempt {attempt}/{max_attempts}: {exc_name}: {detail}"
+    )
+
+
 def _unresolved_provider_output(
     *,
     case_id: str,
@@ -316,7 +349,7 @@ def _unresolved_provider_output(
         "status": "reviewed",
         "verdict": "unresolved",
         "confidence": 0.0,
-        "reason": reason,
+        "reason": sanitize_provider_error_text(reason),
         "evidence": evidence or [],
     }
 
@@ -333,7 +366,7 @@ def _sanitize_provider_output(case_id: str, output: dict[str, Any]) -> dict[str,
         "status": "reviewed",
         "verdict": verdict,
         "confidence": _clamp_confidence(output.get("confidence")),
-        "reason": str(output.get("reason") or ""),
+        "reason": sanitize_provider_error_text(output.get("reason") or ""),
         "evidence": evidence if isinstance(evidence, list) else [],
     }
 
@@ -344,6 +377,7 @@ def _invoke_google_gemma_case(
     api_key: str,
     model: str,
     timeout_seconds: float,
+    max_attempts: int,
 ) -> dict[str, Any]:
     """Invoke Google's Gemma/Gemini API for one identity case."""
     import requests
@@ -361,29 +395,48 @@ def _invoke_google_gemma_case(
             "response_mime_type": "application/json",
         },
     }
-    try:
-        response = requests.post(
-            GOOGLE_GENERATE_CONTENT_URL.format(model=model),
-            params={"key": api_key},
-            json=request_payload,
-            timeout=timeout_seconds,
-        )
-        response.raise_for_status()
-        text = _extract_google_text(response.json())
-        parsed = _parse_json_object(text)
-        if parsed is None:
-            return _unresolved_provider_output(
-                case_id=case_id,
-                reason="Google Gemma API returned non-JSON output.",
-                evidence=[{"type": "raw_text", "text": text[:500]}] if text else [],
+    max_attempts = max(1, int(max_attempts))
+    retry_delay = float(os.environ.get("IDENTITY_REVIEW_PROVIDER_RETRY_BACKOFF", "1.5"))
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.post(
+                GOOGLE_GENERATE_CONTENT_URL.format(model=model),
+                params={"key": api_key},
+                json=request_payload,
+                timeout=timeout_seconds,
             )
-        return _sanitize_provider_output(case_id, parsed)
-    except Exception as exc:  # noqa: BLE001 - provider failures must fail closed.
-        return _unresolved_provider_output(
-            case_id=case_id,
-            reason=f"Google Gemma API failed: {exc}",
-            evidence=[{"type": "provider_error", "provider": GOOGLE_GEMMA_PROVIDER}],
-        )
+            response.raise_for_status()
+            text = _extract_google_text(response.json())
+            parsed = _parse_json_object(text)
+            if parsed is None:
+                return _unresolved_provider_output(
+                    case_id=case_id,
+                    reason="Google Gemma API returned non-JSON output.",
+                    evidence=[{"type": "raw_text", "text": text[:500]}] if text else [],
+                )
+            return _sanitize_provider_output(case_id, parsed)
+        except Exception as exc:  # noqa: BLE001 - provider failures must fail closed.
+            last_exc = exc
+            if attempt < max_attempts:
+                time.sleep(max(0.0, retry_delay * attempt))
+
+    reason = (
+        _provider_failure_reason(last_exc, attempt=max_attempts, max_attempts=max_attempts)
+        if last_exc is not None
+        else "Google Gemma API failed without a provider exception."
+    )
+    return _unresolved_provider_output(
+        case_id=case_id,
+        reason=reason,
+        evidence=[
+            {
+                "type": "provider_error",
+                "provider": GOOGLE_GEMMA_PROVIDER,
+                "attempt_count": max_attempts,
+            }
+        ],
+    )
 
 
 def invoke_identity_review_provider(
@@ -464,12 +517,14 @@ def invoke_identity_review_provider(
         }
 
     timeout_seconds = float(os.environ.get("IDENTITY_REVIEW_PROVIDER_TIMEOUT", "45"))
+    max_attempts = int(os.environ.get("IDENTITY_REVIEW_PROVIDER_RETRIES", "2"))
     outputs = [
         _invoke_google_gemma_case(
             case=case,
             api_key=api_key,
             model=model_name,
             timeout_seconds=timeout_seconds,
+            max_attempts=max_attempts,
         )
         for case in cases
     ]

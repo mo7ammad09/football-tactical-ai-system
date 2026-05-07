@@ -1,4 +1,7 @@
 from src.identity.resolver import (
+    LOCK_DISPLAY_ROLE_ACTION,
+    LOCK_DISPLAY_TEAM_ACTION,
+    MARK_SEGMENT_SPLIT_REQUIRED_ACTION,
     MERGE_GOALKEEPER_ACTION,
     READY_STATUS,
     build_identity_resolution_plan,
@@ -228,3 +231,144 @@ def test_identity_resolution_validator_rejects_unsafe_ready_merge():
     assert "goalkeeper_merge_requires_model_evidence" in validation[
         "rejected_proposals"
     ][0]["reasons"]
+
+
+def test_identity_resolver_proposes_safe_display_team_lock():
+    decisions = {"render_safe": False, "decisions": []}
+    queue = {
+        "cases": [
+            {
+                "case_id": "review_display_team_flicker_16",
+                "question": "team_assignment_uncertain",
+                "audit_evidence": {
+                    "issue_type": "display_team_flicker",
+                    "track_id": 16,
+                    "player_team_counts": {"2": 415, "1": 23},
+                    "player_team_confidence": 0.947,
+                    "max_minor_player_team_segment_ratio": 0.052,
+                    "max_minor_player_team_segment_frames": 23,
+                    "raw_role_confidence": 1.0,
+                },
+            }
+        ]
+    }
+    results = {
+        "vision_model_invoked": True,
+        "results": [
+            {
+                "case_id": "review_display_team_flicker_16",
+                "question": "team_assignment_uncertain",
+                "status": "reviewed",
+                "verdict": "team_2",
+                "confidence": 0.95,
+                "evidence": [{"track_id": 16, "source_frame_idx": 210}],
+                "model_evidence": [{"claim": "light kit throughout"}],
+            }
+        ],
+    }
+
+    plan = build_identity_resolution_plan(
+        identity_review_decisions=decisions,
+        vision_review_queue=queue,
+        vision_review_results=results,
+    )
+
+    assert plan["validation"]["verdict"] == "PASS"
+    assert plan["summary"]["ready_for_safe_apply_count"] == 1
+    proposal = plan["resolution_proposals"][0]
+    assert proposal["status"] == READY_STATUS
+    assert proposal["proposed_action"] == LOCK_DISPLAY_TEAM_ACTION
+    assert proposal["target_track_ids"] == [16]
+    assert proposal["evidence"]["target_display_team"] == 2
+
+
+def test_identity_resolver_defers_team_lock_when_model_detects_track_switch():
+    decisions = {"render_safe": False, "decisions": []}
+    queue = {
+        "cases": [
+            {
+                "case_id": "review_display_team_flicker_7",
+                "question": "team_assignment_uncertain",
+                "audit_evidence": {
+                    "issue_type": "display_team_flicker",
+                    "track_id": 7,
+                    "player_team_counts": {"2": 252, "1": 136},
+                    "player_team_confidence": 0.649,
+                    "max_minor_player_team_segment_ratio": 0.35,
+                    "max_minor_player_team_segment_frames": 136,
+                    "raw_role_confidence": 1.0,
+                },
+            }
+        ]
+    }
+    results = {
+        "vision_model_invoked": True,
+        "results": [
+            {
+                "case_id": "review_display_team_flicker_7",
+                "question": "team_assignment_uncertain",
+                "status": "reviewed",
+                "verdict": "unresolved",
+                "confidence": 1.0,
+                "reason": "The track contains a track switch between different players.",
+                "evidence": [{"track_id": 7, "source_frame_idx": 1240}],
+                "model_evidence": [{"claim": "track switch"}],
+            }
+        ],
+    }
+
+    plan = build_identity_resolution_plan(
+        identity_review_decisions=decisions,
+        vision_review_queue=queue,
+        vision_review_results=results,
+    )
+
+    proposal = plan["resolution_proposals"][0]
+    assert proposal["status"] == "deferred_needs_evidence"
+    assert proposal["proposal_type"] == "segment_split_required"
+    assert proposal["proposed_action"] == MARK_SEGMENT_SPLIT_REQUIRED_ACTION
+    assert plan["summary"]["segment_split_required_count"] == 1
+
+
+def test_identity_resolver_proposes_safe_display_role_lock():
+    decisions = {"render_safe": False, "decisions": []}
+    queue = {
+        "cases": [
+            {
+                "case_id": "review_display_role_flicker_24",
+                "question": "role_stability_flicker",
+                "audit_evidence": {
+                    "issue_type": "display_role_flicker",
+                    "track_id": 24,
+                    "dominant_raw_role": "player",
+                    "raw_role_confidence": 0.996,
+                    "max_minor_raw_role_segment_frames": 1,
+                },
+            }
+        ]
+    }
+    results = {
+        "vision_model_invoked": True,
+        "results": [
+            {
+                "case_id": "review_display_role_flicker_24",
+                "question": "role_stability_flicker",
+                "status": "reviewed",
+                "verdict": "player",
+                "confidence": 1.0,
+                "evidence": [{"track_id": 24, "source_frame_idx": 140}],
+                "model_evidence": [{"claim": "isolated referee flicker"}],
+            }
+        ],
+    }
+
+    plan = build_identity_resolution_plan(
+        identity_review_decisions=decisions,
+        vision_review_queue=queue,
+        vision_review_results=results,
+    )
+
+    proposal = plan["resolution_proposals"][0]
+    assert proposal["status"] == READY_STATUS
+    assert proposal["proposed_action"] == LOCK_DISPLAY_ROLE_ACTION
+    assert proposal["evidence"]["target_display_role"] == "player"

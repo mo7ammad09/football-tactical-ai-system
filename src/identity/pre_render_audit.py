@@ -6,6 +6,8 @@ from collections import Counter, defaultdict
 from copy import deepcopy
 from typing import Any, Iterable
 
+from src.identity.model_review import sanitize_provider_error_text
+
 
 RUNPOD_BASELINE_IMAGE = "ghcr.io/mo7ammad09/football-tactical-ai-runpod:sha-bbe8dec"
 KNOWN_BAD_RUNPOD_IMAGES = [
@@ -303,6 +305,11 @@ def _build_source_profiles(rows: list[dict[str, Any]]) -> dict[int, dict[str, An
         detected_roles = Counter(_detected_role(row) for row in ordered)
         visible_roles = Counter(_visible_role(row) for row in ordered)
         visible_labels = Counter(_visible_label(row) for row in ordered)
+        identity_resolution_actions = Counter(
+            str(row.get("identity_resolution_action") or "")
+            for row in ordered
+            if row.get("identity_resolution_status") == "phase10_safe_applied"
+        )
         teams = Counter(_as_int(row.get("team")) for row in ordered)
         visible_teams = Counter(_visible_team(row) for row in ordered)
         player_teams = Counter(
@@ -381,6 +388,13 @@ def _build_source_profiles(rows: list[dict[str, Any]]) -> dict[int, dict[str, An
             "detected_role_counts": _counter_dict(detected_roles),
             "visible_role_counts": _counter_dict(visible_roles),
             "visible_label_counts": _counter_dict(visible_labels),
+            "identity_resolution_action_counts": _counter_dict(identity_resolution_actions),
+            "phase10_display_team_lock_count": int(
+                identity_resolution_actions.get("lock_display_team", 0)
+            ),
+            "phase10_display_role_lock_count": int(
+                identity_resolution_actions.get("lock_display_role", 0)
+            ),
             "team_counts": _counter_dict(teams),
             "visible_team_counts": _counter_dict(visible_teams),
             "player_team_counts": _counter_dict(player_teams),
@@ -647,6 +661,9 @@ def build_render_identity_audit(
         max_minor_player_team_segment_ratio = _as_float(
             profile.get("max_minor_player_team_segment_ratio")
         )
+        phase10_team_lock_resolved = (
+            _as_int(profile.get("phase10_display_team_lock_count"), 0) >= frames_seen
+        )
 
         if (
             dominant_raw_role == "player"
@@ -752,6 +769,7 @@ def build_render_identity_audit(
             and raw_role_confidence >= 0.65
             and display_team_transitions == 0
             and len(player_team_count_values) > 1
+            and not phase10_team_lock_resolved
             and (
                 player_team_confidence < 0.85
                 or max_minor_player_team_segment > 12
@@ -1866,7 +1884,7 @@ def _sanitize_model_output(output: dict[str, Any]) -> dict[str, Any]:
         "status": status,
         "verdict": verdict,
         "confidence": confidence,
-        "reason": str(output.get("reason") or ""),
+        "reason": sanitize_provider_error_text(output.get("reason") or ""),
         "model_evidence": output.get("evidence") if isinstance(output.get("evidence"), list) else [],
         "raw_output": output,
     }

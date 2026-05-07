@@ -2344,10 +2344,29 @@ def run_batch_analysis(
                     identity_resolution_plan,
                 )
             )
+            rendered_frames = _render_smooth_review_video(
+                tracker=tracker,
+                video_path=video_path,
+                output_path=output_path,
+                annotation_states=annotation_states,
+                output_fps=resolved_output_fps,
+                resize_width=int(resize_width),
+                max_source_frame_idx=max_source_frame_idx,
+            )
+            if rendered_frames == 0:
+                raise ValueError(f"Could not re-render output video after Phase 10: {output_path}")
+            final_render_identity_manifest = build_final_render_identity_manifest(
+                render_audit_after=render_audit_after,
+                correction_applied=correction_applied,
+                vision_review_queue=vision_review_queue,
+                vision_review_results=vision_review_results,
+                rendered_output_frames=rendered_frames,
+                baseline_image=RUNPOD_BASELINE_IMAGE,
+            )
             warnings.append(
                 "Phase 10 identity safe apply recorded "
                 f"{identity_resolution_applied['applied_proposal_count']} "
-                "validated resolution proposal(s)."
+                "validated resolution proposal(s) and re-rendered the video."
             )
         else:
             identity_resolution_applied["safe_apply_status"] = "rolled_back"

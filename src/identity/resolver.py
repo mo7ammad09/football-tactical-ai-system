@@ -17,10 +17,19 @@ BLOCKED_STATUS = "blocked_render_not_safe"
 
 MERGE_GOALKEEPER_ACTION = "merge_goalkeeper_display_ids"
 MERGE_CANDIDATE_ACTION = "merge_candidate_identity_link"
+LOCK_DISPLAY_TEAM_ACTION = "lock_display_team"
+LOCK_DISPLAY_ROLE_ACTION = "lock_display_role"
+MARK_SEGMENT_SPLIT_REQUIRED_ACTION = "mark_segment_split_required"
 KEEP_UNRESOLVED_ACTION = "keep_unresolved_no_identity_mutation"
 REJECT_MERGE_ACTION = "reject_identity_merge"
 
-READY_ACTIONS = {MERGE_GOALKEEPER_ACTION, MERGE_CANDIDATE_ACTION}
+DISPLAY_LOCK_ACTIONS = {LOCK_DISPLAY_TEAM_ACTION, LOCK_DISPLAY_ROLE_ACTION}
+READY_ACTIONS = {
+    MERGE_GOALKEEPER_ACTION,
+    MERGE_CANDIDATE_ACTION,
+    LOCK_DISPLAY_TEAM_ACTION,
+    LOCK_DISPLAY_ROLE_ACTION,
+}
 VALID_STATUSES = {
     READY_STATUS,
     DEFERRED_STATUS,
@@ -30,9 +39,30 @@ VALID_STATUSES = {
 VALID_ACTIONS = {
     MERGE_GOALKEEPER_ACTION,
     MERGE_CANDIDATE_ACTION,
+    LOCK_DISPLAY_TEAM_ACTION,
+    LOCK_DISPLAY_ROLE_ACTION,
+    MARK_SEGMENT_SPLIT_REQUIRED_ACTION,
     KEEP_UNRESOLVED_ACTION,
     REJECT_MERGE_ACTION,
 }
+
+MIN_DISPLAY_LOCK_MODEL_CONFIDENCE = 0.90
+MIN_SAFE_TEAM_EVIDENCE_CONFIDENCE = 0.88
+MIN_SAFE_ROLE_EVIDENCE_CONFIDENCE = 0.98
+MAX_SAFE_MINOR_TEAM_SEGMENT_RATIO = 0.12
+MAX_SAFE_MINOR_TEAM_SEGMENT_FRAMES = 30
+MAX_SAFE_MINOR_ROLE_SEGMENT_FRAMES = 2
+SEGMENT_SPLIT_REASON_KEYWORDS = (
+    "different player",
+    "different people",
+    "different identities",
+    "multiple different identities",
+    "not following a single individual",
+    "track switch",
+    "track has merged",
+    "track merge",
+    "merged two different",
+)
 
 
 def _as_int(value: Any, fallback: int = 0) -> int:
@@ -49,6 +79,154 @@ def _as_float(value: Any, fallback: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return fallback
+
+
+def _target_team_from_verdict(verdict: str) -> int | None:
+    """Return team id for a model team verdict."""
+    if verdict == "team_1":
+        return 1
+    if verdict == "team_2":
+        return 2
+    return None
+
+
+def _looks_like_segment_split(vision_result: dict[str, Any]) -> bool:
+    """Return whether model text indicates one display track contains identities."""
+    reason = str(vision_result.get("reason") or "").lower()
+    return any(keyword in reason for keyword in SEGMENT_SPLIT_REASON_KEYWORDS)
+
+
+def _audit_evidence(queue_case: dict[str, Any]) -> dict[str, Any]:
+    """Return audit evidence attached to a review queue case."""
+    evidence = queue_case.get("audit_evidence")
+    return evidence if isinstance(evidence, dict) else {}
+
+
+def _target_track_id(
+    *,
+    queue_case: dict[str, Any],
+    vision_result: dict[str, Any],
+    crop_case: dict[str, Any],
+) -> int | None:
+    """Return the single target track for display-only proposals."""
+    audit_track_id = _as_int(_audit_evidence(queue_case).get("track_id"), -1)
+    if audit_track_id >= 0:
+        return audit_track_id
+    target_ids = _track_ids_from_evidence(vision_result, crop_case)
+    if len(target_ids) == 1:
+        return target_ids[0]
+    return None
+
+
+def _dominant_team_from_counts(counts: dict[str, Any]) -> int | None:
+    """Return dominant team id from a counts dictionary."""
+    parsed: list[tuple[int, int]] = []
+    for key, value in (counts or {}).items():
+        team = _as_int(key, 0)
+        count = _as_int(value, 0)
+        if team in {1, 2} and count > 0:
+            parsed.append((team, count))
+    if not parsed:
+        return None
+    parsed.sort(key=lambda item: item[1], reverse=True)
+    return parsed[0][0]
+
+
+def _model_evidence_count(vision_result: dict[str, Any]) -> int:
+    """Return model evidence count for a vision result."""
+    return len(vision_result.get("model_evidence") or [])
+
+
+def _display_lock_evidence_pack(
+    *,
+    question: str,
+    queue_case: dict[str, Any],
+    vision_result: dict[str, Any],
+    crop_case: dict[str, Any],
+    target_track_id: int,
+) -> dict[str, Any]:
+    """Build compact evidence for a display-only safe-apply proposal."""
+    audit = _audit_evidence(queue_case)
+    return {
+        "question": question,
+        "issue_type": audit.get("issue_type"),
+        "issue_id": audit.get("issue_id") or queue_case.get("source_issue_id"),
+        "priority": queue_case.get("priority") or vision_result.get("priority"),
+        "vision_status": vision_result.get("status"),
+        "vision_verdict": vision_result.get("verdict"),
+        "vision_confidence": _as_float(vision_result.get("confidence"), 0.0),
+        "contact_sheet_path": vision_result.get("contact_sheet_path")
+        or crop_case.get("contact_sheet_path"),
+        "crop_count": _as_int(
+            vision_result.get("crop_count"),
+            _as_int(crop_case.get("crop_request_count"), 0),
+        ),
+        "target_track_ids": [target_track_id],
+        "raw_track_ids": _raw_track_ids_from_evidence(vision_result, crop_case),
+        "frame_span": _frame_span_from_evidence(vision_result, crop_case),
+        "model_evidence_count": _model_evidence_count(vision_result),
+        "audit_evidence": audit,
+    }
+
+
+def _safe_team_lock_reason(
+    *,
+    queue_case: dict[str, Any],
+    vision_result: dict[str, Any],
+    target_team: int,
+) -> str | None:
+    """Return None when a team-lock proposal is safe enough to apply."""
+    audit = _audit_evidence(queue_case)
+    if audit.get("issue_type") != "display_team_flicker":
+        return "team_lock_only_handles_display_team_flicker"
+    if str(vision_result.get("status") or "") != "reviewed":
+        return "team_lock_requires_reviewed_model_result"
+    if _model_evidence_count(vision_result) <= 0:
+        return "team_lock_requires_model_evidence"
+    if _looks_like_segment_split(vision_result):
+        return "team_lock_blocked_by_segment_split_evidence"
+    if _as_float(vision_result.get("confidence"), 0.0) < MIN_DISPLAY_LOCK_MODEL_CONFIDENCE:
+        return "team_lock_requires_high_model_confidence"
+    if _dominant_team_from_counts(audit.get("player_team_counts") or {}) != target_team:
+        return "team_lock_requires_model_verdict_to_match_numeric_dominant_team"
+    if _as_float(audit.get("player_team_confidence"), 0.0) < MIN_SAFE_TEAM_EVIDENCE_CONFIDENCE:
+        return "team_lock_requires_strong_numeric_team_evidence"
+    if _as_float(audit.get("max_minor_player_team_segment_ratio"), 1.0) > MAX_SAFE_MINOR_TEAM_SEGMENT_RATIO:
+        return "team_lock_minor_segment_ratio_too_large"
+    if _as_int(audit.get("max_minor_player_team_segment_frames"), 999999) > MAX_SAFE_MINOR_TEAM_SEGMENT_FRAMES:
+        return "team_lock_minor_segment_too_long"
+    if _as_float(audit.get("raw_role_confidence"), 0.0) < 0.95:
+        return "team_lock_requires_stable_player_role"
+    return None
+
+
+def _safe_role_lock_reason(
+    *,
+    queue_case: dict[str, Any],
+    vision_result: dict[str, Any],
+    target_role: str,
+) -> str | None:
+    """Return None when a role-lock proposal is safe enough to apply."""
+    audit = _audit_evidence(queue_case)
+    if audit.get("issue_type") != "display_role_flicker":
+        return "role_lock_only_handles_visible_display_role_flicker"
+    if target_role not in {"player", "referee"}:
+        return "role_lock_rejects_goalkeeper_or_unknown_role"
+    if str(vision_result.get("status") or "") != "reviewed":
+        return "role_lock_requires_reviewed_model_result"
+    if _model_evidence_count(vision_result) <= 0:
+        return "role_lock_requires_model_evidence"
+    if _looks_like_segment_split(vision_result):
+        return "role_lock_blocked_by_segment_split_evidence"
+    if _as_float(vision_result.get("confidence"), 0.0) < MIN_DISPLAY_LOCK_MODEL_CONFIDENCE:
+        return "role_lock_requires_high_model_confidence"
+    if str(audit.get("dominant_raw_role") or "") != target_role:
+        return "role_lock_requires_model_verdict_to_match_numeric_dominant_role"
+    if _as_float(audit.get("raw_role_confidence"), 0.0) < MIN_SAFE_ROLE_EVIDENCE_CONFIDENCE:
+        return "role_lock_requires_stable_numeric_role_evidence"
+    if _as_int(audit.get("max_minor_raw_role_segment_frames"), 999999) > MAX_SAFE_MINOR_ROLE_SEGMENT_FRAMES:
+        return "role_lock_minor_segment_too_long"
+    return None
 
 
 def _case_id(value: dict[str, Any]) -> str:
@@ -104,7 +282,8 @@ def _review_case_ids(
         case_id = str(result.get("case_id") or "")
         if not case_id:
             continue
-        if str(result.get("verdict") or "") != "unresolved":
+        verdict = str(result.get("verdict") or "")
+        if verdict != "unresolved" or _looks_like_segment_split(result):
             case_ids.add(case_id)
     return sorted(case_ids)
 
@@ -314,6 +493,220 @@ def _build_candidate_link_proposal(decision: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _build_segment_split_required_proposal(
+    *,
+    case_id: str,
+    question: str,
+    queue_case: dict[str, Any],
+    vision_result: dict[str, Any],
+    crop_case: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a deferred proposal for tracks that appear internally mixed."""
+    target_track_id = _target_track_id(
+        queue_case=queue_case,
+        vision_result=vision_result,
+        crop_case=crop_case,
+    )
+    target_track_ids = [target_track_id] if target_track_id is not None else _track_ids_from_evidence(
+        vision_result,
+        crop_case,
+    )
+    evidence = _display_lock_evidence_pack(
+        question=question,
+        queue_case=queue_case,
+        vision_result=vision_result,
+        crop_case=crop_case,
+        target_track_id=target_track_ids[0] if target_track_ids else -1,
+    )
+    evidence["segment_split_reason"] = vision_result.get("reason")
+    return {
+        "proposal_id": f"resolve_{case_id}",
+        "case_id": case_id,
+        "proposal_type": "segment_split_required",
+        "status": DEFERRED_STATUS,
+        "proposed_action": MARK_SEGMENT_SPLIT_REQUIRED_ACTION,
+        "confidence": 0.0,
+        "target_track_ids": target_track_ids,
+        "reason": (
+            "Review evidence indicates this display track may contain multiple "
+            "identities; do not force one team or role across the whole track."
+        ),
+        "evidence": evidence,
+        "apply_policy": {
+            "dry_run_only": True,
+            "requires_safe_apply_validator": True,
+            "mutates_raw_tracklets": False,
+            "mutates_render_annotations": False,
+            "requires_segment_level_resolution": True,
+        },
+    }
+
+
+def _build_display_review_proposal(
+    *,
+    case_id: str,
+    question: str,
+    queue_case: dict[str, Any],
+    vision_result: dict[str, Any],
+    crop_case: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a proposal for team/role review cases."""
+    if _looks_like_segment_split(vision_result):
+        return _build_segment_split_required_proposal(
+            case_id=case_id,
+            question=question,
+            queue_case=queue_case,
+            vision_result=vision_result,
+            crop_case=crop_case,
+        )
+
+    verdict = str(vision_result.get("verdict") or "unresolved")
+    target_track_id = _target_track_id(
+        queue_case=queue_case,
+        vision_result=vision_result,
+        crop_case=crop_case,
+    )
+    if target_track_id is None:
+        return {
+            "proposal_id": f"resolve_{case_id}",
+            "case_id": case_id,
+            "proposal_type": question or "identity_review",
+            "status": DEFERRED_STATUS,
+            "proposed_action": KEEP_UNRESOLVED_ACTION,
+            "confidence": 0.0,
+            "target_track_ids": _track_ids_from_evidence(vision_result, crop_case),
+            "reason": "Display review case does not resolve to exactly one target track.",
+            "evidence": {
+                "question": question,
+                "vision_status": vision_result.get("status"),
+                "vision_verdict": vision_result.get("verdict"),
+            },
+            "apply_policy": {
+                "dry_run_only": True,
+                "requires_safe_apply_validator": True,
+                "mutates_raw_tracklets": False,
+                "mutates_render_annotations": False,
+            },
+        }
+
+    if question == "team_assignment_uncertain":
+        target_team = _target_team_from_verdict(verdict)
+        if target_team is not None:
+            block_reason = _safe_team_lock_reason(
+                queue_case=queue_case,
+                vision_result=vision_result,
+                target_team=target_team,
+            )
+            evidence = _display_lock_evidence_pack(
+                question=question,
+                queue_case=queue_case,
+                vision_result=vision_result,
+                crop_case=crop_case,
+                target_track_id=target_track_id,
+            )
+            evidence["target_display_team"] = target_team
+            return {
+                "proposal_id": f"resolve_{case_id}",
+                "case_id": case_id,
+                "proposal_type": "display_team_lock",
+                "status": READY_STATUS if block_reason is None else DEFERRED_STATUS,
+                "proposed_action": (
+                    LOCK_DISPLAY_TEAM_ACTION
+                    if block_reason is None
+                    else KEEP_UNRESOLVED_ACTION
+                ),
+                "confidence": (
+                    _as_float(vision_result.get("confidence"), 0.0)
+                    if block_reason is None
+                    else 0.0
+                ),
+                "target_track_ids": [target_track_id],
+                "reason": (
+                    "Model and numeric evidence support a safe display-team lock."
+                    if block_reason is None
+                    else block_reason
+                ),
+                "evidence": evidence,
+                "apply_policy": {
+                    "dry_run_only": True,
+                    "requires_safe_apply_validator": True,
+                    "mutates_raw_tracklets": False,
+                    "mutates_render_annotations": block_reason is None,
+                    "display_only": True,
+                },
+            }
+
+    if question == "role_stability_flicker" and verdict in {"player", "referee"}:
+        block_reason = _safe_role_lock_reason(
+            queue_case=queue_case,
+            vision_result=vision_result,
+            target_role=verdict,
+        )
+        evidence = _display_lock_evidence_pack(
+            question=question,
+            queue_case=queue_case,
+            vision_result=vision_result,
+            crop_case=crop_case,
+            target_track_id=target_track_id,
+        )
+        evidence["target_display_role"] = verdict
+        return {
+            "proposal_id": f"resolve_{case_id}",
+            "case_id": case_id,
+            "proposal_type": "display_role_lock",
+            "status": READY_STATUS if block_reason is None else DEFERRED_STATUS,
+            "proposed_action": (
+                LOCK_DISPLAY_ROLE_ACTION
+                if block_reason is None
+                else KEEP_UNRESOLVED_ACTION
+            ),
+            "confidence": (
+                _as_float(vision_result.get("confidence"), 0.0)
+                if block_reason is None
+                else 0.0
+            ),
+            "target_track_ids": [target_track_id],
+            "reason": (
+                "Model and numeric evidence support a safe display-role lock."
+                if block_reason is None
+                else block_reason
+            ),
+            "evidence": evidence,
+            "apply_policy": {
+                "dry_run_only": True,
+                "requires_safe_apply_validator": True,
+                "mutates_raw_tracklets": False,
+                "mutates_render_annotations": block_reason is None,
+                "display_only": True,
+            },
+        }
+
+    return {
+        "proposal_id": f"resolve_{case_id}",
+        "case_id": case_id,
+        "proposal_type": question or "identity_review",
+        "status": DEFERRED_STATUS,
+        "proposed_action": KEEP_UNRESOLVED_ACTION,
+        "confidence": 0.0,
+        "target_track_ids": [target_track_id],
+        "reason": "No safe display-lock resolver rule matched this review case.",
+        "evidence": {
+            "question": question,
+            "vision_status": vision_result.get("status"),
+            "vision_verdict": vision_result.get("verdict"),
+            "contact_sheet_path": vision_result.get("contact_sheet_path")
+            or crop_case.get("contact_sheet_path"),
+            "audit_evidence": _audit_evidence(queue_case),
+        },
+        "apply_policy": {
+            "dry_run_only": True,
+            "requires_safe_apply_validator": True,
+            "mutates_raw_tracklets": False,
+            "mutates_render_annotations": False,
+        },
+    }
+
+
 def validate_identity_resolution_plan(plan: dict[str, Any]) -> dict[str, Any]:
     """Validate a Phase 9 dry-run identity resolution plan."""
     rejected: list[dict[str, Any]] = []
@@ -365,14 +758,16 @@ def validate_identity_resolution_plan(plan: dict[str, Any]) -> dict[str, Any]:
             reasons.append("safe_apply_validator_required")
 
         if status == READY_STATUS:
-            if not render_safe:
+            if not render_safe and action not in DISPLAY_LOCK_ACTIONS:
                 reasons.append("ready_proposal_requires_render_safe")
             if action not in READY_ACTIONS:
-                reasons.append("ready_proposal_requires_merge_action")
+                reasons.append("ready_proposal_requires_ready_action")
             if confidence < 0.80:
                 reasons.append("ready_proposal_requires_high_confidence")
-            if len(set(target_track_ids)) < 2:
+            if action in {MERGE_GOALKEEPER_ACTION, MERGE_CANDIDATE_ACTION} and len(set(target_track_ids)) < 2:
                 reasons.append("ready_proposal_requires_multiple_target_tracks")
+            if action in DISPLAY_LOCK_ACTIONS and len(set(target_track_ids)) != 1:
+                reasons.append("display_lock_requires_one_target_track")
             if action == MERGE_GOALKEEPER_ACTION:
                 if evidence.get("vision_verdict") != "same_player":
                     reasons.append("goalkeeper_merge_requires_same_player_verdict")
@@ -380,6 +775,34 @@ def validate_identity_resolution_plan(plan: dict[str, Any]) -> dict[str, Any]:
                     reasons.append("goalkeeper_merge_requires_reviewed_status")
                 if _as_int(evidence.get("model_evidence_count"), 0) <= 0:
                     reasons.append("goalkeeper_merge_requires_model_evidence")
+            if action == LOCK_DISPLAY_TEAM_ACTION:
+                target_team = _as_int(evidence.get("target_display_team"), 0)
+                if target_team not in {1, 2}:
+                    reasons.append("team_lock_requires_target_display_team")
+                if evidence.get("vision_verdict") != f"team_{target_team}":
+                    reasons.append("team_lock_requires_matching_team_verdict")
+                if evidence.get("vision_status") != "reviewed":
+                    reasons.append("team_lock_requires_reviewed_status")
+                if _as_int(evidence.get("model_evidence_count"), 0) <= 0:
+                    reasons.append("team_lock_requires_model_evidence")
+                if not apply_policy.get("display_only"):
+                    reasons.append("team_lock_must_be_display_only")
+                if not apply_policy.get("mutates_render_annotations"):
+                    reasons.append("team_lock_must_mutate_render_annotations")
+            if action == LOCK_DISPLAY_ROLE_ACTION:
+                target_role = str(evidence.get("target_display_role") or "")
+                if target_role not in {"player", "referee"}:
+                    reasons.append("role_lock_requires_target_display_role")
+                if evidence.get("vision_verdict") != target_role:
+                    reasons.append("role_lock_requires_matching_role_verdict")
+                if evidence.get("vision_status") != "reviewed":
+                    reasons.append("role_lock_requires_reviewed_status")
+                if _as_int(evidence.get("model_evidence_count"), 0) <= 0:
+                    reasons.append("role_lock_requires_model_evidence")
+                if not apply_policy.get("display_only"):
+                    reasons.append("role_lock_must_be_display_only")
+                if not apply_policy.get("mutates_render_annotations"):
+                    reasons.append("role_lock_must_mutate_render_annotations")
 
         if reasons:
             rejected.append(
@@ -449,6 +872,16 @@ def build_identity_resolution_plan(
                     crop_case=crop_cases.get(case_id, {}),
                     identity_review_decisions=identity_review_decisions,
                     render_audit_after=render_audit_after,
+                )
+            )
+        elif question in {"team_assignment_uncertain", "role_stability_flicker"}:
+            proposals.append(
+                _build_display_review_proposal(
+                    case_id=case_id,
+                    question=question,
+                    queue_case=queue_case,
+                    vision_result=vision_result,
+                    crop_case=crop_cases.get(case_id, {}),
                 )
             )
         else:
@@ -532,6 +965,16 @@ def build_identity_resolution_plan(
                 1
                 for proposal in proposals
                 if proposal.get("proposal_type") == "candidate_identity_link"
+            ),
+            "display_lock_proposal_count": sum(
+                1
+                for proposal in proposals
+                if proposal.get("proposed_action") in DISPLAY_LOCK_ACTIONS
+            ),
+            "segment_split_required_count": sum(
+                1
+                for proposal in proposals
+                if proposal.get("proposed_action") == MARK_SEGMENT_SPLIT_REQUIRED_ACTION
             ),
         },
         "resolution_proposals": proposals,
