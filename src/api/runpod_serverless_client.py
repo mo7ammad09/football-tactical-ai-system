@@ -12,6 +12,14 @@ from src.api.client import AnalysisClient
 from src.api.object_storage_client import ObjectStorageClient
 
 
+def _safe_int(value: Any, fallback: int = 0) -> int:
+    """Convert values to int without failing status polling."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
 class RunPodServerlessClient(AnalysisClient):
     """Client for queue-based RunPod Serverless endpoints."""
 
@@ -46,6 +54,7 @@ class RunPodServerlessClient(AnalysisClient):
             "Accept": "application/json",
         }
         self._last_outputs: Dict[str, Dict[str, Any]] = {}
+        self._last_statuses: Dict[str, Dict[str, Any]] = {}
 
     def _url(self, suffix: str) -> str:
         return f"{self.base_url}/{self.endpoint_id}/{suffix.lstrip('/')}"
@@ -233,8 +242,34 @@ class RunPodServerlessClient(AnalysisClient):
         self._emit_progress(progress_callback, 95, phase="submitted")
         return job_id
 
+    def _transient_status_error(self, job_id: str, exc: Exception) -> Dict[str, Any]:
+        """Return a non-terminal status when RunPod status polling times out."""
+        previous = self._last_statuses.get(job_id, {})
+        raw_status = str(previous.get("raw_status") or "STATUS_POLL_TIMEOUT")
+        progress = _safe_int(previous.get("progress"), 10)
+        return {
+            "job_id": job_id,
+            "status": "processing",
+            "raw_status": raw_status,
+            "progress": progress,
+            "done": False,
+            "message": (
+                "RunPod status poll timed out; retrying without cancelling the job."
+            ),
+            "transient_error": True,
+            "error_type": exc.__class__.__name__,
+            "raw": previous.get("raw", {}),
+        }
+
     def get_status(self, job_id: str) -> Dict:
-        response = self.session.get(self._url(f"status/{job_id}"), headers=self.headers, timeout=30)
+        try:
+            response = self.session.get(
+                self._url(f"status/{job_id}"),
+                headers=self.headers,
+                timeout=30,
+            )
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            return self._transient_status_error(job_id, exc)
         response.raise_for_status()
         data = response.json()
         raw_status = str(data.get("status", "UNKNOWN")).upper()
@@ -252,7 +287,7 @@ class RunPodServerlessClient(AnalysisClient):
             try:
                 self._last_outputs[job_id] = self._normalize_output(data)
             except ValueError as exc:
-                return {
+                status_payload = {
                     "job_id": job_id,
                     "status": "failed",
                     "raw_status": raw_status,
@@ -261,10 +296,12 @@ class RunPodServerlessClient(AnalysisClient):
                     "message": str(exc),
                     "raw": data,
                 }
+                self._last_statuses[job_id] = status_payload
+                return status_payload
 
         message = self._failure_message(data, raw_status) if raw_status in self.FAILED_STATUSES else raw_status
 
-        return {
+        status_payload = {
             "job_id": job_id,
             "status": "completed" if raw_status == "COMPLETED" else "failed" if raw_status in self.FAILED_STATUSES else "processing",
             "raw_status": raw_status,
@@ -273,12 +310,30 @@ class RunPodServerlessClient(AnalysisClient):
             "message": message,
             "raw": data,
         }
+        self._last_statuses[job_id] = status_payload
+        return status_payload
 
     def get_results(self, job_id: str) -> Dict:
         if job_id in self._last_outputs:
             return self._last_outputs[job_id]
 
-        response = self.session.get(self._url(f"status/{job_id}"), headers=self.headers, timeout=30)
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = self.session.get(
+                    self._url(f"status/{job_id}"),
+                    headers=self.headers,
+                    timeout=30,
+                )
+                break
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(2)
+        else:
+            raise ValueError(
+                "RunPod result fetch timed out after completion; the job may still be retrievable."
+            ) from last_error
         response.raise_for_status()
         data = response.json()
         raw_status = str(data.get("status", "UNKNOWN")).upper()

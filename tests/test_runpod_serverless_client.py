@@ -1,3 +1,5 @@
+import requests
+
 from src.api.runpod_serverless_client import RunPodServerlessClient
 
 
@@ -36,6 +38,24 @@ class DummySession:
                     "warnings": [],
                     "confidence": {"field_calibration": 0.0},
                 },
+            }
+        )
+
+
+class TimeoutOnceSession(DummySession):
+    def __init__(self):
+        super().__init__()
+        self.timeout_next_get = True
+
+    def get(self, url, headers=None, timeout=None):
+        self.gets.append({"url": url, "headers": headers, "timeout": timeout})
+        if self.timeout_next_get:
+            self.timeout_next_get = False
+            raise requests.exceptions.ReadTimeout("status poll timed out")
+        return DummyResponse(
+            {
+                "id": "rp-job-1",
+                "status": "IN_QUEUE",
             }
         )
 
@@ -109,6 +129,25 @@ def test_runpod_client_polls_completed_result():
     assert status["status"] == "completed"
     assert status["progress"] == 100
     assert result["stats"]["processed_frames"] == 10
+
+
+def test_runpod_status_timeout_is_transient_not_failed():
+    client = RunPodServerlessClient(
+        api_key="key",
+        endpoint_id="endpoint",
+        storage_client=DummyStorage(),
+    )
+    client.session = TimeoutOnceSession()
+
+    status = client.get_status("rp-job-1")
+    retry_status = client.get_status("rp-job-1")
+
+    assert status["status"] == "processing"
+    assert status["done"] is False
+    assert status["transient_error"] is True
+    assert "retrying" in status["message"]
+    assert retry_status["raw_status"] == "IN_QUEUE"
+    assert retry_status["status"] == "processing"
 
 
 def test_runpod_client_defaults_to_longer_policy_for_strongsort():
