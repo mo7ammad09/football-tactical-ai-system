@@ -20,6 +20,11 @@ REVIEW_STATUS = "needs_review"
 APPLIED_STATUS = "applied"
 NOOP_STATUS = "no_ready_actions"
 REJECTED_STATUS = "rejected"
+MIN_PLAYER_ROLE_CONFIDENCE = 0.80
+MIN_PLAYER_TEAM_CONFIDENCE = 0.85
+MAX_MINOR_ROLE_SEGMENT_FRAMES = 2
+MAX_MINOR_TEAM_SEGMENT_FRAMES = 12
+MAX_MINOR_TEAM_SEGMENT_RATIO = 0.08
 
 
 def _as_int(value: Any, fallback: int = 0) -> int:
@@ -127,21 +132,76 @@ def _transition_count(values: list[Any]) -> int:
     return sum(1 for before, after in zip(values, values[1:]) if before != after)
 
 
+def _segments(values: list[tuple[int, Any]]) -> list[dict[str, Any]]:
+    """Return contiguous value segments in frame order."""
+    if not values:
+        return []
+    ordered = sorted(values, key=lambda item: item[0])
+    current_value = ordered[0][1]
+    start = end = ordered[0][0]
+    count = 1
+    segments: list[dict[str, Any]] = []
+    for frame, value in ordered[1:]:
+        if value == current_value:
+            end = frame
+            count += 1
+            continue
+        segments.append(
+            {
+                "value": current_value,
+                "first_source_frame_idx": int(start),
+                "last_source_frame_idx": int(end),
+                "frames_seen": int(count),
+            }
+        )
+        current_value = value
+        start = end = frame
+        count = 1
+    segments.append(
+        {
+            "value": current_value,
+            "first_source_frame_idx": int(start),
+            "last_source_frame_idx": int(end),
+            "frames_seen": int(count),
+        }
+    )
+    return segments
+
+
+def _max_non_value_segment(segments: list[dict[str, Any]], dominant_value: Any) -> tuple[int, float]:
+    """Return largest non-dominant segment count and ratio."""
+    total = sum(_as_int(segment.get("frames_seen")) for segment in segments)
+    max_count = max(
+        (
+            _as_int(segment.get("frames_seen"))
+            for segment in segments
+            if segment.get("value") != dominant_value
+        ),
+        default=0,
+    )
+    ratio = (max_count / float(total)) if total else 0.0
+    return int(max_count), float(ratio)
+
+
 def _safe_player_role_decision(
     *,
     role_counts: Counter,
+    role_segments: list[dict[str, Any]],
     frames_seen: int,
     min_role_confidence: float,
     min_role_margin_ratio: float,
+    max_minor_role_segment_frames: int,
 ) -> tuple[bool, str, float, int]:
     """Return whether the track has enough evidence to render as a player."""
     role, confidence, top_count, runner_up = _dominant(role_counts, "unknown")
     margin = top_count - runner_up
     margin_ratio = (margin / float(frames_seen)) if frames_seen else 0.0
+    max_minor_role_segment, _ = _max_non_value_segment(role_segments, role)
     is_safe = (
         str(role) == "player"
         and confidence >= min_role_confidence
         and margin_ratio >= min_role_margin_ratio
+        and max_minor_role_segment <= max_minor_role_segment_frames
     )
     return is_safe, str(role), float(confidence), int(margin)
 
@@ -149,21 +209,27 @@ def _safe_player_role_decision(
 def _safe_player_team_decision(
     *,
     team_counts: Counter,
+    team_segments: list[dict[str, Any]],
     frames_seen: int,
     min_team_confidence: float,
     min_team_margin_ratio: float,
     min_team_frames: int,
+    max_minor_team_segment_frames: int,
+    max_minor_team_segment_ratio: float,
 ) -> tuple[bool, int, float, int]:
     """Return whether the track has enough evidence for a player team."""
     team, confidence, top_count, runner_up = _dominant(team_counts, 0)
     margin = top_count - runner_up
     margin_ratio = (margin / float(frames_seen)) if frames_seen else 0.0
     team_int = _as_int(team, 0)
+    max_minor_team_segment, max_minor_team_ratio = _max_non_value_segment(team_segments, team_int)
     is_safe = (
         team_int in {1, 2}
         and top_count >= min_team_frames
         and confidence >= min_team_confidence
         and margin_ratio >= min_team_margin_ratio
+        and max_minor_team_segment <= max_minor_team_segment_frames
+        and max_minor_team_ratio <= max_minor_team_segment_ratio
     )
     return is_safe, int(team_int), float(confidence), int(margin)
 
@@ -198,22 +264,45 @@ def _track_profiles(raw_tracklet_rows: list[dict[str, Any]]) -> dict[int, dict[s
 
         display_role_sequence = [_display_role(row) for row in ordered]
         display_team_sequence = [_display_team(row) for row in ordered]
+        raw_role_segments = _segments(
+            [(_frame_idx(row), _raw_role(row)) for row in ordered]
+        )
+        player_team_segments = _segments(
+            [
+                (_frame_idx(row), _as_int(row.get("team"), 0))
+                for row in ordered
+                if _raw_role(row) == "player" and _as_int(row.get("team"), 0) in {1, 2}
+            ]
+        )
         player_role_safe, dominant_role, role_confidence, role_margin = _safe_player_role_decision(
             role_counts=raw_roles,
+            role_segments=raw_role_segments,
             frames_seen=frames_seen,
-            min_role_confidence=0.65,
+            min_role_confidence=MIN_PLAYER_ROLE_CONFIDENCE,
             min_role_margin_ratio=0.10,
+            max_minor_role_segment_frames=MAX_MINOR_ROLE_SEGMENT_FRAMES,
         )
         player_team_safe, dominant_team, team_confidence, team_margin = _safe_player_team_decision(
             team_counts=player_team_counts,
+            team_segments=player_team_segments,
             frames_seen=max(1, sum(player_team_counts.values())),
-            min_team_confidence=0.60,
+            min_team_confidence=MIN_PLAYER_TEAM_CONFIDENCE,
             min_team_margin_ratio=0.10,
             min_team_frames=3,
+            max_minor_team_segment_frames=MAX_MINOR_TEAM_SEGMENT_FRAMES,
+            max_minor_team_segment_ratio=MAX_MINOR_TEAM_SEGMENT_RATIO,
         )
         display_role, display_role_confidence, _, _ = _dominant(display_roles, "unknown")
         display_team, display_team_confidence, _, _ = _dominant(display_teams, 0)
         color, _, _, _ = _dominant(colors_by_team.get(dominant_team, Counter()), None)
+        max_minor_role_segment, max_minor_role_segment_ratio = _max_non_value_segment(
+            raw_role_segments,
+            dominant_role,
+        )
+        max_minor_team_segment, max_minor_team_segment_ratio = _max_non_value_segment(
+            player_team_segments,
+            dominant_team,
+        )
 
         profiles[track_id] = {
             "track_id": int(track_id),
@@ -240,6 +329,14 @@ def _track_profiles(raw_tracklet_rows: list[dict[str, Any]]) -> dict[int, dict[s
             "display_goalkeeper_frame_count": sum(1 for row in ordered if _is_display_goalkeeper(row)),
             "player_role_safe": bool(player_role_safe),
             "player_team_safe": bool(player_team_safe),
+            "raw_role_segments": raw_role_segments[:20],
+            "raw_role_segments_truncated": len(raw_role_segments) > 20,
+            "player_team_segments": player_team_segments[:20],
+            "player_team_segments_truncated": len(player_team_segments) > 20,
+            "max_minor_role_segment_frames": int(max_minor_role_segment),
+            "max_minor_role_segment_ratio": float(max_minor_role_segment_ratio),
+            "max_minor_team_segment_frames": int(max_minor_team_segment),
+            "max_minor_team_segment_ratio": float(max_minor_team_segment_ratio),
             "canonical_display_color": list(color) if color is not None else list(PLAYER_FALLBACK_COLOR),
         }
     return profiles
@@ -258,10 +355,16 @@ def validate_global_identity_stability_plan(plan: dict[str, Any]) -> dict[str, A
             reasons.append("only_player_display_overrides_are_supported")
         if _as_int(action.get("set_display_team"), 0) not in {1, 2}:
             reasons.append("player_display_team_must_be_team_1_or_2")
-        if _as_float(action.get("role_confidence"), 0.0) < 0.65:
+        if _as_float(action.get("role_confidence"), 0.0) < MIN_PLAYER_ROLE_CONFIDENCE:
             reasons.append("role_confidence_below_threshold")
-        if _as_float(action.get("team_confidence"), 0.0) < 0.60:
+        if _as_float(action.get("team_confidence"), 0.0) < MIN_PLAYER_TEAM_CONFIDENCE:
             reasons.append("team_confidence_below_threshold")
+        if _as_int(action.get("max_minor_role_segment_frames"), 0) > MAX_MINOR_ROLE_SEGMENT_FRAMES:
+            reasons.append("minor_role_segment_too_long")
+        if _as_int(action.get("max_minor_team_segment_frames"), 0) > MAX_MINOR_TEAM_SEGMENT_FRAMES:
+            reasons.append("minor_team_segment_too_long")
+        if _as_float(action.get("max_minor_team_segment_ratio"), 0.0) > MAX_MINOR_TEAM_SEGMENT_RATIO:
+            reasons.append("minor_team_segment_ratio_too_high")
         if action.get("track_id") is None:
             reasons.append("missing_track_id")
         if reasons:
@@ -307,9 +410,25 @@ def build_global_identity_stability_plan(
         display_team_transitions = _as_int(profile.get("display_team_transition_count"), 0)
         has_visible_flicker = display_role_transitions > 0 or display_team_transitions > 0
         has_gk_leak = _as_int(profile.get("display_goalkeeper_frame_count"), 0) > 0
+        has_hidden_role_conflict = (
+            str(profile.get("dominant_raw_role")) == "player"
+            and _as_int(profile.get("max_minor_role_segment_frames"), 0)
+            > MAX_MINOR_ROLE_SEGMENT_FRAMES
+        )
+        player_team_counts = profile.get("player_team_counts") or {}
+        has_multiple_player_teams = (
+            sum(1 for count in player_team_counts.values() if _as_int(count) > 0) > 1
+        )
+        has_hidden_team_conflict = has_multiple_player_teams and (
+            _as_float(profile.get("player_team_confidence"), 0.0) < MIN_PLAYER_TEAM_CONFIDENCE
+            or _as_int(profile.get("max_minor_team_segment_frames"), 0)
+            > MAX_MINOR_TEAM_SEGMENT_FRAMES
+            or _as_float(profile.get("max_minor_team_segment_ratio"), 0.0)
+            > MAX_MINOR_TEAM_SEGMENT_RATIO
+        )
 
         if frames_seen < min_frames:
-            if has_visible_flicker or has_gk_leak:
+            if has_visible_flicker or has_gk_leak or has_hidden_role_conflict or has_hidden_team_conflict:
                 review.append(
                     {
                         "track_id": int(track_id),
@@ -334,6 +453,18 @@ def build_global_identity_stability_plan(
                 "team_confidence": float(profile.get("player_team_confidence", 0.0)),
                 "role_margin": int(profile.get("raw_role_margin", 0)),
                 "team_margin": int(profile.get("player_team_margin", 0)),
+                "max_minor_role_segment_frames": int(
+                    profile.get("max_minor_role_segment_frames", 0)
+                ),
+                "max_minor_role_segment_ratio": float(
+                    profile.get("max_minor_role_segment_ratio", 0.0)
+                ),
+                "max_minor_team_segment_frames": int(
+                    profile.get("max_minor_team_segment_frames", 0)
+                ),
+                "max_minor_team_segment_ratio": float(
+                    profile.get("max_minor_team_segment_ratio", 0.0)
+                ),
                 "reason": (
                     "Track has enough raw player-role and team evidence to keep "
                     "client-facing role/team stable across rendered frames."
@@ -343,17 +474,27 @@ def build_global_identity_stability_plan(
                     "player_team_counts": profile.get("player_team_counts", {}),
                     "display_role_counts": profile.get("display_role_counts", {}),
                     "display_team_counts": profile.get("display_team_counts", {}),
+                    "raw_role_segments": profile.get("raw_role_segments", []),
+                    "player_team_segments": profile.get("player_team_segments", []),
                 },
             }
             actions.append(action)
             continue
 
-        if has_visible_flicker or has_gk_leak:
+        if has_visible_flicker or has_gk_leak or has_hidden_role_conflict or has_hidden_team_conflict:
             reasons: list[str] = []
             if not profile.get("player_role_safe"):
                 reasons.append("insufficient_role_evidence")
             if not profile.get("player_team_safe"):
                 reasons.append("insufficient_team_evidence")
+            if _as_int(profile.get("max_minor_role_segment_frames"), 0) > MAX_MINOR_ROLE_SEGMENT_FRAMES:
+                reasons.append("minor_role_segment_too_long")
+            if _as_int(profile.get("max_minor_team_segment_frames"), 0) > MAX_MINOR_TEAM_SEGMENT_FRAMES:
+                reasons.append("minor_team_segment_too_long")
+            if has_hidden_role_conflict:
+                reasons.append("hidden_role_conflict")
+            if has_hidden_team_conflict:
+                reasons.append("hidden_team_conflict")
             review.append(
                 {
                     "track_id": int(track_id),

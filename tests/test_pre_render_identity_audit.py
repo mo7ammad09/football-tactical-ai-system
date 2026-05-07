@@ -570,6 +570,56 @@ def test_phase5_crop_index_plan_targets_queued_goalkeeper_segments():
     assert all(request["crop_path"] is None for request in requests)
 
 
+def test_phase5_crop_index_plan_balances_team_uncertain_segments():
+    rows = []
+    rows.extend(_row(19, 19, sample, sample * 10, "player", 1) for sample in range(1, 5))
+    rows.extend(_row(19, 19, sample, sample * 10, "player", 2) for sample in range(5, 9))
+    rows.extend(_row(19, 19, sample, sample * 10, "player", 1) for sample in range(9, 13))
+
+    audit = build_render_identity_audit(rows)
+    queue = build_vision_review_queue(
+        correction_plan={"needs_vision": []},
+        render_audit_before=audit,
+        render_audit_after=audit,
+        correction_applied={"correction_applied": True},
+    )
+    crop_plan = build_player_crop_index_plan(
+        raw_tracklet_rows=rows,
+        vision_review_queue=queue,
+        render_audit=audit,
+    )
+
+    requests = crop_plan["cases"][0]["crop_requests"]
+    assert {request["team"] for request in requests} == {1, 2}
+    team_1_frames = [request["source_frame_idx"] for request in requests if request["team"] == 1]
+    team_2_frames = [request["source_frame_idx"] for request in requests if request["team"] == 2]
+    assert min(team_1_frames) < min(team_2_frames) < max(team_1_frames)
+
+
+def test_phase5_crop_index_plan_includes_problematic_role_segment():
+    rows = []
+    rows.extend(_row(24, 24, sample, sample * 10, "player", 1) for sample in range(1, 6))
+    rows.append(_row(24, 24, 6, 60, "referee", 0))
+    rows.extend(_row(24, 24, sample, sample * 10, "player", 1) for sample in range(7, 12))
+
+    audit = build_render_identity_audit(rows)
+    queue = build_vision_review_queue(
+        correction_plan={"needs_vision": []},
+        render_audit_before=audit,
+        render_audit_after=audit,
+        correction_applied={"correction_applied": True},
+    )
+    crop_plan = build_player_crop_index_plan(
+        raw_tracklet_rows=rows,
+        vision_review_queue=queue,
+        render_audit=audit,
+    )
+
+    requests = crop_plan["cases"][0]["crop_requests"]
+    assert {request["role"] for request in requests} == {"player", "referee"}
+    assert any(request["source_frame_idx"] == 60 for request in requests)
+
+
 def test_phase6_keeps_cases_unresolved_when_vision_provider_is_not_enabled():
     rows = [
         _row(
@@ -862,8 +912,33 @@ def test_render_audit_flags_display_team_flicker_even_when_goalkeeper_is_clean()
     assert audit["summary"]["display_team_uncertain_count"] == 1
 
 
+def test_render_audit_flags_stable_display_that_masks_raw_team_switch():
+    rows = []
+    rows.extend(
+        _row(3, 3, sample, sample * 10, "player", 1, display_team=1)
+        for sample in range(1, 8)
+    )
+    rows.extend(
+        _row(3, 3, sample, sample * 10, "player", 2, display_team=1)
+        for sample in range(8, 16)
+    )
+    rows.extend(
+        _row(3, 3, sample, sample * 10, "player", 1, display_team=1)
+        for sample in range(16, 23)
+    )
+
+    audit = build_render_identity_audit(rows)
+
+    issue_types = {issue["issue_type"] for issue in audit["issues"]}
+    assert "hidden_team_switch_after_stabilizer" in issue_types
+    assert audit["summary"]["display_team_flicker_count"] == 0
+    assert audit["summary"]["hidden_team_switch_after_stabilizer_count"] == 1
+    assert audit["verdict"] == "REVIEW"
+
+
 def test_global_identity_stabilizer_locks_only_when_team_and_role_have_evidence():
     rows = []
+    rows.extend(_row(12, 12, sample, sample * 10, "player", 1) for sample in range(1, 10))
     rows.extend(_row(14, 14, sample, sample * 10, "player", 1) for sample in range(1, 8))
     rows.extend(_row(14, 36, sample, sample * 10, "goalkeeper", 0) for sample in range(8, 10))
     rows.extend(_row(18, 18, sample, sample * 10, "player", 1) for sample in range(1, 6))
@@ -873,13 +948,15 @@ def test_global_identity_stabilizer_locks_only_when_team_and_role_have_evidence(
     corrected_rows, applied = apply_global_identity_stability_plan_to_raw_records(rows, plan)
 
     assert plan["validation"]["verdict"] == "PASS"
-    assert any(action["track_id"] == 14 for action in plan["actions"])
+    assert any(action["track_id"] == 12 for action in plan["actions"])
+    assert all(action["track_id"] != 14 for action in plan["actions"])
     assert all(action["track_id"] != 18 for action in plan["actions"])
+    assert any(item["track_id"] == 14 for item in plan["needs_review"])
     assert any(item["track_id"] == 18 for item in plan["needs_review"])
     assert applied["status"] == "applied"
-    track14_rows = [row for row in corrected_rows if row["track_id"] == 14]
-    assert {row["display_role"] for row in track14_rows} == {"player"}
-    assert {row["display_team"] for row in track14_rows} == {1}
+    track12_rows = [row for row in corrected_rows if row["track_id"] == 12]
+    assert {row["display_role"] for row in track12_rows} == {"player"}
+    assert {row["display_team"] for row in track12_rows} == {1}
     track18_rows = [row for row in corrected_rows if row["track_id"] == 18]
     assert {row["display_team"] for row in track18_rows} == {None}
 
@@ -904,8 +981,7 @@ def test_global_identity_stabilizer_updates_annotation_states_for_final_render()
         }
     ]
     rows = []
-    rows.extend(_row(14, 14, sample, sample * 10, "player", 1) for sample in range(1, 8))
-    rows.extend(_row(14, 36, sample, sample * 10, "goalkeeper", 0) for sample in range(8, 10))
+    rows.extend(_row(14, 14, sample, sample * 10, "player", 1) for sample in range(1, 10))
 
     plan = build_global_identity_stability_plan(rows)
     updated = apply_global_identity_stability_plan_to_annotation_states(states, plan)

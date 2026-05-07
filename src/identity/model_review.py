@@ -120,15 +120,17 @@ def _case_prompt(case: dict[str, Any], crop_case: dict[str, Any]) -> str:
             "Review the audit evidence, crop metadata, and contact sheet for case "
             f"{case_id}. Decide whether the track has strong evidence for team_1 "
             "or team_2. Do not treat KMeans/team counts as ground truth when they "
-            "are split or weak. Return team_1 or team_2 only when evidence is "
-            "strong; otherwise return unresolved."
+            "are split or weak. Compare the crops from each reported team segment; "
+            "if they look like different people or the evidence is not balanced, "
+            "return unresolved. Return team_1 or team_2 only when evidence is strong."
         )
     if question == "role_stability_flicker":
         return (
             "Review the audit evidence, crop metadata, and contact sheet for case "
             f"{case_id}. Decide whether the visible role should be player, "
-            "referee, goalkeeper, or unresolved. Treat isolated flicker as "
-            "uncertain unless neighboring metadata and visual evidence strongly "
+            "referee, goalkeeper, or unresolved. Compare crops from every role "
+            "segment, especially minority/problem frames. Treat isolated flicker "
+            "as uncertain unless neighboring metadata and visual evidence strongly "
             "support one role."
         )
     return (

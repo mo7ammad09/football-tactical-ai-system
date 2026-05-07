@@ -238,6 +238,56 @@ def _transition_count(values: list[Any]) -> int:
     return sum(1 for previous, current in zip(values, values[1:]) if previous != current)
 
 
+def _segments(values: list[tuple[int, Any]]) -> list[dict[str, Any]]:
+    """Return contiguous value segments in source-frame order."""
+    if not values:
+        return []
+    ordered = sorted(values, key=lambda item: item[0])
+    current_value = ordered[0][1]
+    start = end = ordered[0][0]
+    count = 1
+    segments: list[dict[str, Any]] = []
+    for frame, value in ordered[1:]:
+        if value == current_value:
+            end = frame
+            count += 1
+            continue
+        segments.append(
+            {
+                "value": current_value,
+                "first_source_frame_idx": int(start),
+                "last_source_frame_idx": int(end),
+                "frames_seen": int(count),
+            }
+        )
+        current_value = value
+        start = end = frame
+        count = 1
+    segments.append(
+        {
+            "value": current_value,
+            "first_source_frame_idx": int(start),
+            "last_source_frame_idx": int(end),
+            "frames_seen": int(count),
+        }
+    )
+    return segments
+
+
+def _max_segment_not_value(segments: list[dict[str, Any]], dominant_value: Any) -> tuple[int, float]:
+    """Return the largest non-dominant segment count and ratio."""
+    total = sum(_as_int(segment.get("frames_seen")) for segment in segments)
+    max_count = max(
+        (
+            _as_int(segment.get("frames_seen"))
+            for segment in segments
+            if segment.get("value") != dominant_value
+        ),
+        default=0,
+    )
+    return int(max_count), (float(max_count) / float(total)) if total else 0.0
+
+
 def _build_source_profiles(rows: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
     """Build profiles by underlying track id, not by visible label."""
     grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -273,6 +323,39 @@ def _build_source_profiles(rows: list[dict[str, Any]]) -> dict[int, dict[str, An
         dominant_player_team, player_team_confidence = _dominant(player_teams, 0)
         visible_role_sequence = [_visible_role(row) for row in ordered]
         visible_team_sequence = [_visible_team(row) for row in ordered]
+        raw_role_sequence = [_raw_role(row) for row in ordered]
+        player_team_sequence = [
+            _as_int(row.get("team"))
+            for row in ordered
+            if _raw_role(row) == "player" and _as_int(row.get("team")) in {1, 2}
+        ]
+        raw_role_segments = _segments(
+            [(_frame_idx(row), _raw_role(row)) for row in ordered]
+        )
+        visible_role_segments = _segments(
+            [(_frame_idx(row), _visible_role(row)) for row in ordered]
+        )
+        player_team_segments = _segments(
+            [
+                (_frame_idx(row), _as_int(row.get("team")))
+                for row in ordered
+                if _raw_role(row) == "player" and _as_int(row.get("team")) in {1, 2}
+            ]
+        )
+        visible_team_segments = _segments(
+            [
+                (_frame_idx(row), _visible_team(row))
+                for row in ordered
+                if _visible_team(row) in {1, 2}
+            ]
+        )
+        max_minor_raw_role_segment, max_minor_raw_role_segment_ratio = _max_segment_not_value(
+            raw_role_segments,
+            dominant_raw_role,
+        )
+        max_minor_player_team_segment, max_minor_player_team_segment_ratio = (
+            _max_segment_not_value(player_team_segments, dominant_player_team)
+        )
         display_goalkeeper_frames = sum(1 for row in ordered if _is_display_goalkeeper(row))
         raw_goalkeeper_frames = sum(
             1
@@ -306,6 +389,20 @@ def _build_source_profiles(rows: list[dict[str, Any]]) -> dict[int, dict[str, An
             "raw_goalkeeper_frame_count": int(raw_goalkeeper_frames),
             "display_role_transition_count": int(_transition_count(visible_role_sequence)),
             "display_team_transition_count": int(_transition_count(visible_team_sequence)),
+            "raw_role_transition_count": int(_transition_count(raw_role_sequence)),
+            "player_team_transition_count": int(_transition_count(player_team_sequence)),
+            "raw_role_segments": raw_role_segments[:20],
+            "raw_role_segments_truncated": len(raw_role_segments) > 20,
+            "visible_role_segments": visible_role_segments[:20],
+            "visible_role_segments_truncated": len(visible_role_segments) > 20,
+            "player_team_segments": player_team_segments[:20],
+            "player_team_segments_truncated": len(player_team_segments) > 20,
+            "visible_team_segments": visible_team_segments[:20],
+            "visible_team_segments_truncated": len(visible_team_segments) > 20,
+            "max_minor_raw_role_segment_frames": int(max_minor_raw_role_segment),
+            "max_minor_raw_role_segment_ratio": float(max_minor_raw_role_segment_ratio),
+            "max_minor_player_team_segment_frames": int(max_minor_player_team_segment),
+            "max_minor_player_team_segment_ratio": float(max_minor_player_team_segment_ratio),
         }
     return profiles
 
@@ -541,6 +638,15 @@ def build_render_identity_audit(
             if player_team_total
             else 0.0
         )
+        max_minor_raw_role_segment = _as_int(
+            profile.get("max_minor_raw_role_segment_frames")
+        )
+        max_minor_player_team_segment = _as_int(
+            profile.get("max_minor_player_team_segment_frames")
+        )
+        max_minor_player_team_segment_ratio = _as_float(
+            profile.get("max_minor_player_team_segment_ratio")
+        )
 
         if (
             dominant_raw_role == "player"
@@ -548,11 +654,13 @@ def build_render_identity_audit(
             and display_role_transitions > 0
         ):
             includes_goalkeeper = _as_int(visible_role_counts.get(GOALKEEPER_ROLE), 0) > 0
+            referee_frames = _as_int(visible_role_counts.get("referee"), 0)
+            has_long_role_segment = max_minor_raw_role_segment > 12 or referee_frames > 12
             issues.append(
                 _issue(
                     issue_id=f"display_role_flicker_{track_id}",
                     issue_type="display_role_flicker",
-                    severity="high" if includes_goalkeeper else "medium",
+                    severity="high" if includes_goalkeeper or has_long_role_segment else "medium",
                     title="Rendered role flickers on a player-dominant track",
                     reason=(
                         "The same underlying player-dominant track changes its "
@@ -565,6 +673,38 @@ def build_render_identity_audit(
                     raw_role_confidence=float(raw_role_confidence),
                     display_role_transition_count=int(display_role_transitions),
                     visible_role_counts=visible_role_counts,
+                    raw_role_counts=profile.get("raw_role_counts", {}),
+                    raw_role_segments=profile.get("raw_role_segments", []),
+                    max_minor_raw_role_segment_frames=int(max_minor_raw_role_segment),
+                )
+            )
+
+        if (
+            dominant_raw_role == "player"
+            and raw_role_confidence >= 0.65
+            and display_role_transitions == 0
+            and max_minor_raw_role_segment > 2
+        ):
+            severity = "high" if max_minor_raw_role_segment > 12 else "medium"
+            issues.append(
+                _issue(
+                    issue_id=f"hidden_role_switch_after_stabilizer_{track_id}",
+                    issue_type="hidden_role_switch_after_stabilizer",
+                    severity=severity,
+                    title="Stable display role masks raw role switch",
+                    reason=(
+                        "The client-facing role is stable, but the underlying track "
+                        "contains a non-player role segment large enough to require "
+                        "review before trusting the rendered identity."
+                    ),
+                    track_id=int(track_id),
+                    frames_seen=int(frames_seen),
+                    dominant_raw_role=dominant_raw_role,
+                    raw_role_confidence=float(raw_role_confidence),
+                    raw_role_counts=profile.get("raw_role_counts", {}),
+                    visible_role_counts=visible_role_counts,
+                    raw_role_segments=profile.get("raw_role_segments", []),
+                    max_minor_raw_role_segment_frames=int(max_minor_raw_role_segment),
                 )
             )
 
@@ -599,6 +739,54 @@ def build_render_identity_audit(
                     visible_team_counts=visible_team_counts,
                     player_team_counts=player_team_counts,
                     player_team_confidence=float(player_team_confidence),
+                    player_team_segments=profile.get("player_team_segments", []),
+                    max_minor_player_team_segment_frames=int(max_minor_player_team_segment),
+                    max_minor_player_team_segment_ratio=float(
+                        max_minor_player_team_segment_ratio
+                    ),
+                )
+            )
+
+        if (
+            dominant_raw_role == "player"
+            and raw_role_confidence >= 0.65
+            and display_team_transitions == 0
+            and len(player_team_count_values) > 1
+            and (
+                player_team_confidence < 0.85
+                or max_minor_player_team_segment > 12
+                or max_minor_player_team_segment_ratio > 0.08
+            )
+        ):
+            severity = (
+                "high"
+                if player_team_confidence < 0.75 or max_minor_player_team_segment > 24
+                else "medium"
+            )
+            issues.append(
+                _issue(
+                    issue_id=f"hidden_team_switch_after_stabilizer_{track_id}",
+                    issue_type="hidden_team_switch_after_stabilizer",
+                    severity=severity,
+                    title="Stable display team masks raw team switch",
+                    reason=(
+                        "The rendered team/color is stable, but the underlying player "
+                        "track has substantial team-1/team-2 evidence. This can hide "
+                        "KMeans drift or an actual identity switch."
+                    ),
+                    track_id=int(track_id),
+                    frames_seen=int(frames_seen),
+                    dominant_raw_role=dominant_raw_role,
+                    raw_role_confidence=float(raw_role_confidence),
+                    visible_team_counts=visible_team_counts,
+                    player_team_counts=player_team_counts,
+                    player_team_confidence=float(player_team_confidence),
+                    player_team_segments=profile.get("player_team_segments", []),
+                    visible_team_segments=profile.get("visible_team_segments", []),
+                    max_minor_player_team_segment_frames=int(max_minor_player_team_segment),
+                    max_minor_player_team_segment_ratio=float(
+                        max_minor_player_team_segment_ratio
+                    ),
                 )
             )
 
@@ -608,6 +796,8 @@ def build_render_identity_audit(
         "simultaneous_goalkeeper_display",
         "display_role_flicker",
         "display_team_uncertain",
+        "hidden_role_switch_after_stabilizer",
+        "hidden_team_switch_after_stabilizer",
     }
     has_visible_identity_risk = any(
         str(issue.get("issue_type")) in visible_risk_issue_types
@@ -656,6 +846,12 @@ def build_render_identity_audit(
             "display_role_flicker_count": int(issue_counts.get("display_role_flicker", 0)),
             "display_team_flicker_count": int(issue_counts.get("display_team_flicker", 0)),
             "display_team_uncertain_count": int(issue_counts.get("display_team_uncertain", 0)),
+            "hidden_role_switch_after_stabilizer_count": int(
+                issue_counts.get("hidden_role_switch_after_stabilizer", 0)
+            ),
+            "hidden_team_switch_after_stabilizer_count": int(
+                issue_counts.get("hidden_team_switch_after_stabilizer", 0)
+            ),
             "simultaneous_goalkeeper_conflict_count": int(
                 issue_counts.get("simultaneous_goalkeeper_display", 0)
             ),
@@ -1188,6 +1384,8 @@ def build_vision_review_queue(
         "display_team_uncertain": "team_assignment_uncertain",
         "display_team_flicker": "team_assignment_uncertain",
         "display_role_flicker": "role_stability_flicker",
+        "hidden_team_switch_after_stabilizer": "team_assignment_uncertain",
+        "hidden_role_switch_after_stabilizer": "role_stability_flicker",
     }
     for issue in render_audit_after.get("issues", []) or []:
         if not isinstance(issue, dict):
@@ -1297,6 +1495,13 @@ def _compact_audit_issue_for_review(issue: dict[str, Any]) -> dict[str, Any]:
         "visible_team_counts",
         "player_team_counts",
         "player_team_confidence",
+        "raw_role_counts",
+        "raw_role_segments",
+        "player_team_segments",
+        "visible_team_segments",
+        "max_minor_raw_role_segment_frames",
+        "max_minor_player_team_segment_frames",
+        "max_minor_player_team_segment_ratio",
     }
     return {
         key: issue.get(key)
@@ -1342,6 +1547,8 @@ def _target_tracks_for_case(
                 "first_source_frame_idx": issue.get("first_source_frame_idx"),
                 "last_source_frame_idx": issue.get("last_source_frame_idx"),
                 "source_issue_id": source_issue_id,
+                "issue_type": issue.get("issue_type"),
+                "question": case.get("question"),
             }
         )
 
@@ -1353,6 +1560,8 @@ def _target_tracks_for_case(
                 "first_source_frame_idx": None,
                 "last_source_frame_idx": None,
                 "source_issue_id": source_issue_id,
+                "issue_type": issue.get("issue_type"),
+                "question": case.get("question"),
             }
         )
 
@@ -1366,6 +1575,8 @@ def _target_tracks_for_case(
                     "first_source_frame_idx": None,
                     "last_source_frame_idx": None,
                     "source_issue_id": source_issue_id,
+                    "issue_type": issue.get("issue_type"),
+                    "question": case.get("question"),
                 }
             )
 
@@ -1383,6 +1594,8 @@ def _target_tracks_for_case(
                     "first_source_frame_idx": segment.get("first_source_frame_idx"),
                     "last_source_frame_idx": segment.get("last_source_frame_idx"),
                     "source_issue_id": source_issue_id or None,
+                    "issue_type": issue.get("issue_type"),
+                    "question": case.get("question"),
                 }
             )
 
@@ -1428,6 +1641,85 @@ def _select_crop_rows(
         display_bonus = 1 if _is_display_goalkeeper(row) else 0
         return (display_bonus, confidence, _bbox_area_from_row(row))
 
+    def segment_representatives(
+        source_rows: list[dict[str, Any]],
+        key_func: Any,
+    ) -> list[dict[str, Any]]:
+        ordered = sorted(source_rows, key=lambda item: (_frame_idx(item), _sample_number(item)))
+        if not ordered:
+            return []
+
+        segment_rows: list[list[dict[str, Any]]] = []
+        current_segment = [ordered[0]]
+        current_key = key_func(ordered[0])
+        for row in ordered[1:]:
+            row_key = key_func(row)
+            if row_key == current_key:
+                current_segment.append(row)
+                continue
+            segment_rows.append(current_segment)
+            current_segment = [row]
+            current_key = row_key
+        segment_rows.append(current_segment)
+
+        selected_rows: list[dict[str, Any]] = []
+        seen_segment_frames: set[int] = set()
+        for segment in segment_rows:
+            best = max(segment, key=row_score)
+            frame = _frame_idx(best)
+            if frame not in seen_segment_frames:
+                selected_rows.append(best)
+                seen_segment_frames.add(frame)
+            if len(selected_rows) >= max_rows:
+                return sorted(selected_rows, key=_frame_idx)
+
+        segment_index = 0
+        while len(selected_rows) < max_rows and segment_rows:
+            segment = sorted(segment_rows[segment_index % len(segment_rows)], key=row_score, reverse=True)
+            for row in segment:
+                frame = _frame_idx(row)
+                if frame in seen_segment_frames:
+                    continue
+                selected_rows.append(row)
+                seen_segment_frames.add(frame)
+                break
+            else:
+                if all(
+                    all(_frame_idx(row) in seen_segment_frames for row in candidate_segment)
+                    for candidate_segment in segment_rows
+                ):
+                    break
+            segment_index += 1
+
+        return sorted(selected_rows, key=_frame_idx)
+
+    question = str(target.get("question") or "")
+    issue_type = str(target.get("issue_type") or "")
+    if question == "team_assignment_uncertain" or issue_type in {
+        "display_team_uncertain",
+        "display_team_flicker",
+        "hidden_team_switch_after_stabilizer",
+    }:
+        team_rows = [
+            row
+            for row in rows
+            if _raw_role(row) == "player" and _as_int(row.get("team")) in {1, 2}
+        ]
+        selected_by_team_segment = segment_representatives(
+            team_rows or rows,
+            lambda item: _as_int(item.get("team")),
+        )
+        if selected_by_team_segment:
+            return selected_by_team_segment
+
+    if question == "role_stability_flicker" or issue_type in {
+        "display_role_flicker",
+        "hidden_role_switch_after_stabilizer",
+    }:
+        selected_by_role_segment = segment_representatives(rows, _visible_role)
+        if selected_by_role_segment:
+            return selected_by_role_segment
+
     rows = sorted(rows, key=row_score, reverse=True)
     selected: list[dict[str, Any]] = []
     seen_frames: set[int] = set()
@@ -1458,10 +1750,16 @@ def build_player_crop_index_plan(
         crop_requests: list[dict[str, Any]] = []
         targets = _target_tracks_for_case(case, render_audit)
         for target in targets:
+            max_rows_for_target = max(1, int(max_crops_per_track))
+            if str(case.get("question")) in {
+                "team_assignment_uncertain",
+                "role_stability_flicker",
+            }:
+                max_rows_for_target = max(max_rows_for_target, 6)
             for row in _select_crop_rows(
                 raw_tracklet_rows,
                 target,
-                max_rows=max(1, int(max_crops_per_track)),
+                max_rows=max_rows_for_target,
             ):
                 crop_id = (
                     f"{case.get('case_id')}_track{_source_track_id(row)}_"
