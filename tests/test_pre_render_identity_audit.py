@@ -961,6 +961,75 @@ def test_global_identity_stabilizer_locks_only_when_team_and_role_have_evidence(
     assert {row["display_team"] for row in track18_rows} == {None}
 
 
+def test_global_identity_stabilizer_smooths_isolated_referee_role_frame():
+    rows = []
+    rows.extend(_row(17, 17, sample, sample * 10, "player", 1) for sample in range(1, 16))
+    rows.extend(_row(17, 17, sample, sample * 10, "player", 2) for sample in range(16, 30))
+    referee_row = _row(17, 17, 30, 300, "referee", 0, display_role="referee")
+    referee_row["object_type"] = "referee"
+    rows.append(referee_row)
+
+    plan = build_global_identity_stability_plan(rows)
+    corrected_rows, applied = apply_global_identity_stability_plan_to_raw_records(rows, plan)
+
+    assert plan["validation"]["verdict"] == "PASS"
+    role_actions = [
+        action
+        for action in plan["actions"]
+        if action["track_id"] == 17
+        and action["action_type"] == "stable_player_role_display_override"
+    ]
+    assert len(role_actions) == 1
+    assert applied["status"] == "applied"
+    smoothed_referee_rows = [
+        row
+        for row in corrected_rows
+        if row["track_id"] == 17 and row["object_type"] == "referee"
+    ]
+    assert {row["display_role"] for row in smoothed_referee_rows} == {"player"}
+
+
+def test_global_identity_stabilizer_locks_strong_team_without_forcing_role():
+    rows = []
+    rows.extend(_row(16, 16, sample, sample * 10, "player", 2) for sample in range(1, 151))
+    rows.extend(_row(16, 16, sample, sample * 10, "player", 1) for sample in range(151, 169))
+    rows.extend(_row(16, 16, sample, sample * 10, "player", 2) for sample in range(169, 301))
+
+    plan = build_global_identity_stability_plan(rows)
+    corrected_rows, applied = apply_global_identity_stability_plan_to_raw_records(rows, plan)
+
+    team_actions = [
+        action
+        for action in plan["actions"]
+        if action["track_id"] == 16
+        and action["action_type"] == "stable_player_team_display_override"
+    ]
+    assert len(team_actions) == 1
+    assert team_actions[0].get("set_display_role") is None
+    assert team_actions[0]["set_display_team"] == 2
+    assert applied["status"] == "applied"
+    assert {row["display_team"] for row in corrected_rows if row["track_id"] == 16} == {2}
+
+
+def test_global_identity_stabilizer_does_not_team_lock_true_role_switch():
+    rows = []
+    rows.extend(_row(20, 20, sample, sample * 10, "player", 1) for sample in range(1, 40))
+    for sample in range(40, 55):
+        referee_row = _row(20, 20, sample, sample * 10, "referee", 0, display_role="referee")
+        referee_row["object_type"] = "referee"
+        rows.append(referee_row)
+
+    plan = build_global_identity_stability_plan(rows)
+
+    assert all(
+        action["track_id"] != 20
+        or action["action_type"] != "stable_player_team_display_override"
+        for action in plan["actions"]
+    )
+    review_case = next(item for item in plan["needs_review"] if item["track_id"] == 20)
+    assert review_case["recommended_action"] == "segment_split_required"
+
+
 def test_global_identity_stabilizer_updates_annotation_states_for_final_render():
     states = [
         {

@@ -164,3 +164,6 @@ def test_runpod_handler_uploads_all_identity_artifacts_when_present(monkeypatch,
     assert result["identity_resolution_applied_json_url"].endswith(
         "/identity_resolution_applied_json.json"
     )
+    assert result["identity_review_bundle_zip_url"].endswith(
+        "/identity_review_bundle_zip.zip"
+    )

@@ -327,6 +327,20 @@ def sanitize_provider_error_text(value: Any) -> str:
     return text
 
 
+def classify_provider_error_text(value: Any) -> str | None:
+    """Classify common provider failures so downstream reports are explicit."""
+    text = str(value or "").lower()
+    if "429" in text or "too many requests" in text or "rate limit" in text:
+        return "provider_rate_limited"
+    if "403" in text or "forbidden" in text or "permission" in text:
+        return "provider_forbidden"
+    if "timeout" in text or "timed out" in text:
+        return "provider_timeout"
+    if "api key" in text or "key is not configured" in text:
+        return "provider_missing_or_invalid_key"
+    return None
+
+
 def _provider_failure_reason(exc: Exception, *, attempt: int, max_attempts: int) -> str:
     """Return a sanitized, retry-aware failure reason for a provider exception."""
     exc_name = exc.__class__.__name__
@@ -344,13 +358,18 @@ def _unresolved_provider_output(
     evidence: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Return a conservative unresolved output for provider failures."""
+    failure_category = classify_provider_error_text(reason) or "provider_error"
     return {
         "case_id": case_id,
         "status": "reviewed",
         "verdict": "unresolved",
         "confidence": 0.0,
         "reason": sanitize_provider_error_text(reason),
-        "evidence": evidence or [],
+        "failure_category": failure_category,
+        "evidence": [
+            {"type": "provider_failure_category", "category": failure_category},
+            *(evidence or []),
+        ],
     }
 
 

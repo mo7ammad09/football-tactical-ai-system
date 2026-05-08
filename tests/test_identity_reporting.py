@@ -65,6 +65,9 @@ def test_identity_artifact_links_read_runpod_artifact_metadata():
         "identity_resolution_applied_json": {
             "public_url": "https://cdn.example/resolution-applied.json"
         },
+        "identity_review_bundle_zip": {
+            "public_url": "https://cdn.example/bundle.zip"
+        },
         "vision_contact_sheets_zip": {
             "public_url": "https://cdn.example/sheets.zip"
         },
@@ -74,6 +77,7 @@ def test_identity_artifact_links_read_runpod_artifact_metadata():
     links = build_identity_artifact_links(results)
 
     assert [link["key"] for link in links] == [
+        "identity_review_bundle_zip_url",
         "identity_model_review_request_json_url",
         "final_render_identity_manifest_json_url",
         "identity_review_decisions_json_url",

@@ -6,7 +6,7 @@ from collections import Counter, defaultdict
 from copy import deepcopy
 from typing import Any, Iterable
 
-from src.identity.model_review import sanitize_provider_error_text
+from src.identity.model_review import classify_provider_error_text, sanitize_provider_error_text
 
 
 RUNPOD_BASELINE_IMAGE = "ghcr.io/mo7ammad09/football-tactical-ai-runpod:sha-bbe8dec"
@@ -1885,6 +1885,8 @@ def _sanitize_model_output(output: dict[str, Any]) -> dict[str, Any]:
         "verdict": verdict,
         "confidence": confidence,
         "reason": sanitize_provider_error_text(output.get("reason") or ""),
+        "failure_category": output.get("failure_category")
+        or classify_provider_error_text(output.get("reason")),
         "model_evidence": output.get("evidence") if isinstance(output.get("evidence"), list) else [],
         "raw_output": output,
     }
@@ -1942,9 +1944,17 @@ def build_vision_review_results(
             verdict = sanitized["verdict"]
             confidence = sanitized["confidence"]
             reason = sanitized["reason"]
-            limits = []
+            failure_category = sanitized.get("failure_category")
+            limits = [failure_category] if failure_category else []
             model_evidence = sanitized["model_evidence"]
 
+        has_provider_failure = any(str(item).startswith("provider_") for item in limits)
+        if verdict == "unresolved" and has_provider_failure:
+            recommended_action = "retry_or_review_before_identity_mutation"
+        elif verdict == "unresolved":
+            recommended_action = "keep_unresolved_no_identity_mutation"
+        else:
+            recommended_action = "requires_validator_before_identity_mutation"
         results.append(
             {
                 "case_id": case_id,
@@ -1955,11 +1965,7 @@ def build_vision_review_results(
                 "verdict": verdict,
                 "confidence": confidence,
                 "reason": reason,
-                "recommended_action": (
-                    "keep_unresolved_no_identity_mutation"
-                    if verdict == "unresolved"
-                    else "requires_validator_before_identity_mutation"
-                ),
+                "recommended_action": recommended_action,
                 "contact_sheet_path": contact_sheet_path,
                 "crop_count": len(evidence),
                 "evidence": evidence,

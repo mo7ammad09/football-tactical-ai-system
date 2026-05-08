@@ -31,6 +31,7 @@ REQUIRED_RUNPOD_ARTIFACTS: tuple[str, ...] = (
     "identity_stability_plan_json",
     "identity_stability_applied_json",
     "vision_contact_sheets_zip",
+    "identity_review_bundle_zip",
 )
 
 REQUIRED_SOURCE_FILES: tuple[str, ...] = (

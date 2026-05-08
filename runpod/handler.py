@@ -232,6 +232,7 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             ),
             "player_crop_index_json": ("application/json", "player_crop_index_json_url"),
             "vision_contact_sheets_zip": ("application/zip", "vision_contact_sheets_zip_url"),
+            "identity_review_bundle_zip": ("application/zip", "identity_review_bundle_zip_url"),
         }
         artifacts = {}
         for artifact_name, (content_type, url_key) in artifact_specs.items():

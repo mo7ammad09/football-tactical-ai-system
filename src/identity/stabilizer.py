@@ -22,9 +22,17 @@ NOOP_STATUS = "no_ready_actions"
 REJECTED_STATUS = "rejected"
 MIN_PLAYER_ROLE_CONFIDENCE = 0.80
 MIN_PLAYER_TEAM_CONFIDENCE = 0.85
+MIN_STRONG_PLAYER_TEAM_CONFIDENCE = 0.94
 MAX_MINOR_ROLE_SEGMENT_FRAMES = 2
 MAX_MINOR_TEAM_SEGMENT_FRAMES = 12
 MAX_MINOR_TEAM_SEGMENT_RATIO = 0.08
+MAX_STRONG_MINOR_TEAM_SEGMENT_FRAMES = 30
+MAX_STRONG_MINOR_TEAM_SEGMENT_RATIO = 0.06
+VALID_ACTION_TYPES = {
+    "stable_player_display_override",
+    "stable_player_role_display_override",
+    "stable_player_team_display_override",
+}
 
 
 def _as_int(value: Any, fallback: int = 0) -> int:
@@ -234,6 +242,80 @@ def _safe_player_team_decision(
     return is_safe, int(team_int), float(confidence), int(margin)
 
 
+def _strong_player_team_safe(profile: dict[str, Any]) -> bool:
+    """Return whether team evidence is strong enough for display-only locking."""
+    return (
+        bool(profile.get("player_role_safe"))
+        and _as_int(profile.get("dominant_player_team"), 0) in {1, 2}
+        and _as_float(profile.get("player_team_confidence"), 0.0)
+        >= MIN_STRONG_PLAYER_TEAM_CONFIDENCE
+        and _as_int(profile.get("max_minor_team_segment_frames"), 0)
+        <= MAX_STRONG_MINOR_TEAM_SEGMENT_FRAMES
+        and _as_float(profile.get("max_minor_team_segment_ratio"), 0.0)
+        <= MAX_STRONG_MINOR_TEAM_SEGMENT_RATIO
+    )
+
+
+def _action_sets_role(action: dict[str, Any]) -> bool:
+    """Return whether an action writes display role/label."""
+    return action.get("set_display_role") is not None
+
+
+def _action_sets_team(action: dict[str, Any]) -> bool:
+    """Return whether an action writes display team/color."""
+    return action.get("set_display_team") is not None
+
+
+def _build_player_display_action(
+    profile: dict[str, Any],
+    *,
+    action_type: str,
+    set_role: bool,
+    set_team: bool,
+    reason: str,
+) -> dict[str, Any]:
+    """Build a JSON-safe display stabilization action."""
+    track_id = _as_int(profile.get("track_id"), -1)
+    action: dict[str, Any] = {
+        "action_id": f"{action_type}_{track_id}",
+        "action_type": action_type,
+        "status": READY_STATUS,
+        "track_id": int(track_id),
+        "role_confidence": float(profile.get("raw_role_confidence", 0.0)),
+        "team_confidence": float(profile.get("player_team_confidence", 0.0)),
+        "role_margin": int(profile.get("raw_role_margin", 0)),
+        "team_margin": int(profile.get("player_team_margin", 0)),
+        "max_minor_role_segment_frames": int(
+            profile.get("max_minor_role_segment_frames", 0)
+        ),
+        "max_minor_role_segment_ratio": float(
+            profile.get("max_minor_role_segment_ratio", 0.0)
+        ),
+        "max_minor_team_segment_frames": int(
+            profile.get("max_minor_team_segment_frames", 0)
+        ),
+        "max_minor_team_segment_ratio": float(
+            profile.get("max_minor_team_segment_ratio", 0.0)
+        ),
+        "reason": reason,
+        "evidence": {
+            "raw_role_counts": profile.get("raw_role_counts", {}),
+            "player_team_counts": profile.get("player_team_counts", {}),
+            "display_role_counts": profile.get("display_role_counts", {}),
+            "display_team_counts": profile.get("display_team_counts", {}),
+            "raw_role_segments": profile.get("raw_role_segments", []),
+            "player_team_segments": profile.get("player_team_segments", []),
+        },
+    }
+    if set_role:
+        action["set_display_role"] = "player"
+        action["set_display_label"] = str(track_id)
+    if set_team:
+        action["set_display_team"] = int(profile.get("dominant_player_team", 0))
+        action["set_display_color"] = profile.get("canonical_display_color")
+    return action
+
+
 def _track_profiles(raw_tracklet_rows: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
     """Build display-stability profiles by track id."""
     grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -349,22 +431,39 @@ def validate_global_identity_stability_plan(plan: dict[str, Any]) -> dict[str, A
         reasons: list[str] = []
         if action.get("status") != READY_STATUS:
             continue
-        if str(action.get("action_type")) != "stable_player_display_override":
+        action_type = str(action.get("action_type"))
+        sets_role = _action_sets_role(action)
+        sets_team = _action_sets_team(action)
+        if action_type not in VALID_ACTION_TYPES:
             reasons.append("unsupported_action_type")
-        if str(action.get("set_display_role")) != "player":
-            reasons.append("only_player_display_overrides_are_supported")
-        if _as_int(action.get("set_display_team"), 0) not in {1, 2}:
-            reasons.append("player_display_team_must_be_team_1_or_2")
-        if _as_float(action.get("role_confidence"), 0.0) < MIN_PLAYER_ROLE_CONFIDENCE:
-            reasons.append("role_confidence_below_threshold")
-        if _as_float(action.get("team_confidence"), 0.0) < MIN_PLAYER_TEAM_CONFIDENCE:
-            reasons.append("team_confidence_below_threshold")
-        if _as_int(action.get("max_minor_role_segment_frames"), 0) > MAX_MINOR_ROLE_SEGMENT_FRAMES:
-            reasons.append("minor_role_segment_too_long")
-        if _as_int(action.get("max_minor_team_segment_frames"), 0) > MAX_MINOR_TEAM_SEGMENT_FRAMES:
-            reasons.append("minor_team_segment_too_long")
-        if _as_float(action.get("max_minor_team_segment_ratio"), 0.0) > MAX_MINOR_TEAM_SEGMENT_RATIO:
-            reasons.append("minor_team_segment_ratio_too_high")
+        if not sets_role and not sets_team:
+            reasons.append("display_action_must_set_role_or_team")
+        if action_type == "stable_player_display_override" and (not sets_role or not sets_team):
+            reasons.append("combined_display_override_requires_role_and_team")
+        if action_type == "stable_player_role_display_override" and not sets_role:
+            reasons.append("role_display_override_requires_role")
+        if action_type == "stable_player_team_display_override" and not sets_team:
+            reasons.append("team_display_override_requires_team")
+        if sets_role:
+            if str(action.get("set_display_role")) != "player":
+                reasons.append("only_player_display_role_overrides_are_supported")
+            if _as_float(action.get("role_confidence"), 0.0) < MIN_PLAYER_ROLE_CONFIDENCE:
+                reasons.append("role_confidence_below_threshold")
+            if _as_int(action.get("max_minor_role_segment_frames"), 0) > MAX_MINOR_ROLE_SEGMENT_FRAMES:
+                reasons.append("minor_role_segment_too_long")
+        if sets_team:
+            if _as_int(action.get("set_display_team"), 0) not in {1, 2}:
+                reasons.append("player_display_team_must_be_team_1_or_2")
+            if _as_float(action.get("role_confidence"), 0.0) < MIN_PLAYER_ROLE_CONFIDENCE:
+                reasons.append("team_lock_requires_stable_player_role")
+            if _as_int(action.get("max_minor_role_segment_frames"), 0) > MAX_MINOR_ROLE_SEGMENT_FRAMES:
+                reasons.append("team_lock_requires_stable_player_role_segments")
+            if _as_float(action.get("team_confidence"), 0.0) < MIN_PLAYER_TEAM_CONFIDENCE:
+                reasons.append("team_confidence_below_threshold")
+            if _as_int(action.get("max_minor_team_segment_frames"), 0) > MAX_STRONG_MINOR_TEAM_SEGMENT_FRAMES:
+                reasons.append("minor_team_segment_too_long")
+            if _as_float(action.get("max_minor_team_segment_ratio"), 0.0) > MAX_STRONG_MINOR_TEAM_SEGMENT_RATIO:
+                reasons.append("minor_team_segment_ratio_too_high")
         if action.get("track_id") is None:
             reasons.append("missing_track_id")
         if reasons:
@@ -439,47 +538,53 @@ def build_global_identity_stability_plan(
                 )
             continue
 
+        action_added = False
         if profile.get("player_role_safe") and profile.get("player_team_safe"):
-            action = {
-                "action_id": f"stable_player_display_{track_id}",
-                "action_type": "stable_player_display_override",
-                "status": READY_STATUS,
-                "track_id": int(track_id),
-                "set_display_role": "player",
-                "set_display_label": str(track_id),
-                "set_display_team": int(profile.get("dominant_player_team", 0)),
-                "set_display_color": profile.get("canonical_display_color"),
-                "role_confidence": float(profile.get("raw_role_confidence", 0.0)),
-                "team_confidence": float(profile.get("player_team_confidence", 0.0)),
-                "role_margin": int(profile.get("raw_role_margin", 0)),
-                "team_margin": int(profile.get("player_team_margin", 0)),
-                "max_minor_role_segment_frames": int(
-                    profile.get("max_minor_role_segment_frames", 0)
-                ),
-                "max_minor_role_segment_ratio": float(
-                    profile.get("max_minor_role_segment_ratio", 0.0)
-                ),
-                "max_minor_team_segment_frames": int(
-                    profile.get("max_minor_team_segment_frames", 0)
-                ),
-                "max_minor_team_segment_ratio": float(
-                    profile.get("max_minor_team_segment_ratio", 0.0)
-                ),
-                "reason": (
-                    "Track has enough raw player-role and team evidence to keep "
-                    "client-facing role/team stable across rendered frames."
-                ),
-                "evidence": {
-                    "raw_role_counts": profile.get("raw_role_counts", {}),
-                    "player_team_counts": profile.get("player_team_counts", {}),
-                    "display_role_counts": profile.get("display_role_counts", {}),
-                    "display_team_counts": profile.get("display_team_counts", {}),
-                    "raw_role_segments": profile.get("raw_role_segments", []),
-                    "player_team_segments": profile.get("player_team_segments", []),
-                },
-            }
-            actions.append(action)
-            continue
+            actions.append(
+                _build_player_display_action(
+                    profile,
+                    action_type="stable_player_display_override",
+                    set_role=True,
+                    set_team=True,
+                    reason=(
+                        "Track has enough raw player-role and team evidence to keep "
+                        "client-facing role/team stable across rendered frames."
+                    ),
+                )
+            )
+            action_added = True
+        else:
+            if profile.get("player_role_safe") and (display_role_transitions > 0 or has_gk_leak):
+                actions.append(
+                    _build_player_display_action(
+                        profile,
+                        action_type="stable_player_role_display_override",
+                        set_role=True,
+                        set_team=False,
+                        reason=(
+                            "Track has isolated role flicker only; lock the "
+                            "client-facing role to player without forcing team."
+                        ),
+                    )
+                )
+                action_added = True
+            if (
+                display_team_transitions > 0
+                and _strong_player_team_safe(profile)
+            ):
+                actions.append(
+                    _build_player_display_action(
+                        profile,
+                        action_type="stable_player_team_display_override",
+                        set_role=False,
+                        set_team=True,
+                        reason=(
+                            "Track has strong player-team evidence with a small "
+                            "minor team segment; lock display team/color only."
+                        ),
+                    )
+                )
+                action_added = True
 
         if has_visible_flicker or has_gk_leak or has_hidden_role_conflict or has_hidden_team_conflict:
             reasons: list[str] = []
@@ -500,6 +605,12 @@ def build_global_identity_stability_plan(
                     "track_id": int(track_id),
                     "status": REVIEW_STATUS,
                     "reason": ",".join(reasons) if reasons else "display_flicker_needs_review",
+                    "recommended_action": (
+                        "segment_split_required"
+                        if has_hidden_role_conflict or has_hidden_team_conflict
+                        else "review_remaining_display_evidence"
+                    ),
+                    "partial_safe_action_applied": bool(action_added),
                     "profile": profile,
                 }
             )
@@ -554,18 +665,24 @@ def apply_global_identity_stability_plan_to_raw_records(
     for action in _ready_actions(stability_plan):
         track_id = _as_int(action.get("track_id"), -1)
         action_updates = 0
+        sets_role = _action_sets_role(action)
+        sets_team = _action_sets_team(action)
         color = normalize_color(action.get("set_display_color"), PLAYER_FALLBACK_COLOR)
         for row in rows:
-            if str(row.get("object_type")) != "player":
+            if str(row.get("object_type")) not in PERSON_OBJECT_TYPES:
                 continue
             if _source_track_id(row) != track_id:
                 continue
-            row["display_role"] = "player"
-            row["display_label"] = str(action.get("set_display_label", track_id))
-            row["display_team"] = int(action.get("set_display_team"))
-            row["display_color"] = list(color)
-            row["goalkeeper_display_locked"] = False
-            row["role_display_suppressed"] = False
+            if sets_team and not sets_role and _raw_role(row) != "player":
+                continue
+            if sets_role:
+                row["display_role"] = "player"
+                row["display_label"] = str(action.get("set_display_label", track_id))
+                row["goalkeeper_display_locked"] = False
+                row["role_display_suppressed"] = False
+            if sets_team:
+                row["display_team"] = int(action.get("set_display_team"))
+                row["display_color"] = list(color)
             row["identity_stability_status"] = "phase12_safe_applied"
             row["identity_stability_action_id"] = action.get("action_id")
             row["identity_stability_role_confidence"] = float(action.get("role_confidence", 0.0))
@@ -578,7 +695,12 @@ def apply_global_identity_stability_plan_to_raw_records(
                     "action_id": action.get("action_id"),
                     "track_id": track_id,
                     "updated_record_count": action_updates,
-                    "set_display_team": int(action.get("set_display_team")),
+                    "set_display_role": action.get("set_display_role"),
+                    "set_display_team": (
+                        int(action.get("set_display_team"))
+                        if action.get("set_display_team") is not None
+                        else None
+                    ),
                 }
             )
 
@@ -605,20 +727,27 @@ def apply_global_identity_stability_plan_to_annotation_states(
     updated = 0
     for action in ready:
         track_id = _as_int(action.get("track_id"), -1)
+        sets_role = _action_sets_role(action)
+        sets_team = _action_sets_team(action)
         color = normalize_color(action.get("set_display_color"), PLAYER_FALLBACK_COLOR)
         for state in annotation_states:
-            track = (state.get("players") or {}).get(track_id)
-            if track is None:
-                continue
-            track["display_role"] = "player"
-            track["display_label"] = str(action.get("set_display_label", track_id))
-            track["display_team"] = int(action.get("set_display_team"))
-            track["display_color"] = tuple(color)
-            track["goalkeeper_display_locked"] = False
-            track["role_display_suppressed"] = False
-            track["identity_stability_status"] = "phase12_safe_applied"
-            track["identity_stability_action_id"] = action.get("action_id")
-            track["identity_stability_role_confidence"] = float(action.get("role_confidence", 0.0))
-            track["identity_stability_team_confidence"] = float(action.get("team_confidence", 0.0))
-            updated += 1
+            for bucket_name in ("players", "referees"):
+                track = (state.get(bucket_name) or {}).get(track_id)
+                if track is None:
+                    continue
+                if sets_team and not sets_role and str(track.get("role") or bucket_name) != "player":
+                    continue
+                if sets_role:
+                    track["display_role"] = "player"
+                    track["display_label"] = str(action.get("set_display_label", track_id))
+                    track["goalkeeper_display_locked"] = False
+                    track["role_display_suppressed"] = False
+                if sets_team:
+                    track["display_team"] = int(action.get("set_display_team"))
+                    track["display_color"] = tuple(color)
+                track["identity_stability_status"] = "phase12_safe_applied"
+                track["identity_stability_action_id"] = action.get("action_id")
+                track["identity_stability_role_confidence"] = float(action.get("role_confidence", 0.0))
+                track["identity_stability_team_confidence"] = float(action.get("team_confidence", 0.0))
+                updated += 1
     return updated

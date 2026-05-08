@@ -1,5 +1,6 @@
 from src.identity.model_review import (
     build_identity_model_review_request,
+    classify_provider_error_text,
     invoke_identity_review_provider,
     normalize_identity_review_model_outputs,
     resolve_identity_review_model_config,
@@ -266,6 +267,7 @@ def test_phase11_google_gemma_missing_key_fails_closed(monkeypatch):
 
     assert result["status"] == "missing_api_key"
     assert result["model_outputs"][0]["verdict"] == "unresolved"
+    assert result["model_outputs"][0]["failure_category"] == "provider_missing_or_invalid_key"
     assert "API key" in result["model_outputs"][0]["reason"]
 
 
@@ -279,6 +281,12 @@ def test_phase11_sanitizes_google_provider_errors():
     assert "AIza" not in text
     assert "key=" not in text
     assert "generativelanguage.googleapis.com/v1beta" not in text
+
+
+def test_phase11_classifies_common_provider_errors():
+    assert classify_provider_error_text("429 Too Many Requests") == "provider_rate_limited"
+    assert classify_provider_error_text("403 Forbidden") == "provider_forbidden"
+    assert classify_provider_error_text("Read timed out") == "provider_timeout"
 
 
 def test_phase11_retries_google_gemma_case_failures(monkeypatch):
@@ -322,5 +330,6 @@ def test_phase11_retries_google_gemma_case_failures(monkeypatch):
     assert calls["count"] == 2
     output = result["model_outputs"][0]
     assert output["verdict"] == "unresolved"
+    assert output["failure_category"] == "provider_error"
     assert "AIza" not in output["reason"]
     assert "key=" not in output["reason"]

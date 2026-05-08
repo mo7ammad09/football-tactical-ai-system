@@ -31,6 +31,7 @@ def test_phase9_preflight_tracks_final_identity_manifest_artifact():
     assert "identity_resolution_plan_json" in result["required_artifacts"]
     assert "identity_resolution_applied_json" in result["required_artifacts"]
     assert "vision_review_results_json" in result["required_artifacts"]
+    assert "identity_review_bundle_zip" in result["required_artifacts"]
     assert result["baseline_image"].endswith(":sha-bbe8dec")
     assert any(
         item["image"].endswith(":sha-5f969e6")

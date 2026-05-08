@@ -6,6 +6,7 @@ from typing import Any
 
 
 IDENTITY_ARTIFACTS: tuple[tuple[str, str], ...] = (
+    ("identity_review_bundle_zip_url", "Identity review bundle"),
     ("raw_tracklets_jsonl_url", "Raw tracklets"),
     ("identity_debug_json_url", "Identity debug"),
     ("identity_events_json_url", "Identity events"),

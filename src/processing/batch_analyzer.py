@@ -106,7 +106,16 @@ def _draw_review_frame(
         if player.get("has_ball", False):
             out = tracker.draw_triangle(out, player["bbox"], (0, 0, 255))
 
-    for _, referee in referee_track.items():
+    for referee_id, referee in referee_track.items():
+        if str(referee.get("display_role") or referee.get("role") or "") == "player":
+            color = resolve_player_annotation_color(referee)
+            out = tracker.draw_ellipse(
+                out,
+                referee["bbox"],
+                color,
+                referee.get("display_label", referee_id),
+            )
+            continue
         out = tracker.draw_ellipse(out, referee["bbox"], (0, 255, 255))
 
     for _, ball in ball_track.items():
@@ -229,6 +238,7 @@ def _write_identity_artifacts(
     identity_resolution_applied_path = identity_dir / f"{job_id}_identity_resolution_applied.json"
     identity_stability_plan_path = identity_dir / f"{job_id}_identity_stability_plan.json"
     identity_stability_applied_path = identity_dir / f"{job_id}_identity_stability_applied.json"
+    identity_review_bundle_path = identity_dir / f"{job_id}_identity_review_bundle.zip"
 
     _write_jsonl(raw_tracklets_path, raw_tracklet_records)
     identity_debug_path.write_text(
@@ -295,6 +305,7 @@ def _write_identity_artifacts(
         json.dumps(_json_safe(identity_stability_applied), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    _zip_directory(identity_dir, identity_review_bundle_path)
 
     return {
         "raw_tracklets_jsonl": raw_tracklets_path,
@@ -314,6 +325,7 @@ def _write_identity_artifacts(
         "identity_resolution_applied_json": identity_resolution_applied_path,
         "identity_stability_plan_json": identity_stability_plan_path,
         "identity_stability_applied_json": identity_stability_applied_path,
+        "identity_review_bundle_zip": identity_review_bundle_path,
     }
 
 
@@ -415,9 +427,10 @@ def _make_contact_sheet(crops: List[tuple[Path, str]], output_path: Path) -> boo
 def _zip_directory(source_dir: Path, output_path: Path) -> None:
     """Zip a directory, preserving relative paths."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    excluded = output_path.resolve()
     with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as zip_f:
         for path in sorted(source_dir.rglob("*")):
-            if path.is_file():
+            if path.is_file() and path.resolve() != excluded:
                 zip_f.write(path, path.relative_to(source_dir))
 
 
@@ -2592,6 +2605,7 @@ def run_batch_analysis(
         "identity_stability_applied_json": {"local_path": str(report_paths["identity_stability_applied_json"]), "content_type": "application/json"},
         "player_crop_index_json": {"local_path": str(report_paths["player_crop_index_json"]), "content_type": "application/json"},
         "vision_contact_sheets_zip": {"local_path": str(report_paths["vision_contact_sheets_zip"]), "content_type": "application/zip"},
+        "identity_review_bundle_zip": {"local_path": str(report_paths["identity_review_bundle_zip"]), "content_type": "application/zip"},
     }
     report_paths["report_json"].write_text(
         json.dumps(report, ensure_ascii=False, indent=2),
