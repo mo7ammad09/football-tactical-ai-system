@@ -2344,6 +2344,7 @@ def run_batch_analysis(
         )
         if post_fix_audit_improved(render_audit_after, candidate_resolution_audit):
             raw_tracklet_records = candidate_resolution_records
+            render_audit_after = candidate_resolution_audit
             identity_resolution_applied["kept"] = True
             identity_resolution_applied["post_apply_audit_verdict"] = (
                 candidate_resolution_audit.get("verdict")

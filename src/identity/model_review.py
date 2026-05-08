@@ -29,9 +29,19 @@ DEFAULT_GOOGLE_GEMMA_MODEL = "gemma-4-31b-it"
 GOOGLE_GENERATE_CONTENT_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 )
+OPENROUTER_PROVIDER = "openrouter"
+OPENROUTER_PROVIDERS = {
+    OPENROUTER_PROVIDER,
+    "openrouter_gemma",
+    "openrouter_gemma_api",
+}
+DEFAULT_OPENROUTER_GEMMA_MODEL = "google/gemma-4-31b-it"
+OPENROUTER_CHAT_COMPLETIONS_URL = "https://openrouter.ai/api/v1/chat/completions"
 PROVIDER_ERROR_REDACTION_PATTERNS = (
     re.compile(r"key=[^&\s)]+"),
     re.compile(r"AIza[0-9A-Za-z_\-]{20,}"),
+    re.compile(r"sk-or-v1-[0-9A-Za-z_\-]+"),
+    re.compile(r"Bearer\s+[0-9A-Za-z_\-\.]+", flags=re.IGNORECASE),
 )
 
 IDENTITY_REVIEW_OUTPUT_SCHEMA = {
@@ -127,17 +137,21 @@ def _case_prompt(case: dict[str, Any], crop_case: dict[str, Any]) -> str:
             f"{case_id}. Decide whether the track has strong evidence for team_1 "
             "or team_2. Do not treat KMeans/team counts as ground truth when they "
             "are split or weak. Compare the crops from each reported team segment; "
-            "if they look like different people or the evidence is not balanced, "
-            "return unresolved. Return team_1 or team_2 only when evidence is strong."
+            "if they look like different people, return unresolved and start the "
+            "reason with 'segment_split_required:'. If the same real player is "
+            "split across separate display track IDs, start the reason with "
+            "'identity_cluster_required:'. Return team_1 or team_2 only when "
+            "numeric and visual evidence are both strong."
         )
     if question == "role_stability_flicker":
         return (
             "Review the audit evidence, crop metadata, and contact sheet for case "
             f"{case_id}. Decide whether the visible role should be player, "
             "referee, goalkeeper, or unresolved. Compare crops from every role "
-            "segment, especially minority/problem frames. Treat isolated flicker "
-            "as uncertain unless neighboring metadata and visual evidence strongly "
-            "support one role."
+            "segment, especially minority/problem frames. If one display track "
+            "contains multiple real people, return unresolved and start the reason "
+            "with 'segment_split_required:'. Treat isolated flicker as uncertain "
+            "unless neighboring metadata and visual evidence strongly support one role."
         )
     return (
         f"Review identity case {case_id}. Decide only the requested identity "
@@ -151,6 +165,11 @@ def _is_google_gemma_provider(provider: str | None) -> bool:
     return str(provider or "").strip().lower() in GOOGLE_GEMMA_PROVIDERS
 
 
+def _is_openrouter_provider(provider: str | None) -> bool:
+    """Return true when provider should use OpenRouter chat completions."""
+    return str(provider or "").strip().lower() in OPENROUTER_PROVIDERS
+
+
 def _google_api_key() -> str | None:
     """Return the configured Google AI API key, if available."""
     return (
@@ -160,6 +179,11 @@ def _google_api_key() -> str | None:
     )
 
 
+def _openrouter_api_key() -> str | None:
+    """Return the configured OpenRouter API key, if available."""
+    return os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENROUTER_KEY")
+
+
 def _resolved_google_model(model: str | None = None) -> str:
     """Return the configured Gemma model id for the Google API provider."""
     return (
@@ -167,6 +191,17 @@ def _resolved_google_model(model: str | None = None) -> str:
         or os.environ.get("IDENTITY_REVIEW_MODEL")
         or os.environ.get("GOOGLE_GEMMA_MODEL")
         or DEFAULT_GOOGLE_GEMMA_MODEL
+    )
+
+
+def _resolved_openrouter_model(model: str | None = None) -> str:
+    """Return the configured OpenRouter model id for Gemma review."""
+    return (
+        model
+        or os.environ.get("IDENTITY_REVIEW_MODEL")
+        or os.environ.get("OPENROUTER_MODEL")
+        or os.environ.get("OPENROUTER_GEMMA_MODEL")
+        or DEFAULT_OPENROUTER_GEMMA_MODEL
     )
 
 
@@ -244,6 +279,10 @@ def _google_prompt(case: dict[str, Any]) -> str:
         "Allowed verdict values: same_player, different_player, goalkeeper, "
         "not_goalkeeper, player, referee, team_1, team_2, unresolved.\n"
         "Use unresolved when the evidence is weak, cropped poorly, or ambiguous.\n"
+        "If the evidence shows one track contains multiple real people, return "
+        "verdict unresolved and begin reason with 'segment_split_required:'.\n"
+        "If the evidence shows one real player is split across multiple track IDs, "
+        "return verdict unresolved and begin reason with 'identity_cluster_required:'.\n"
         "Do not rename track IDs. Do not change render colors.\n\n"
         f"Required JSON schema:\n{schema}\n\n"
         f"Case data:\n{payload}\n\n"
@@ -266,6 +305,22 @@ def _image_part(path_value: Any) -> dict[str, Any] | None:
     return {"inline_data": {"mime_type": mime_type, "data": data}}
 
 
+def _openrouter_image_part(path_value: Any) -> dict[str, Any] | None:
+    """Return an OpenAI-compatible image_url part for OpenRouter."""
+    image_part = _image_part(path_value)
+    if not image_part:
+        return None
+    inline_data = image_part.get("inline_data") or {}
+    mime_type = inline_data.get("mime_type") or "image/jpeg"
+    data = inline_data.get("data")
+    if not isinstance(data, str) or not data:
+        return None
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"data:{mime_type};base64,{data}"},
+    }
+
+
 def _extract_google_text(payload: dict[str, Any]) -> str:
     """Extract text content from a Google generateContent response."""
     candidates = payload.get("candidates")
@@ -278,6 +333,24 @@ def _extract_google_text(payload: dict[str, Any]) -> str:
         if isinstance(part, dict) and isinstance(part.get("text"), str):
             texts.append(part["text"])
     return "\n".join(texts).strip()
+
+
+def _extract_openrouter_text(payload: dict[str, Any]) -> str:
+    """Extract text content from an OpenRouter chat-completions response."""
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    message = choices[0].get("message") if isinstance(choices[0], dict) else {}
+    content = message.get("content") if isinstance(message, dict) else ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        texts: list[str] = []
+        for part in content:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                texts.append(part["text"])
+        return "\n".join(texts).strip()
+    return ""
 
 
 def _parse_json_object(text: str) -> dict[str, Any] | None:
@@ -314,14 +387,22 @@ def sanitize_provider_error_text(value: Any) -> str:
     """Return provider text safe to persist in public review artifacts."""
     text = str(value or "")
     for pattern in PROVIDER_ERROR_REDACTION_PATTERNS:
-        text = pattern.sub(
-            "key=REDACTED" if pattern.pattern.startswith("key=") else "API_KEY_REDACTED",
-            text,
-        )
+        if pattern.pattern.startswith("key="):
+            replacement = "key=REDACTED"
+        elif pattern.pattern.lower().startswith("bearer"):
+            replacement = "Bearer API_KEY_REDACTED"
+        else:
+            replacement = "API_KEY_REDACTED"
+        text = pattern.sub(replacement, text)
     # Requests HTTPError strings include the full URL; keep only the useful status.
     text = re.sub(
         r" for url: https://generativelanguage\.googleapis\.com/[^\s)]+",
         " for Google Generative Language API",
+        text,
+    )
+    text = re.sub(
+        r" for url: https://openrouter\.ai/[^\s)]+",
+        " for OpenRouter API",
         text,
     )
     return text
@@ -341,12 +422,18 @@ def classify_provider_error_text(value: Any) -> str | None:
     return None
 
 
-def _provider_failure_reason(exc: Exception, *, attempt: int, max_attempts: int) -> str:
+def _provider_failure_reason(
+    exc: Exception,
+    *,
+    attempt: int,
+    max_attempts: int,
+    provider_label: str,
+) -> str:
     """Return a sanitized, retry-aware failure reason for a provider exception."""
     exc_name = exc.__class__.__name__
     detail = sanitize_provider_error_text(exc)
     return (
-        "Google Gemma API failed "
+        f"{provider_label} failed "
         f"after attempt {attempt}/{max_attempts}: {exc_name}: {detail}"
     )
 
@@ -441,7 +528,12 @@ def _invoke_google_gemma_case(
                 time.sleep(max(0.0, retry_delay * attempt))
 
     reason = (
-        _provider_failure_reason(last_exc, attempt=max_attempts, max_attempts=max_attempts)
+        _provider_failure_reason(
+            last_exc,
+            attempt=max_attempts,
+            max_attempts=max_attempts,
+            provider_label="Google Gemma API",
+        )
         if last_exc is not None
         else "Google Gemma API failed without a provider exception."
     )
@@ -452,6 +544,94 @@ def _invoke_google_gemma_case(
             {
                 "type": "provider_error",
                 "provider": GOOGLE_GEMMA_PROVIDER,
+                "attempt_count": max_attempts,
+            }
+        ],
+    )
+
+
+def _invoke_openrouter_case(
+    *,
+    case: dict[str, Any],
+    api_key: str,
+    model: str,
+    timeout_seconds: float,
+    max_attempts: int,
+) -> dict[str, Any]:
+    """Invoke OpenRouter's chat-completions API for one identity case."""
+    import requests
+
+    case_id = str(case.get("case_id") or "unknown_case")
+    content: list[dict[str, Any]] = [{"type": "text", "text": _google_prompt(case)}]
+    image_part = _openrouter_image_part(case.get("contact_sheet_path"))
+    if image_part is not None:
+        content.append(image_part)
+
+    request_payload: dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "temperature": 0.0,
+        "response_format": {"type": "json_object"},
+    }
+    max_tokens = os.environ.get("IDENTITY_REVIEW_PROVIDER_MAX_TOKENS")
+    if max_tokens:
+        request_payload["max_tokens"] = max(1, int(max_tokens))
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    referer = os.environ.get("OPENROUTER_HTTP_REFERER")
+    title = os.environ.get("OPENROUTER_X_TITLE", "Football Tactical AI Identity Review")
+    if referer:
+        headers["HTTP-Referer"] = referer
+    if title:
+        headers["X-Title"] = title
+
+    max_attempts = max(1, int(max_attempts))
+    retry_delay = float(os.environ.get("IDENTITY_REVIEW_PROVIDER_RETRY_BACKOFF", "1.5"))
+    last_exc: Exception | None = None
+    url = os.environ.get("OPENROUTER_CHAT_COMPLETIONS_URL", OPENROUTER_CHAT_COMPLETIONS_URL)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json=request_payload,
+                timeout=timeout_seconds,
+            )
+            response.raise_for_status()
+            text = _extract_openrouter_text(response.json())
+            parsed = _parse_json_object(text)
+            if parsed is None:
+                return _unresolved_provider_output(
+                    case_id=case_id,
+                    reason="OpenRouter Gemma API returned non-JSON output.",
+                    evidence=[{"type": "raw_text", "text": text[:500]}] if text else [],
+                )
+            return _sanitize_provider_output(case_id, parsed)
+        except Exception as exc:  # noqa: BLE001 - provider failures must fail closed.
+            last_exc = exc
+            if attempt < max_attempts:
+                time.sleep(max(0.0, retry_delay * attempt))
+
+    reason = (
+        _provider_failure_reason(
+            last_exc,
+            attempt=max_attempts,
+            max_attempts=max_attempts,
+            provider_label="OpenRouter Gemma API",
+        )
+        if last_exc is not None
+        else "OpenRouter Gemma API failed without a provider exception."
+    )
+    return _unresolved_provider_output(
+        case_id=case_id,
+        reason=reason,
+        evidence=[
+            {
+                "type": "provider_error",
+                "provider": OPENROUTER_PROVIDER,
                 "attempt_count": max_attempts,
             }
         ],
@@ -496,7 +676,9 @@ def invoke_identity_review_provider(
             **base_meta,
             "output_count": 0,
         }
-    if not _is_google_gemma_provider(provider_name):
+    uses_google = _is_google_gemma_provider(provider_name)
+    uses_openrouter = _is_openrouter_provider(provider_name)
+    if not uses_google and not uses_openrouter:
         return {
             "status": "unsupported_provider",
             "model_outputs": None,
@@ -504,8 +686,17 @@ def invoke_identity_review_provider(
             "output_count": 0,
         }
 
-    api_key = _google_api_key()
-    model_name = _resolved_google_model(model_name)
+    if uses_openrouter:
+        api_key = _openrouter_api_key()
+        model_name = _resolved_openrouter_model(model_name)
+        missing_env = "OPENROUTER_API_KEY"
+        missing_reason = "OpenRouter API key is not configured."
+    else:
+        api_key = _google_api_key()
+        model_name = _resolved_google_model(model_name)
+        missing_env = "GOOGLE_API_KEY"
+        missing_reason = "Google API key is not configured."
+
     base_meta["model"] = model_name
     cases = [
         case
@@ -523,8 +714,8 @@ def invoke_identity_review_provider(
         outputs = [
             _unresolved_provider_output(
                 case_id=str(case.get("case_id") or "unknown_case"),
-                reason="Google API key is not configured.",
-                evidence=[{"type": "missing_env", "env": "GOOGLE_API_KEY"}],
+                reason=missing_reason,
+                evidence=[{"type": "missing_env", "env": missing_env}],
             )
             for case in cases
         ]
@@ -537,8 +728,9 @@ def invoke_identity_review_provider(
 
     timeout_seconds = float(os.environ.get("IDENTITY_REVIEW_PROVIDER_TIMEOUT", "45"))
     max_attempts = int(os.environ.get("IDENTITY_REVIEW_PROVIDER_RETRIES", "2"))
+    invoke_case = _invoke_openrouter_case if uses_openrouter else _invoke_google_gemma_case
     outputs = [
-        _invoke_google_gemma_case(
+        invoke_case(
             case=case,
             api_key=api_key,
             model=model_name,
@@ -589,25 +781,37 @@ def resolve_identity_review_model_config(
     """Return stable provider config for Phase 11/Phase 6."""
     requested_provider = str(provider or "").strip() or None
     has_google_key = bool(_google_api_key())
+    has_openrouter_key = bool(_openrouter_api_key())
     explicitly_disabled = provider_enabled is False and model_outputs is None
     explicit_google_provider = bool(
         requested_provider and _is_google_gemma_provider(requested_provider) and has_google_key
     )
-    should_default_google = bool(provider_enabled and has_google_key and not requested_provider)
+    explicit_openrouter_provider = bool(
+        requested_provider and _is_openrouter_provider(requested_provider) and has_openrouter_key
+    )
+    should_default_openrouter = bool(
+        provider_enabled and has_openrouter_key and not requested_provider
+    )
+    should_default_google = bool(
+        provider_enabled and has_google_key and not requested_provider and not should_default_openrouter
+    )
     enabled = bool(
         model_outputs is not None
         or (
             not explicitly_disabled
-            and bool(provider_enabled or explicit_google_provider)
+            and bool(provider_enabled or explicit_google_provider or explicit_openrouter_provider)
         )
     )
     resolved_provider = (
         requested_provider
+        or (OPENROUTER_PROVIDER if should_default_openrouter else None)
         or (GOOGLE_GEMMA_PROVIDER if should_default_google else None)
         or (DEFAULT_REVIEW_PROVIDER if enabled else None)
     )
     if model:
         resolved_model = model
+    elif _is_openrouter_provider(resolved_provider):
+        resolved_model = _resolved_openrouter_model(None)
     elif _is_google_gemma_provider(resolved_provider):
         resolved_model = _resolved_google_model(None)
     elif enabled:

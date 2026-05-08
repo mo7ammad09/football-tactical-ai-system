@@ -28,6 +28,8 @@ MAX_MINOR_TEAM_SEGMENT_FRAMES = 12
 MAX_MINOR_TEAM_SEGMENT_RATIO = 0.08
 MAX_STRONG_MINOR_TEAM_SEGMENT_FRAMES = 30
 MAX_STRONG_MINOR_TEAM_SEGMENT_RATIO = 0.06
+RAW_FRAGMENT_COUNT_REVIEW_THRESHOLD = 8
+RAW_FRAGMENT_TRANSITION_REVIEW_THRESHOLD = 16
 VALID_ACTION_TYPES = {
     "stable_player_display_override",
     "stable_player_role_display_override",
@@ -300,10 +302,12 @@ def _build_player_display_action(
         "reason": reason,
         "evidence": {
             "raw_role_counts": profile.get("raw_role_counts", {}),
+            "raw_track_id_counts": profile.get("raw_track_id_counts", {}),
             "player_team_counts": profile.get("player_team_counts", {}),
             "display_role_counts": profile.get("display_role_counts", {}),
             "display_team_counts": profile.get("display_team_counts", {}),
             "raw_role_segments": profile.get("raw_role_segments", []),
+            "raw_track_id_segments": profile.get("raw_track_id_segments", []),
             "player_team_segments": profile.get("player_team_segments", []),
         },
     }
@@ -329,6 +333,9 @@ def _track_profiles(raw_tracklet_rows: list[dict[str, Any]]) -> dict[int, dict[s
         ordered = sorted(rows, key=lambda item: (_sample_number(item), _frame_idx(item)))
         frames_seen = len(ordered)
         raw_roles = Counter(_raw_role(row) for row in ordered)
+        raw_track_ids = Counter(
+            _as_int(row.get("raw_track_id"), _source_track_id(row)) for row in ordered
+        )
         display_roles = Counter(_display_role(row) for row in ordered)
         display_teams = Counter(_display_team(row) for row in ordered)
         object_types = Counter(str(row.get("object_type") or "unknown") for row in ordered)
@@ -346,8 +353,17 @@ def _track_profiles(raw_tracklet_rows: list[dict[str, Any]]) -> dict[int, dict[s
 
         display_role_sequence = [_display_role(row) for row in ordered]
         display_team_sequence = [_display_team(row) for row in ordered]
+        raw_track_id_sequence = [
+            _as_int(row.get("raw_track_id"), _source_track_id(row)) for row in ordered
+        ]
         raw_role_segments = _segments(
             [(_frame_idx(row), _raw_role(row)) for row in ordered]
+        )
+        raw_track_id_segments = _segments(
+            [
+                (_frame_idx(row), _as_int(row.get("raw_track_id"), _source_track_id(row)))
+                for row in ordered
+            ]
         )
         player_team_segments = _segments(
             [
@@ -376,6 +392,10 @@ def _track_profiles(raw_tracklet_rows: list[dict[str, Any]]) -> dict[int, dict[s
         )
         display_role, display_role_confidence, _, _ = _dominant(display_roles, "unknown")
         display_team, display_team_confidence, _, _ = _dominant(display_teams, 0)
+        dominant_raw_track_id, raw_track_id_confidence, _, _ = _dominant(
+            raw_track_ids,
+            track_id,
+        )
         color, _, _, _ = _dominant(colors_by_team.get(dominant_team, Counter()), None)
         max_minor_role_segment, max_minor_role_segment_ratio = _max_non_value_segment(
             raw_role_segments,
@@ -392,11 +412,15 @@ def _track_profiles(raw_tracklet_rows: list[dict[str, Any]]) -> dict[int, dict[s
             "first_source_frame_idx": _frame_idx(ordered[0]) if ordered else 0,
             "last_source_frame_idx": _frame_idx(ordered[-1]) if ordered else 0,
             "raw_role_counts": _counter_dict(raw_roles),
+            "raw_track_id_counts": _counter_dict(raw_track_ids),
+            "raw_track_id_count": int(len(raw_track_ids)),
             "display_role_counts": _counter_dict(display_roles),
             "display_team_counts": _counter_dict(display_teams),
             "player_team_counts": _counter_dict(player_team_counts),
             "object_type_counts": _counter_dict(object_types),
             "dominant_raw_role": dominant_role,
+            "dominant_raw_track_id": int(_as_int(dominant_raw_track_id, track_id)),
+            "raw_track_id_confidence": float(raw_track_id_confidence),
             "raw_role_confidence": float(role_confidence),
             "raw_role_margin": int(role_margin),
             "dominant_player_team": int(dominant_team),
@@ -408,11 +432,14 @@ def _track_profiles(raw_tracklet_rows: list[dict[str, Any]]) -> dict[int, dict[s
             "display_team_confidence": float(display_team_confidence),
             "display_role_transition_count": int(_transition_count(display_role_sequence)),
             "display_team_transition_count": int(_transition_count(display_team_sequence)),
+            "raw_track_id_transition_count": int(_transition_count(raw_track_id_sequence)),
             "display_goalkeeper_frame_count": sum(1 for row in ordered if _is_display_goalkeeper(row)),
             "player_role_safe": bool(player_role_safe),
             "player_team_safe": bool(player_team_safe),
             "raw_role_segments": raw_role_segments[:20],
             "raw_role_segments_truncated": len(raw_role_segments) > 20,
+            "raw_track_id_segments": raw_track_id_segments[:20],
+            "raw_track_id_segments_truncated": len(raw_track_id_segments) > 20,
             "player_team_segments": player_team_segments[:20],
             "player_team_segments_truncated": len(player_team_segments) > 20,
             "max_minor_role_segment_frames": int(max_minor_role_segment),
@@ -525,6 +552,38 @@ def build_global_identity_stability_plan(
             or _as_float(profile.get("max_minor_team_segment_ratio"), 0.0)
             > MAX_MINOR_TEAM_SEGMENT_RATIO
         )
+        high_raw_fragmentation = (
+            _as_int(profile.get("raw_track_id_count"), 0) >= RAW_FRAGMENT_COUNT_REVIEW_THRESHOLD
+            and _as_int(profile.get("raw_track_id_transition_count"), 0)
+            >= RAW_FRAGMENT_TRANSITION_REVIEW_THRESHOLD
+        )
+        severe_team_conflict = has_hidden_team_conflict and not _strong_player_team_safe(profile)
+        segment_split_required = (
+            has_hidden_role_conflict
+            or severe_team_conflict
+            or (
+                high_raw_fragmentation
+                and (has_hidden_team_conflict or has_gk_leak)
+            )
+        )
+        identity_cluster_required = high_raw_fragmentation and not segment_split_required
+        profile["identity_topology_status"] = (
+            "segment_split_required"
+            if segment_split_required
+            else "identity_cluster_required"
+            if identity_cluster_required
+            else "clean_track"
+        )
+        profile["identity_topology_reason"] = {
+            "high_raw_fragmentation": bool(high_raw_fragmentation),
+            "raw_track_id_count": int(profile.get("raw_track_id_count", 0)),
+            "raw_track_id_transition_count": int(
+                profile.get("raw_track_id_transition_count", 0)
+            ),
+            "hidden_role_conflict": bool(has_hidden_role_conflict),
+            "hidden_team_conflict": bool(has_hidden_team_conflict),
+            "severe_team_conflict": bool(severe_team_conflict),
+        }
 
         if frames_seen < min_frames:
             if has_visible_flicker or has_gk_leak or has_hidden_role_conflict or has_hidden_team_conflict:
@@ -536,6 +595,30 @@ def build_global_identity_stability_plan(
                         "profile": profile,
                     }
                 )
+            continue
+
+        if segment_split_required:
+            reasons: list[str] = []
+            if not profile.get("player_role_safe"):
+                reasons.append("insufficient_role_evidence")
+            if not profile.get("player_team_safe"):
+                reasons.append("insufficient_team_evidence")
+            if has_hidden_role_conflict:
+                reasons.append("hidden_role_conflict")
+            if severe_team_conflict:
+                reasons.append("severe_hidden_team_conflict")
+            if high_raw_fragmentation:
+                reasons.append("high_raw_track_fragmentation")
+            review.append(
+                {
+                    "track_id": int(track_id),
+                    "status": REVIEW_STATUS,
+                    "reason": ",".join(reasons) if reasons else "mixed_identity_topology",
+                    "recommended_action": "segment_split_required",
+                    "partial_safe_action_applied": False,
+                    "profile": profile,
+                }
+            )
             continue
 
         action_added = False
@@ -586,7 +669,13 @@ def build_global_identity_stability_plan(
                 )
                 action_added = True
 
-        if has_visible_flicker or has_gk_leak or has_hidden_role_conflict or has_hidden_team_conflict:
+        if (
+            has_visible_flicker
+            or has_gk_leak
+            or has_hidden_role_conflict
+            or has_hidden_team_conflict
+            or identity_cluster_required
+        ):
             reasons: list[str] = []
             if not profile.get("player_role_safe"):
                 reasons.append("insufficient_role_evidence")
@@ -600,13 +689,17 @@ def build_global_identity_stability_plan(
                 reasons.append("hidden_role_conflict")
             if has_hidden_team_conflict:
                 reasons.append("hidden_team_conflict")
+            if identity_cluster_required:
+                reasons.append("high_raw_track_fragmentation")
             review.append(
                 {
                     "track_id": int(track_id),
                     "status": REVIEW_STATUS,
                     "reason": ",".join(reasons) if reasons else "display_flicker_needs_review",
                     "recommended_action": (
-                        "segment_split_required"
+                        "identity_cluster_required"
+                        if identity_cluster_required
+                        else "segment_split_required"
                         if has_hidden_role_conflict or has_hidden_team_conflict
                         else "review_remaining_display_evidence"
                     ),
@@ -622,6 +715,16 @@ def build_global_identity_stability_plan(
             "profile_count": len(profiles),
             "ready_action_count": len(actions),
             "review_track_count": len(review),
+            "segment_split_required_count": sum(
+                1
+                for item in review
+                if item.get("recommended_action") == "segment_split_required"
+            ),
+            "identity_cluster_required_count": sum(
+                1
+                for item in review
+                if item.get("recommended_action") == "identity_cluster_required"
+            ),
         },
         "actions": actions,
         "needs_review": review[:120],

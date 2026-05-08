@@ -632,23 +632,36 @@ with st.sidebar:
             )
             with st.expander("Gemma Identity Review", expanded=False):
                 identity_review_provider_enabled_remote = st.checkbox(
-                    "تفعيل Gemma API لمراجعة الهوية"
+                    "تفعيل Gemma 4 عبر OpenRouter لمراجعة الهوية"
                     if lang == "ar"
-                    else "Enable Gemma API identity review",
+                    else "Enable Gemma 4 via OpenRouter identity review",
                     value=False,
                     help=(
-                        "يتطلب GOOGLE_API_KEY داخل إعدادات RunPod endpoint. إذا فشل، يبقى النظام على review_required."
+                        "يتطلب OPENROUTER_API_KEY داخل إعدادات RunPod endpoint. إذا فشل، يبقى النظام على review_required."
                         if lang == "ar"
-                        else "Requires GOOGLE_API_KEY in the RunPod endpoint environment. If it fails, the system stays review_required."
+                        else "Requires OPENROUTER_API_KEY in the RunPod endpoint environment. If it fails, the system stays review_required."
+                    ),
+                )
+                identity_review_provider_remote = st.selectbox(
+                    "مزود مراجعة الهوية" if lang == "ar" else "Identity review provider",
+                    options=["openrouter", "google_gemma_api"],
+                    format_func=lambda value: (
+                        "OpenRouter / Gemma 4" if value == "openrouter" else "Google Gemini API (legacy)"
+                    ),
+                    index=0,
+                    help=(
+                        "OpenRouter هو المسار الصحيح لاستخدام google/gemma-4-31b-it عبر API."
+                        if lang == "ar"
+                        else "OpenRouter is the intended API route for google/gemma-4-31b-it."
                     ),
                 )
                 identity_review_model_remote = st.text_input(
                     "Gemma model id" if lang == "ar" else "Gemma model id",
-                    value=os.environ.get("IDENTITY_REVIEW_MODEL", "gemma-4-31b-it"),
+                    value=os.environ.get("IDENTITY_REVIEW_MODEL", "google/gemma-4-31b-it"),
                     help=(
-                        "يمكن تغييره إذا كان اسم Gemma 4 في حساب Google مختلفاً."
+                        "اتركه google/gemma-4-31b-it عند استخدام OpenRouter."
                         if lang == "ar"
-                        else "Change this if the Gemma 4 model id differs in your Google account."
+                        else "Keep google/gemma-4-31b-it when using OpenRouter."
                     ),
                 )
         else:
@@ -656,7 +669,8 @@ with st.sidebar:
             tracker_backend_remote = "botsort"
             runpod_execution_timeout_hours = 2.0
             identity_review_provider_enabled_remote = False
-            identity_review_model_remote = "gemma-4-31b-it"
+            identity_review_provider_remote = "openrouter"
+            identity_review_model_remote = "google/gemma-4-31b-it"
         st.caption(
             "السريع مناسب للمباريات الطويلة. الجودة العالية أدق لكنها أبطأ وأغلى. جودة قصوى مخصصة للمقاطع القصيرة."
             if lang == "ar"
@@ -673,7 +687,8 @@ with st.sidebar:
         tracker_backend_remote = "botsort"
         runpod_execution_timeout_hours = 2.0
         identity_review_provider_enabled_remote = False
-        identity_review_model_remote = "gemma-4-31b-it"
+        identity_review_provider_remote = "openrouter"
+        identity_review_model_remote = "google/gemma-4-31b-it"
 
     st.markdown("---")
     
@@ -1107,7 +1122,7 @@ if video_path:
                         identity_merge_map=identity_merge_map,
                         tracker_backend=tracker_backend_remote,
                         identity_review_provider=(
-                            "google_gemma_api"
+                            identity_review_provider_remote
                             if identity_review_provider_enabled_remote
                             else None
                         ),
@@ -1533,7 +1548,7 @@ if st.session_state.analysis_done and st.session_state.analysis_results:
     identity_artifact_links = build_identity_artifact_links(results)
     if report_json_url or report_csv_url or raw_tracklets_jsonl_url or identity_debug_json_url or identity_artifact_links:
         st.markdown("### 📄 " + ("التقارير" if lang == "ar" else "Reports"))
-        cols = st.columns(5)
+        cols = st.columns(6)
         if report_json_url:
             cols[0].markdown(f"[JSON report]({report_json_url})")
         if report_csv_url:
@@ -1542,6 +1557,16 @@ if st.session_state.analysis_done and st.session_state.analysis_results:
             cols[2].markdown(f"[Raw tracklets]({raw_tracklets_jsonl_url})")
         if identity_debug_json_url:
             cols[3].markdown(f"[Identity debug]({identity_debug_json_url})")
+        bundle_link = next(
+            (
+                link
+                for link in identity_artifact_links
+                if link["key"] == "identity_review_bundle_zip_url"
+            ),
+            None,
+        )
+        if bundle_link:
+            cols[4].markdown(f"[Identity review bundle ZIP]({bundle_link['url']})")
         manifest_link = next(
             (
                 link
@@ -1551,7 +1576,7 @@ if st.session_state.analysis_done and st.session_state.analysis_results:
             None,
         )
         if manifest_link:
-            cols[4].markdown(f"[Final identity manifest]({manifest_link['url']})")
+            cols[5].markdown(f"[Final identity manifest]({manifest_link['url']})")
     
     # Tabs
     tab_labels = ["📊 إحصائيات", "🎯 لوحة تكتيكية", "👥 لاعبين", "🤖 تحليل AI"] if lang == "ar" else ["📊 Stats", "🎯 Tactical", "👥 Players", "🤖 AI"]

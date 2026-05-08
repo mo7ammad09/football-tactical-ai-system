@@ -155,6 +155,22 @@ def test_phase11_resolves_google_gemma_config_from_provider_and_key(monkeypatch)
     assert config["model_output_count"] == 0
 
 
+def test_phase11_resolves_openrouter_gemma_config_from_provider_and_key(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+
+    config = resolve_identity_review_model_config(
+        provider="openrouter",
+        model=None,
+        provider_enabled=None,
+        model_outputs=None,
+    )
+
+    assert config["provider_enabled"] is True
+    assert config["provider"] == "openrouter"
+    assert config["model"] == "google/gemma-4-31b-it"
+    assert config["model_output_count"] == 0
+
+
 def test_phase11_invokes_google_gemma_provider(monkeypatch, tmp_path):
     contact_sheet = tmp_path / "sheet.jpg"
     contact_sheet.write_bytes(b"fake-jpeg")
@@ -242,6 +258,91 @@ def test_phase11_invokes_google_gemma_provider(monkeypatch, tmp_path):
     assert "inline_data" in parts[1]
 
 
+def test_phase11_invokes_openrouter_gemma_provider(monkeypatch, tmp_path):
+    contact_sheet = tmp_path / "sheet.jpg"
+    contact_sheet.write_bytes(b"fake-jpeg")
+    request = build_identity_model_review_request(
+        vision_review_queue={
+            "cases": [
+                {
+                    "case_id": "review_display_team_flicker_2",
+                    "question": "team_assignment_uncertain",
+                    "priority": "high",
+                }
+            ]
+        },
+        player_crop_index={
+            "cases": [
+                {
+                    "case_id": "review_display_team_flicker_2",
+                    "contact_sheet_path": str(contact_sheet),
+                    "target_count": 1,
+                    "crop_requests": [
+                        {
+                            "crop_id": "c1",
+                            "track_id": 2,
+                            "source_frame_idx": 75,
+                            "display_team": 1,
+                            "crop_path": "/tmp/c1.jpg",
+                        }
+                    ],
+                }
+            ]
+        },
+        provider="openrouter",
+        model="google/gemma-4-31b-it",
+    )
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"case_id":"review_display_team_flicker_2",'
+                                '"status":"reviewed","verdict":"team_1",'
+                                '"confidence":0.94,"reason":"consistent team evidence",'
+                                '"evidence":[{"type":"numeric_and_visual"}]}'
+                            )
+                        }
+                    }
+                ]
+            }
+
+    def fake_post(url, headers, json, timeout):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["json"] = json
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.setattr("requests.post", fake_post)
+
+    result = invoke_identity_review_provider(
+        request=request,
+        provider="openrouter",
+        model="google/gemma-4-31b-it",
+        provider_enabled=True,
+        model_outputs=None,
+    )
+
+    assert result["status"] == "invoked"
+    assert result["model_outputs"][0]["verdict"] == "team_1"
+    assert captured["url"] == "https://openrouter.ai/api/v1/chat/completions"
+    assert captured["headers"]["Authorization"] == "Bearer test-openrouter-key"
+    assert captured["json"]["model"] == "google/gemma-4-31b-it"
+    content = captured["json"]["messages"][0]["content"]
+    assert content[0]["type"] == "text"
+    assert content[1]["type"] == "image_url"
+    assert content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
 def test_phase11_google_gemma_missing_key_fails_closed(monkeypatch):
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
@@ -271,6 +372,35 @@ def test_phase11_google_gemma_missing_key_fails_closed(monkeypatch):
     assert "API key" in result["model_outputs"][0]["reason"]
 
 
+def test_phase11_openrouter_missing_key_fails_closed(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_KEY", raising=False)
+    request = {
+        "case_count": 1,
+        "cases": [
+            {
+                "case_id": "case-1",
+                "status": "ready_for_model_review",
+                "prompt": "review",
+            }
+        ],
+    }
+
+    result = invoke_identity_review_provider(
+        request=request,
+        provider="openrouter",
+        model="google/gemma-4-31b-it",
+        provider_enabled=True,
+        model_outputs=None,
+    )
+
+    assert result["status"] == "missing_api_key"
+    output = result["model_outputs"][0]
+    assert output["verdict"] == "unresolved"
+    assert output["failure_category"] == "provider_missing_or_invalid_key"
+    assert output["evidence"][1]["env"] == "OPENROUTER_API_KEY"
+
+
 def test_phase11_sanitizes_google_provider_errors():
     text = sanitize_provider_error_text(
         "500 Server Error for url: "
@@ -281,6 +411,17 @@ def test_phase11_sanitizes_google_provider_errors():
     assert "AIza" not in text
     assert "key=" not in text
     assert "generativelanguage.googleapis.com/v1beta" not in text
+
+
+def test_phase11_sanitizes_openrouter_provider_errors():
+    text = sanitize_provider_error_text(
+        "403 Forbidden for url: https://openrouter.ai/api/v1/chat/completions "
+        "Authorization: Bearer sk-or-v1-secretvalue"
+    )
+
+    assert "sk-or-v1" not in text
+    assert "openrouter.ai/api" not in text
+    assert "OpenRouter API" in text
 
 
 def test_phase11_classifies_common_provider_errors():

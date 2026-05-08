@@ -963,8 +963,7 @@ def test_global_identity_stabilizer_locks_only_when_team_and_role_have_evidence(
 
 def test_global_identity_stabilizer_smooths_isolated_referee_role_frame():
     rows = []
-    rows.extend(_row(17, 17, sample, sample * 10, "player", 1) for sample in range(1, 16))
-    rows.extend(_row(17, 17, sample, sample * 10, "player", 2) for sample in range(16, 30))
+    rows.extend(_row(17, 17, sample, sample * 10, "player", 0) for sample in range(1, 30))
     referee_row = _row(17, 17, 30, 300, "referee", 0, display_role="referee")
     referee_row["object_type"] = "referee"
     rows.append(referee_row)
@@ -1028,6 +1027,37 @@ def test_global_identity_stabilizer_does_not_team_lock_true_role_switch():
     )
     review_case = next(item for item in plan["needs_review"] if item["track_id"] == 20)
     assert review_case["recommended_action"] == "segment_split_required"
+
+
+def test_global_identity_stabilizer_flags_mixed_fragmented_track_for_split():
+    rows = []
+    for sample in range(1, 41):
+        raw_track_id = 100 + (sample % 10)
+        team = 1 if sample <= 20 else 2
+        rows.append(_row(44, raw_track_id, sample, sample * 10, "player", team))
+
+    plan = build_global_identity_stability_plan(rows)
+
+    assert all(action["track_id"] != 44 for action in plan["actions"])
+    review_case = next(item for item in plan["needs_review"] if item["track_id"] == 44)
+    assert review_case["recommended_action"] == "segment_split_required"
+    assert review_case["profile"]["identity_topology_status"] == "segment_split_required"
+    assert review_case["profile"]["raw_track_id_count"] >= 8
+    assert plan["summary"]["segment_split_required_count"] >= 1
+
+
+def test_global_identity_stabilizer_flags_clean_fragmented_track_for_cluster_review():
+    rows = []
+    for sample in range(1, 41):
+        raw_track_id = 200 + (sample % 10)
+        rows.append(_row(45, raw_track_id, sample, sample * 10, "player", 1))
+
+    plan = build_global_identity_stability_plan(rows)
+
+    review_case = next(item for item in plan["needs_review"] if item["track_id"] == 45)
+    assert review_case["recommended_action"] == "identity_cluster_required"
+    assert review_case["profile"]["identity_topology_status"] == "identity_cluster_required"
+    assert plan["summary"]["identity_cluster_required_count"] >= 1
 
 
 def test_global_identity_stabilizer_updates_annotation_states_for_final_render():

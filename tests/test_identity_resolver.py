@@ -1,6 +1,7 @@
 from src.identity.resolver import (
     LOCK_DISPLAY_ROLE_ACTION,
     LOCK_DISPLAY_TEAM_ACTION,
+    MARK_IDENTITY_CLUSTER_REQUIRED_ACTION,
     MARK_SEGMENT_SPLIT_REQUIRED_ACTION,
     MERGE_GOALKEEPER_ACTION,
     READY_STATUS,
@@ -328,6 +329,57 @@ def test_identity_resolver_defers_team_lock_when_model_detects_track_switch():
     assert proposal["proposal_type"] == "segment_split_required"
     assert proposal["proposed_action"] == MARK_SEGMENT_SPLIT_REQUIRED_ACTION
     assert plan["summary"]["segment_split_required_count"] == 1
+
+
+def test_identity_resolver_defers_when_model_detects_identity_cluster_need():
+    decisions = {"render_safe": False, "decisions": []}
+    queue = {
+        "cases": [
+            {
+                "case_id": "review_display_team_flicker_2",
+                "question": "team_assignment_uncertain",
+                "audit_evidence": {
+                    "issue_type": "display_team_flicker",
+                    "track_id": 2,
+                    "player_team_counts": {"1": 280},
+                    "player_team_confidence": 1.0,
+                    "max_minor_player_team_segment_ratio": 0.0,
+                    "max_minor_player_team_segment_frames": 0,
+                    "raw_role_confidence": 1.0,
+                },
+            }
+        ]
+    }
+    results = {
+        "vision_model_invoked": True,
+        "results": [
+            {
+                "case_id": "review_display_team_flicker_2",
+                "question": "team_assignment_uncertain",
+                "status": "reviewed",
+                "verdict": "unresolved",
+                "confidence": 1.0,
+                "reason": (
+                    "identity_cluster_required: the same real player appears "
+                    "fragmented across track IDs."
+                ),
+                "evidence": [{"track_id": 2, "source_frame_idx": 75}],
+                "model_evidence": [{"claim": "identity cluster required"}],
+            }
+        ],
+    }
+
+    plan = build_identity_resolution_plan(
+        identity_review_decisions=decisions,
+        vision_review_queue=queue,
+        vision_review_results=results,
+    )
+
+    proposal = plan["resolution_proposals"][0]
+    assert proposal["status"] == "deferred_needs_evidence"
+    assert proposal["proposal_type"] == "identity_cluster_required"
+    assert proposal["proposed_action"] == MARK_IDENTITY_CLUSTER_REQUIRED_ACTION
+    assert plan["summary"]["identity_cluster_required_count"] == 1
 
 
 def test_identity_resolver_proposes_safe_display_role_lock():

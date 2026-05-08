@@ -20,6 +20,7 @@ MERGE_CANDIDATE_ACTION = "merge_candidate_identity_link"
 LOCK_DISPLAY_TEAM_ACTION = "lock_display_team"
 LOCK_DISPLAY_ROLE_ACTION = "lock_display_role"
 MARK_SEGMENT_SPLIT_REQUIRED_ACTION = "mark_segment_split_required"
+MARK_IDENTITY_CLUSTER_REQUIRED_ACTION = "mark_identity_cluster_required"
 KEEP_UNRESOLVED_ACTION = "keep_unresolved_no_identity_mutation"
 REJECT_MERGE_ACTION = "reject_identity_merge"
 
@@ -42,6 +43,7 @@ VALID_ACTIONS = {
     LOCK_DISPLAY_TEAM_ACTION,
     LOCK_DISPLAY_ROLE_ACTION,
     MARK_SEGMENT_SPLIT_REQUIRED_ACTION,
+    MARK_IDENTITY_CLUSTER_REQUIRED_ACTION,
     KEEP_UNRESOLVED_ACTION,
     REJECT_MERGE_ACTION,
 }
@@ -53,6 +55,7 @@ MAX_SAFE_MINOR_TEAM_SEGMENT_RATIO = 0.12
 MAX_SAFE_MINOR_TEAM_SEGMENT_FRAMES = 30
 MAX_SAFE_MINOR_ROLE_SEGMENT_FRAMES = 2
 SEGMENT_SPLIT_REASON_KEYWORDS = (
+    "segment_split_required",
     "different player",
     "different people",
     "different identities",
@@ -62,6 +65,14 @@ SEGMENT_SPLIT_REASON_KEYWORDS = (
     "track has merged",
     "track merge",
     "merged two different",
+)
+IDENTITY_CLUSTER_REASON_KEYWORDS = (
+    "identity_cluster_required",
+    "same real player is split",
+    "same player is split",
+    "same individual is split",
+    "fragmented across track ids",
+    "fragmented across display track",
 )
 
 
@@ -94,6 +105,12 @@ def _looks_like_segment_split(vision_result: dict[str, Any]) -> bool:
     """Return whether model text indicates one display track contains identities."""
     reason = str(vision_result.get("reason") or "").lower()
     return any(keyword in reason for keyword in SEGMENT_SPLIT_REASON_KEYWORDS)
+
+
+def _looks_like_identity_cluster(vision_result: dict[str, Any]) -> bool:
+    """Return whether model text indicates one identity spans display tracks."""
+    reason = str(vision_result.get("reason") or "").lower()
+    return any(keyword in reason for keyword in IDENTITY_CLUSTER_REASON_KEYWORDS)
 
 
 def _audit_evidence(queue_case: dict[str, Any]) -> dict[str, Any]:
@@ -185,6 +202,8 @@ def _safe_team_lock_reason(
         return "team_lock_requires_model_evidence"
     if _looks_like_segment_split(vision_result):
         return "team_lock_blocked_by_segment_split_evidence"
+    if _looks_like_identity_cluster(vision_result):
+        return "team_lock_blocked_by_identity_cluster_evidence"
     if _as_float(vision_result.get("confidence"), 0.0) < MIN_DISPLAY_LOCK_MODEL_CONFIDENCE:
         return "team_lock_requires_high_model_confidence"
     if _dominant_team_from_counts(audit.get("player_team_counts") or {}) != target_team:
@@ -218,6 +237,8 @@ def _safe_role_lock_reason(
         return "role_lock_requires_model_evidence"
     if _looks_like_segment_split(vision_result):
         return "role_lock_blocked_by_segment_split_evidence"
+    if _looks_like_identity_cluster(vision_result):
+        return "role_lock_blocked_by_identity_cluster_evidence"
     if _as_float(vision_result.get("confidence"), 0.0) < MIN_DISPLAY_LOCK_MODEL_CONFIDENCE:
         return "role_lock_requires_high_model_confidence"
     if str(audit.get("dominant_raw_role") or "") != target_role:
@@ -283,7 +304,11 @@ def _review_case_ids(
         if not case_id:
             continue
         verdict = str(result.get("verdict") or "")
-        if verdict != "unresolved" or _looks_like_segment_split(result):
+        if (
+            verdict != "unresolved"
+            or _looks_like_segment_split(result)
+            or _looks_like_identity_cluster(result)
+        ):
             case_ids.add(case_id)
     return sorted(case_ids)
 
@@ -542,6 +567,54 @@ def _build_segment_split_required_proposal(
     }
 
 
+def _build_identity_cluster_required_proposal(
+    *,
+    case_id: str,
+    question: str,
+    queue_case: dict[str, Any],
+    vision_result: dict[str, Any],
+    crop_case: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a deferred proposal for identities that span display tracks."""
+    target_track_ids = _track_ids_from_evidence(vision_result, crop_case)
+    if not target_track_ids:
+        target_track_id = _target_track_id(
+            queue_case=queue_case,
+            vision_result=vision_result,
+            crop_case=crop_case,
+        )
+        target_track_ids = [target_track_id] if target_track_id is not None else []
+    evidence = _display_lock_evidence_pack(
+        question=question,
+        queue_case=queue_case,
+        vision_result=vision_result,
+        crop_case=crop_case,
+        target_track_id=target_track_ids[0] if target_track_ids else -1,
+    )
+    evidence["identity_cluster_reason"] = vision_result.get("reason")
+    return {
+        "proposal_id": f"resolve_{case_id}",
+        "case_id": case_id,
+        "proposal_type": "identity_cluster_required",
+        "status": DEFERRED_STATUS,
+        "proposed_action": MARK_IDENTITY_CLUSTER_REQUIRED_ACTION,
+        "confidence": 0.0,
+        "target_track_ids": target_track_ids,
+        "reason": (
+            "Review evidence indicates one real identity may be fragmented across "
+            "multiple display tracks; cluster/merge must be solved before final trust."
+        ),
+        "evidence": evidence,
+        "apply_policy": {
+            "dry_run_only": True,
+            "requires_safe_apply_validator": True,
+            "mutates_raw_tracklets": False,
+            "mutates_render_annotations": False,
+            "requires_cross_track_identity_resolution": True,
+        },
+    }
+
+
 def _build_display_review_proposal(
     *,
     case_id: str,
@@ -553,6 +626,14 @@ def _build_display_review_proposal(
     """Build a proposal for team/role review cases."""
     if _looks_like_segment_split(vision_result):
         return _build_segment_split_required_proposal(
+            case_id=case_id,
+            question=question,
+            queue_case=queue_case,
+            vision_result=vision_result,
+            crop_case=crop_case,
+        )
+    if _looks_like_identity_cluster(vision_result):
+        return _build_identity_cluster_required_proposal(
             case_id=case_id,
             question=question,
             queue_case=queue_case,
@@ -975,6 +1056,11 @@ def build_identity_resolution_plan(
                 1
                 for proposal in proposals
                 if proposal.get("proposed_action") == MARK_SEGMENT_SPLIT_REQUIRED_ACTION
+            ),
+            "identity_cluster_required_count": sum(
+                1
+                for proposal in proposals
+                if proposal.get("proposed_action") == MARK_IDENTITY_CLUSTER_REQUIRED_ACTION
             ),
         },
         "resolution_proposals": proposals,
