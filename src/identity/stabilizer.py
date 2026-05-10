@@ -11,7 +11,7 @@ from collections import Counter, defaultdict
 from copy import deepcopy
 from typing import Any, Iterable
 
-from src.utils.annotation_colors import PLAYER_FALLBACK_COLOR, is_goalkeeper_color, normalize_color
+from src.utils.annotation_colors import GOALKEEPER_COLOR, PLAYER_FALLBACK_COLOR, is_goalkeeper_color, normalize_color
 
 
 PERSON_OBJECT_TYPES = {"player", "referee", "goalkeeper"}
