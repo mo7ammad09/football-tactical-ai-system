@@ -194,7 +194,10 @@ def _safe_team_lock_reason(
 ) -> str | None:
     """Return None when a team-lock proposal is safe enough to apply."""
     audit = _audit_evidence(queue_case)
-    if audit.get("issue_type") != "display_team_flicker":
+    if audit.get("issue_type") not in {
+        "display_team_flicker",
+        "hidden_team_switch_after_stabilizer",
+    }:
         return "team_lock_only_handles_display_team_flicker"
     if str(vision_result.get("status") or "") != "reviewed":
         return "team_lock_requires_reviewed_model_result"
@@ -208,6 +211,11 @@ def _safe_team_lock_reason(
         return "team_lock_requires_high_model_confidence"
     if _dominant_team_from_counts(audit.get("player_team_counts") or {}) != target_team:
         return "team_lock_requires_model_verdict_to_match_numeric_dominant_team"
+    if (
+        _as_float(vision_result.get("confidence"), 0.0) >= MIN_DISPLAY_LOCK_MODEL_CONFIDENCE
+        and _as_float(audit.get("raw_role_confidence"), 0.0) >= 0.90
+    ):
+        return None
     if _as_float(audit.get("player_team_confidence"), 0.0) < MIN_SAFE_TEAM_EVIDENCE_CONFIDENCE:
         return "team_lock_requires_strong_numeric_team_evidence"
     if _as_float(audit.get("max_minor_player_team_segment_ratio"), 1.0) > MAX_SAFE_MINOR_TEAM_SEGMENT_RATIO:
@@ -227,7 +235,10 @@ def _safe_role_lock_reason(
 ) -> str | None:
     """Return None when a role-lock proposal is safe enough to apply."""
     audit = _audit_evidence(queue_case)
-    if audit.get("issue_type") != "display_role_flicker":
+    if audit.get("issue_type") not in {
+        "display_role_flicker",
+        "hidden_role_switch_after_stabilizer",
+    }:
         return "role_lock_only_handles_visible_display_role_flicker"
     if target_role not in {"player", "referee"}:
         return "role_lock_rejects_goalkeeper_or_unknown_role"
@@ -243,6 +254,11 @@ def _safe_role_lock_reason(
         return "role_lock_requires_high_model_confidence"
     if str(audit.get("dominant_raw_role") or "") != target_role:
         return "role_lock_requires_model_verdict_to_match_numeric_dominant_role"
+    if (
+        _as_float(vision_result.get("confidence"), 0.0) >= MIN_DISPLAY_LOCK_MODEL_CONFIDENCE
+        and _as_float(audit.get("raw_role_confidence"), 0.0) >= 0.85
+    ):
+        return None
     if _as_float(audit.get("raw_role_confidence"), 0.0) < MIN_SAFE_ROLE_EVIDENCE_CONFIDENCE:
         return "role_lock_requires_stable_numeric_role_evidence"
     if _as_int(audit.get("max_minor_raw_role_segment_frames"), 999999) > MAX_SAFE_MINOR_ROLE_SEGMENT_FRAMES:
@@ -429,7 +445,14 @@ def _build_goalkeeper_fragmentation_proposal(
         vision_result.get("model_evidence")
     )
 
-    if not render_safe:
+    if _looks_like_identity_cluster(vision_result):
+        proposal_status = DEFERRED_STATUS
+        action = MARK_IDENTITY_CLUSTER_REQUIRED_ACTION
+        reason = (
+            "Review evidence says goalkeeper identity is fragmented across display "
+            "tracks; apply a display-only cluster guard before final render."
+        )
+    elif not render_safe:
         proposal_status = BLOCKED_STATUS
         action = KEEP_UNRESOLVED_ACTION
         reason = "Render identity is not safe; resolver cannot propose identity merges."
@@ -467,11 +490,17 @@ def _build_goalkeeper_fragmentation_proposal(
         "frame_span": _frame_span_from_evidence(vision_result, crop_case),
         "model_evidence_count": len(vision_result.get("model_evidence") or []),
     }
+    if action == MARK_IDENTITY_CLUSTER_REQUIRED_ACTION:
+        evidence_pack["identity_cluster_reason"] = vision_result.get("reason")
 
     return {
         "proposal_id": f"resolve_{case_id}",
         "case_id": case_id,
-        "proposal_type": "goalkeeper_identity_fragmentation",
+        "proposal_type": (
+            "identity_cluster_required"
+            if action == MARK_IDENTITY_CLUSTER_REQUIRED_ACTION
+            else "goalkeeper_identity_fragmentation"
+        ),
         "status": proposal_status,
         "proposed_action": action,
         "confidence": confidence if proposal_status == READY_STATUS else 0.0,
@@ -482,7 +511,10 @@ def _build_goalkeeper_fragmentation_proposal(
             "dry_run_only": True,
             "requires_safe_apply_validator": True,
             "mutates_raw_tracklets": False,
-            "mutates_render_annotations": False,
+            "mutates_render_annotations": action == MARK_IDENTITY_CLUSTER_REQUIRED_ACTION,
+            "display_only": action == MARK_IDENTITY_CLUSTER_REQUIRED_ACTION,
+            "requires_cross_track_identity_resolution": action
+            == MARK_IDENTITY_CLUSTER_REQUIRED_ACTION,
         },
     }
 

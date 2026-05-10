@@ -781,11 +781,15 @@ def apply_global_identity_stability_plan_to_raw_records(
             if sets_role:
                 row["display_role"] = "player"
                 row["display_label"] = str(action.get("set_display_label", track_id))
+                row["model_confirmed_role"] = "player"
+                row["model_confirmed_role_source"] = "global_identity_stabilizer"
                 row["goalkeeper_display_locked"] = False
                 row["role_display_suppressed"] = False
             if sets_team:
                 row["display_team"] = int(action.get("set_display_team"))
                 row["display_color"] = list(color)
+                row["model_confirmed_team"] = int(action.get("set_display_team"))
+                row["model_confirmed_team_source"] = "global_identity_stabilizer"
             row["identity_stability_status"] = "phase12_safe_applied"
             row["identity_stability_action_id"] = action.get("action_id")
             row["identity_stability_role_confidence"] = float(action.get("role_confidence", 0.0))
@@ -843,11 +847,15 @@ def apply_global_identity_stability_plan_to_annotation_states(
                 if sets_role:
                     track["display_role"] = "player"
                     track["display_label"] = str(action.get("set_display_label", track_id))
+                    track["model_confirmed_role"] = "player"
+                    track["model_confirmed_role_source"] = "global_identity_stabilizer"
                     track["goalkeeper_display_locked"] = False
                     track["role_display_suppressed"] = False
                 if sets_team:
                     track["display_team"] = int(action.get("set_display_team"))
                     track["display_color"] = tuple(color)
+                    track["model_confirmed_team"] = int(action.get("set_display_team"))
+                    track["model_confirmed_team_source"] = "global_identity_stabilizer"
                 track["identity_stability_status"] = "phase12_safe_applied"
                 track["identity_stability_action_id"] = action.get("action_id")
                 track["identity_stability_role_confidence"] = float(action.get("role_confidence", 0.0))

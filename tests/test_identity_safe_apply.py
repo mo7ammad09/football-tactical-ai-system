@@ -1,9 +1,12 @@
 from src.identity.resolver import (
     LOCK_DISPLAY_ROLE_ACTION,
     LOCK_DISPLAY_TEAM_ACTION,
+    MARK_IDENTITY_CLUSTER_REQUIRED_ACTION,
+    MARK_SEGMENT_SPLIT_REQUIRED_ACTION,
     MERGE_GOALKEEPER_ACTION,
     READY_STATUS,
 )
+from src.identity.pre_render_audit import build_render_identity_audit
 from src.identity.safe_apply import (
     apply_identity_resolution_plan_to_annotation_states,
     apply_identity_resolution_plan_to_raw_records,
@@ -259,3 +262,145 @@ def test_phase10_applies_display_role_lock_to_player_rows():
     assert rows[0]["display_role"] == "player"
     assert rows[0]["display_team"] == 1
     assert rows[0]["display_color"] == [10, 10, 10]
+
+
+def test_phase10_applies_segment_split_guard_to_render_identity():
+    plan = {
+        "validation": {"verdict": "PASS"},
+        "resolution_proposals": [
+            {
+                "proposal_id": "resolve_review_display_role_flicker_20",
+                "case_id": "review_display_role_flicker_20",
+                "proposal_type": "segment_split_required",
+                "status": "deferred_needs_evidence",
+                "proposed_action": MARK_SEGMENT_SPLIT_REQUIRED_ACTION,
+                "confidence": 0.0,
+                "target_track_ids": [20],
+                "evidence": {
+                    "frame_span": {
+                        "first_source_frame_idx": 1200,
+                        "last_source_frame_idx": 1325,
+                    },
+                    "raw_track_ids": [197, 235],
+                },
+                "apply_policy": {
+                    "dry_run_only": True,
+                    "requires_safe_apply_validator": True,
+                    "requires_segment_level_resolution": True,
+                },
+            }
+        ],
+    }
+    raw_rows = [
+        {
+            "object_type": "player",
+            "track_id": 20,
+            "raw_track_id": 197,
+            "source_frame_idx": 1200,
+            "role": "player",
+            "team": 1,
+            "team_color": [20, 20, 20],
+        },
+        {
+            "object_type": "player",
+            "track_id": 20,
+            "raw_track_id": 235,
+            "source_frame_idx": 1258,
+            "role": "player",
+            "team": 1,
+            "team_color": [20, 20, 20],
+        },
+        {
+            "object_type": "player",
+            "track_id": 20,
+            "raw_track_id": 235,
+            "source_frame_idx": 1280,
+            "role": "referee",
+            "team": 0,
+        },
+    ]
+
+    rows, applied = apply_identity_resolution_plan_to_raw_records(raw_rows, plan)
+    after = build_render_identity_audit(rows)
+
+    assert applied["safe_apply_status"] == "applied"
+    assert applied["updated_record_count"] == 3
+    assert rows[0]["display_label"] == "20A"
+    assert rows[1]["display_label"] == "20B"
+    assert rows[2]["display_role"] == "referee"
+    assert rows[0]["display_identity_id"] != rows[2]["display_identity_id"]
+    assert {profile["track_id"] for profile in after["source_profiles"]} == {
+        rows[0]["display_identity_id"],
+        rows[1]["display_identity_id"],
+        rows[2]["display_identity_id"],
+    }
+    assert all(
+        profile["display_role_transition_count"] == 0
+        for profile in after["source_profiles"]
+    )
+
+
+def test_phase10_applies_goalkeeper_cluster_guard_only_to_gk_evidence():
+    plan = {
+        "validation": {"verdict": "PASS"},
+        "resolution_proposals": [
+            {
+                "proposal_id": "resolve_candidate_goalkeeper_identity_fragmentation",
+                "case_id": "candidate_goalkeeper_identity_fragmentation",
+                "proposal_type": "identity_cluster_required",
+                "status": "deferred_needs_evidence",
+                "proposed_action": MARK_IDENTITY_CLUSTER_REQUIRED_ACTION,
+                "confidence": 0.0,
+                "target_track_ids": [21, 29],
+                "evidence": {
+                    "question": "goalkeeper_identity_fragmentation",
+                    "raw_track_ids": [114],
+                    "frame_span": {
+                        "first_source_frame_idx": 275,
+                        "last_source_frame_idx": 500,
+                    },
+                    "identity_cluster_reason": "identity_cluster_required: same goalkeeper",
+                },
+                "apply_policy": {
+                    "dry_run_only": True,
+                    "requires_safe_apply_validator": True,
+                    "requires_cross_track_identity_resolution": True,
+                },
+            }
+        ],
+    }
+    raw_rows = [
+        {
+            "object_type": "player",
+            "track_id": 21,
+            "raw_track_id": 114,
+            "source_frame_idx": 275,
+            "role": "goalkeeper",
+            "display_label": "21",
+        },
+        {
+            "object_type": "player",
+            "track_id": 21,
+            "raw_track_id": 200,
+            "source_frame_idx": 700,
+            "role": "player",
+            "display_label": "21",
+        },
+        {
+            "object_type": "player",
+            "track_id": 29,
+            "raw_track_id": 114,
+            "source_frame_idx": 485,
+            "role": "goalkeeper",
+            "display_label": "29",
+        },
+    ]
+
+    rows, applied = apply_identity_resolution_plan_to_raw_records(raw_rows, plan)
+
+    assert applied["safe_apply_status"] == "applied"
+    assert applied["updated_record_count"] == 2
+    assert rows[0]["display_label"] == "GK"
+    assert rows[0]["display_identity_id"] == rows[2]["display_identity_id"]
+    assert rows[1]["display_label"] == "21"
+    assert rows[1].get("display_identity_id") is None

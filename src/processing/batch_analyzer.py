@@ -96,6 +96,9 @@ def _draw_review_frame(
     out = frame.copy()
 
     for track_id, player in player_track.items():
+        if str(player.get("display_role") or player.get("role") or "") == "referee":
+            out = tracker.draw_ellipse(out, player["bbox"], (0, 255, 255), None)
+            continue
         color = resolve_player_annotation_color(player)
         out = tracker.draw_ellipse(
             out,

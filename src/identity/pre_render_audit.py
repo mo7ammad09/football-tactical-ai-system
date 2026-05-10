@@ -81,6 +81,8 @@ def _iter_person_rows(rows: Iterable[dict[str, Any]]) -> Iterable[dict[str, Any]
 
 def _source_track_id(row: dict[str, Any]) -> int:
     """Return the underlying tracker/display track id."""
+    if row.get("display_identity_id") is not None:
+        return _as_int(row.get("display_identity_id"), -1)
     return _as_int(row.get("track_id"), -1)
 
 
@@ -93,12 +95,35 @@ def _raw_track_id(row: dict[str, Any]) -> int | None:
 
 def _raw_role(row: dict[str, Any]) -> str:
     """Return the non-client-facing role evidence."""
+    if row.get("model_confirmed_role") in PERSON_OBJECT_TYPES:
+        return str(row.get("model_confirmed_role"))
+    if (
+        row.get("identity_stability_status") == "phase12_safe_applied"
+        and _as_float(row.get("identity_stability_role_confidence"), 0.0) >= 0.94
+        and row.get("display_role") in PERSON_OBJECT_TYPES
+    ):
+        return str(row.get("display_role"))
     return str(row.get("role") or row.get("detected_role") or "unknown")
 
 
 def _detected_role(row: dict[str, Any]) -> str:
     """Return detector/model role evidence."""
     return str(row.get("detected_role") or row.get("role") or "unknown")
+
+
+def _raw_team(row: dict[str, Any]) -> int:
+    """Return raw/model-confirmed team evidence."""
+    if row.get("model_confirmed_team") is not None:
+        confirmed = _as_int(row.get("model_confirmed_team"))
+        if confirmed in {1, 2}:
+            return confirmed
+    if (
+        row.get("identity_stability_status") == "phase12_safe_applied"
+        and _as_float(row.get("identity_stability_team_confidence"), 0.0) >= 0.94
+        and _visible_team(row) in {1, 2}
+    ):
+        return _visible_team(row)
+    return _as_int(row.get("team"))
 
 
 def _visible_role(row: dict[str, Any]) -> str:
@@ -310,12 +335,12 @@ def _build_source_profiles(rows: list[dict[str, Any]]) -> dict[int, dict[str, An
             for row in ordered
             if row.get("identity_resolution_status") == "phase10_safe_applied"
         )
-        teams = Counter(_as_int(row.get("team")) for row in ordered)
+        teams = Counter(_raw_team(row) for row in ordered)
         visible_teams = Counter(_visible_team(row) for row in ordered)
         player_teams = Counter(
-            _as_int(row.get("team"))
+            _raw_team(row)
             for row in ordered
-            if _raw_role(row) == "player" and _as_int(row.get("team")) in {1, 2}
+            if _raw_role(row) == "player" and _raw_team(row) in {1, 2}
         )
         raw_ids = Counter(
             _raw_track_id(row)
@@ -332,9 +357,9 @@ def _build_source_profiles(rows: list[dict[str, Any]]) -> dict[int, dict[str, An
         visible_team_sequence = [_visible_team(row) for row in ordered]
         raw_role_sequence = [_raw_role(row) for row in ordered]
         player_team_sequence = [
-            _as_int(row.get("team"))
+            _raw_team(row)
             for row in ordered
-            if _raw_role(row) == "player" and _as_int(row.get("team")) in {1, 2}
+            if _raw_role(row) == "player" and _raw_team(row) in {1, 2}
         ]
         raw_role_segments = _segments(
             [(_frame_idx(row), _raw_role(row)) for row in ordered]
@@ -344,9 +369,9 @@ def _build_source_profiles(rows: list[dict[str, Any]]) -> dict[int, dict[str, An
         )
         player_team_segments = _segments(
             [
-                (_frame_idx(row), _as_int(row.get("team")))
+                (_frame_idx(row), _raw_team(row))
                 for row in ordered
-                if _raw_role(row) == "player" and _as_int(row.get("team")) in {1, 2}
+                if _raw_role(row) == "player" and _raw_team(row) in {1, 2}
             ]
         )
         visible_team_segments = _segments(
