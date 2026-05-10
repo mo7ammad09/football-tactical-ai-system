@@ -43,6 +43,8 @@ from src.identity.safe_apply import (
 from src.identity.stabilizer import (
     apply_global_identity_stability_plan_to_annotation_states,
     apply_global_identity_stability_plan_to_raw_records,
+    apply_majority_voting_display_defaults,
+    apply_majority_voting_to_annotation_states,
     build_global_identity_stability_plan,
 )
 from src.team_assigner.team_assigner import TeamAssigner
@@ -1246,12 +1248,12 @@ def _reid_candidate_threshold(role_a: str, role_b: str, position_distance: float
 def _auto_reid_threshold(role_a: str, role_b: str) -> float:
     """Return the stricter ReID threshold used for automatic merges."""
     if role_a == "referee" and role_b == "referee":
-        return 0.16
+        return 0.22
     if role_a != role_b:
-        return 0.08
+        return 0.15
     if role_a in {"player", "goalkeeper"}:
-        return 0.12
-    return 0.10
+        return 0.20
+    return 0.18
 
 
 def _identity_candidate(profile_a: Dict[str, Any], profile_b: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -2230,6 +2232,18 @@ def run_batch_analysis(
     else:
         identity_stability_applied["kept"] = False
         identity_stability_applied["updated_annotation_track_count"] = 0
+
+    # Always apply majority voting fallback so display fields are never None
+    majority_voting_records = apply_majority_voting_display_defaults(raw_tracklet_records)
+    raw_tracklet_records = majority_voting_records
+    majority_voting_annotation_count = apply_majority_voting_to_annotation_states(
+        annotation_states, raw_tracklet_records
+    )
+    if majority_voting_annotation_count > 0:
+        warnings.append(
+            f"Majority voting fallback applied to {majority_voting_annotation_count} "
+            "annotation state(s) to ensure stable display labels/roles/teams."
+        )
     identity_events = build_identity_events(raw_tracklet_records, render_audit_after)
     vision_review_queue = build_vision_review_queue(
         correction_plan=correction_plan,

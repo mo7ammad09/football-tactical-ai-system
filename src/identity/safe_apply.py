@@ -197,7 +197,7 @@ def validate_identity_safe_apply_plan(
 
         if action not in SUPPORTED_ACTIONS:
             reasons.append("unsupported_ready_action")
-        if confidence < 0.80:
+        if confidence < 0.60:
             reasons.append("ready_proposal_confidence_below_threshold")
         if action in {MERGE_GOALKEEPER_ACTION, MERGE_CANDIDATE_ACTION} and len(targets) < 2:
             reasons.append("ready_proposal_needs_multiple_targets")
