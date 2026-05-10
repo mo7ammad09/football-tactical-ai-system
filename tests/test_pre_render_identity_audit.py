@@ -103,6 +103,51 @@ def test_render_audit_flags_bad_gk_display_spread_to_player_tracks():
     assert audit["summary"]["gk_false_positive_segment_count"] == 1
 
 
+def test_render_audit_keeps_goalkeeper_raw_id_when_fragment_moves_tracks():
+    rows = []
+    rows.extend(
+        _row(9, 9, sample, sample * 10, "player", 1)
+        for sample in range(1, 21)
+    )
+    rows.extend(
+        _row(
+            9,
+            131,
+            sample,
+            sample * 10,
+            "goalkeeper",
+            0,
+            display_label="GK",
+            display_role="goalkeeper",
+            display_team=0,
+            display_color=[255, 0, 255],
+        )
+        for sample in range(21, 27)
+    )
+    rows.extend(
+        _row(
+            29,
+            131,
+            sample,
+            sample * 10,
+            "goalkeeper",
+            0,
+            display_label="GK",
+            display_role="goalkeeper",
+            display_team=0,
+            display_color=[255, 0, 255],
+        )
+        for sample in range(27, 37)
+    )
+
+    audit = build_render_identity_audit(rows)
+
+    issue_ids = {issue["issue_id"] for issue in audit["issues"]}
+    assert "gk_false_positive_9_210_260" not in issue_ids
+    assert "unsafe_gk_display_spread" not in issue_ids
+    assert 131 in audit["summary"]["trusted_goalkeeper_raw_track_ids"]
+
+
 def test_render_audit_passes_single_goalkeeper_display_on_goalkeeper_track():
     rows = []
     rows.extend(

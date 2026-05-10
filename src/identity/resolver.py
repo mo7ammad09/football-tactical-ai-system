@@ -113,6 +113,36 @@ def _looks_like_identity_cluster(vision_result: dict[str, Any]) -> bool:
     return any(keyword in reason for keyword in IDENTITY_CLUSTER_REASON_KEYWORDS)
 
 
+def _provider_rate_limited(vision_result: dict[str, Any]) -> bool:
+    """Return whether a model review case failed because the provider rate-limited it."""
+    if str(vision_result.get("failure_category") or "") == "provider_rate_limited":
+        return True
+    for evidence in vision_result.get("evidence") or []:
+        if not isinstance(evidence, dict):
+            continue
+        if evidence.get("category") == "provider_rate_limited":
+            return True
+    reason = str(vision_result.get("reason") or "").lower()
+    return (
+        "provider_rate_limited" in reason
+        or "429" in reason
+        or "too many requests" in reason
+        or "rate limit" in reason
+    )
+
+
+def _can_protect_failed_display_case(queue_case: dict[str, Any]) -> bool:
+    """Return whether a failed review case can safely become a split guard."""
+    audit = _audit_evidence(queue_case)
+    return str(audit.get("issue_type") or "") in {
+        "display_team_flicker",
+        "display_team_uncertain",
+        "display_role_flicker",
+        "hidden_team_switch_after_stabilizer",
+        "hidden_role_switch_after_stabilizer",
+    }
+
+
 def _audit_evidence(queue_case: dict[str, Any]) -> dict[str, Any]:
     """Return audit evidence attached to a review queue case."""
     evidence = queue_case.get("audit_evidence")
@@ -324,6 +354,7 @@ def _review_case_ids(
             verdict != "unresolved"
             or _looks_like_segment_split(result)
             or _looks_like_identity_cluster(result)
+            or _provider_rate_limited(result)
         ):
             case_ids.add(case_id)
     return sorted(case_ids)
@@ -670,6 +701,24 @@ def _build_display_review_proposal(
             question=question,
             queue_case=queue_case,
             vision_result=vision_result,
+            crop_case=crop_case,
+        )
+    if (
+        str(vision_result.get("verdict") or "") == "unresolved"
+        and _provider_rate_limited(vision_result)
+        and _can_protect_failed_display_case(queue_case)
+    ):
+        fallback_result = dict(vision_result)
+        fallback_result["reason"] = (
+            "segment_split_required: provider_rate_limited; applying a "
+            "display-only split guard from deterministic role/team evidence "
+            "so the final render does not show one unstable identity."
+        )
+        return _build_segment_split_required_proposal(
+            case_id=case_id,
+            question=question,
+            queue_case=queue_case,
+            vision_result=fallback_result,
             crop_case=crop_case,
         )
 

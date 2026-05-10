@@ -331,6 +331,51 @@ def test_identity_resolver_defers_team_lock_when_model_detects_track_switch():
     assert plan["summary"]["segment_split_required_count"] == 1
 
 
+def test_identity_resolver_adds_split_guard_when_provider_rate_limited():
+    decisions = {"render_safe": False, "decisions": []}
+    queue = {
+        "cases": [
+            {
+                "case_id": "review_display_team_flicker_7",
+                "question": "team_assignment_uncertain",
+                "audit_evidence": {
+                    "issue_type": "display_team_flicker",
+                    "track_id": 7,
+                    "player_team_counts": {"2": 252, "1": 136},
+                    "player_team_confidence": 0.649,
+                    "raw_role_confidence": 1.0,
+                },
+            }
+        ]
+    }
+    results = {
+        "vision_model_invoked": True,
+        "results": [
+            {
+                "case_id": "review_display_team_flicker_7",
+                "question": "team_assignment_uncertain",
+                "status": "reviewed",
+                "verdict": "unresolved",
+                "confidence": 0.0,
+                "failure_category": "provider_rate_limited",
+                "reason": "OpenRouter Gemma API failed: 429 Too Many Requests",
+                "evidence": [{"type": "provider_failure_category", "category": "provider_rate_limited"}],
+            }
+        ],
+    }
+
+    plan = build_identity_resolution_plan(
+        identity_review_decisions=decisions,
+        vision_review_queue=queue,
+        vision_review_results=results,
+    )
+
+    proposal = plan["resolution_proposals"][0]
+    assert proposal["proposal_type"] == "segment_split_required"
+    assert proposal["proposed_action"] == MARK_SEGMENT_SPLIT_REQUIRED_ACTION
+    assert "provider_rate_limited" in proposal["evidence"]["segment_split_reason"]
+
+
 def test_identity_resolver_defers_when_model_detects_identity_cluster_need():
     decisions = {"render_safe": False, "decisions": []}
     queue = {
