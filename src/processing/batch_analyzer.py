@@ -1997,7 +1997,14 @@ def run_batch_analysis(
                 team = 0
                 if team_assigner.kmeans is not None and role == "player":
                     try:
-                        team = team_assigner.get_player_team(frame, track["bbox"], player_id)
+                        # Prefer YOLO team_color directly (more stable than bbox color extraction)
+                        yolo_team_color = track.get("team_color")
+                        if yolo_team_color is not None and len(yolo_team_color) >= 3:
+                            team, margin = team_assigner.predict_team_from_color(
+                                np.array(yolo_team_color, dtype=float)
+                            )
+                        else:
+                            team = team_assigner.get_player_team(frame, track["bbox"], player_id)
                     except Exception:
                         team = 0
                 track["team"] = int(team)

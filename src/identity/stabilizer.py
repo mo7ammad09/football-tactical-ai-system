@@ -881,11 +881,20 @@ def apply_majority_voting_display_defaults(
 
             # Fill display_team if missing and we have a confident team decision
             if current_display_team not in {1, 2}:
-                if int(dominant_team) in {1, 2} and team_confidence >= 0.50:
+                if int(dominant_team) in {1, 2} and team_confidence >= 0.70:
                     row["display_team"] = int(dominant_team)
                     row["model_confirmed_team"] = int(dominant_team)
                     row["model_confirmed_team_source"] = "majority_voting_fallback"
                     # Set color from canonical color if available
+                    canonical_color = profile.get("canonical_display_color")
+                    if canonical_color and not is_goalkeeper_color(canonical_color):
+                        row["display_color"] = list(canonical_color)
+                elif int(dominant_team) in {1, 2} and team_confidence >= 0.55:
+                    # Weak confidence — fill but flag as uncertain
+                    row["display_team"] = int(dominant_team)
+                    row["model_confirmed_team"] = int(dominant_team)
+                    row["model_confirmed_team_source"] = "majority_voting_fallback_weak"
+                    row["display_team_uncertain"] = True
                     canonical_color = profile.get("canonical_display_color")
                     if canonical_color and not is_goalkeeper_color(canonical_color):
                         row["display_color"] = list(canonical_color)
@@ -951,10 +960,19 @@ def apply_majority_voting_to_annotation_states(
                     updated += 1
 
                 if current_display_team not in {1, 2}:
-                    if int(dominant_team) in {1, 2} and team_confidence >= 0.50:
+                    if int(dominant_team) in {1, 2} and team_confidence >= 0.70:
                         track["display_team"] = int(dominant_team)
                         track["model_confirmed_team"] = int(dominant_team)
                         track["model_confirmed_team_source"] = "majority_voting_fallback"
+                        canonical_color = profile.get("canonical_display_color")
+                        if canonical_color and not is_goalkeeper_color(canonical_color):
+                            track["display_color"] = tuple(canonical_color)
+                        updated += 1
+                    elif int(dominant_team) in {1, 2} and team_confidence >= 0.55:
+                        track["display_team"] = int(dominant_team)
+                        track["model_confirmed_team"] = int(dominant_team)
+                        track["model_confirmed_team_source"] = "majority_voting_fallback_weak"
+                        track["display_team_uncertain"] = True
                         canonical_color = profile.get("canonical_display_color")
                         if canonical_color and not is_goalkeeper_color(canonical_color):
                             track["display_color"] = tuple(canonical_color)
