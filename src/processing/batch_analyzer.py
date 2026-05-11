@@ -1961,18 +1961,19 @@ def run_batch_analysis(
                 )
 
         if team_assigner.kmeans is None:
-            for frame, player_track in zip(frames, batch_tracks["players"]):
-                field_players = {
-                    player_id: track
-                    for player_id, track in player_track.items()
-                    if track.get("role", "player") == "player"
-                }
-                if len(field_players) >= 2:
-                    try:
-                        team_assigner.assign_team_color(frame, field_players)
-                    except Exception as exc:
-                        warnings.append(f"Team color assignment failed on an early frame: {exc}")
-                    break
+            # Build team colors from YOLO team_color across ALL frames (more stable than single frame)
+            all_player_colors: list[np.ndarray] = []
+            for player_track in batch_tracks["players"]:
+                for track in player_track.values():
+                    if track.get("role", "player") == "player":
+                        yolo_color = track.get("team_color")
+                        if yolo_color is not None and len(yolo_color) >= 3:
+                            all_player_colors.append(np.array(yolo_color, dtype=float))
+            if len(all_player_colors) >= 2:
+                try:
+                    team_assigner.assign_team_color_from_colors(all_player_colors)
+                except Exception as exc:
+                    warnings.append(f"Team color assignment failed: {exc}")
 
         for local_idx, (source_frame_idx, frame) in enumerate(entries):
             player_track = batch_tracks["players"][local_idx]
