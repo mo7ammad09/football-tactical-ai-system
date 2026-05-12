@@ -48,9 +48,9 @@ VALID_ACTIONS = {
     REJECT_MERGE_ACTION,
 }
 
-MIN_DISPLAY_LOCK_MODEL_CONFIDENCE = 0.60
-MIN_SAFE_TEAM_EVIDENCE_CONFIDENCE = 0.60
-MIN_SAFE_ROLE_EVIDENCE_CONFIDENCE = 0.60
+MIN_DISPLAY_LOCK_MODEL_CONFIDENCE = 0.90
+MIN_SAFE_TEAM_EVIDENCE_CONFIDENCE = 0.88
+MIN_SAFE_ROLE_EVIDENCE_CONFIDENCE = 0.98
 MAX_SAFE_MINOR_TEAM_SEGMENT_RATIO = 0.12
 MAX_SAFE_MINOR_TEAM_SEGMENT_FRAMES = 30
 MAX_SAFE_MINOR_ROLE_SEGMENT_FRAMES = 2
@@ -111,36 +111,6 @@ def _looks_like_identity_cluster(vision_result: dict[str, Any]) -> bool:
     """Return whether model text indicates one identity spans display tracks."""
     reason = str(vision_result.get("reason") or "").lower()
     return any(keyword in reason for keyword in IDENTITY_CLUSTER_REASON_KEYWORDS)
-
-
-def _provider_rate_limited(vision_result: dict[str, Any]) -> bool:
-    """Return whether a model review case failed because the provider rate-limited it."""
-    if str(vision_result.get("failure_category") or "") == "provider_rate_limited":
-        return True
-    for evidence in vision_result.get("evidence") or []:
-        if not isinstance(evidence, dict):
-            continue
-        if evidence.get("category") == "provider_rate_limited":
-            return True
-    reason = str(vision_result.get("reason") or "").lower()
-    return (
-        "provider_rate_limited" in reason
-        or "429" in reason
-        or "too many requests" in reason
-        or "rate limit" in reason
-    )
-
-
-def _can_protect_failed_display_case(queue_case: dict[str, Any]) -> bool:
-    """Return whether a failed review case can safely become a split guard."""
-    audit = _audit_evidence(queue_case)
-    return str(audit.get("issue_type") or "") in {
-        "display_team_flicker",
-        "display_team_uncertain",
-        "display_role_flicker",
-        "hidden_team_switch_after_stabilizer",
-        "hidden_role_switch_after_stabilizer",
-    }
 
 
 def _audit_evidence(queue_case: dict[str, Any]) -> dict[str, Any]:
@@ -229,14 +199,6 @@ def _safe_team_lock_reason(
         "hidden_team_switch_after_stabilizer",
     }:
         return "team_lock_only_handles_display_team_flicker"
-
-    # Allow deterministic team lock when numeric evidence is strong, even without vision
-    player_team_confidence = _as_float(audit.get("player_team_confidence"), 0.0)
-    raw_role_confidence = _as_float(audit.get("raw_role_confidence"), 0.0)
-    if player_team_confidence >= 0.70 and raw_role_confidence >= 0.55:
-        if _dominant_team_from_counts(audit.get("player_team_counts") or {}) == target_team:
-            return None
-
     if str(vision_result.get("status") or "") != "reviewed":
         return "team_lock_requires_reviewed_model_result"
     if _model_evidence_count(vision_result) <= 0:
@@ -251,16 +213,16 @@ def _safe_team_lock_reason(
         return "team_lock_requires_model_verdict_to_match_numeric_dominant_team"
     if (
         _as_float(vision_result.get("confidence"), 0.0) >= MIN_DISPLAY_LOCK_MODEL_CONFIDENCE
-        and raw_role_confidence >= 0.60
+        and _as_float(audit.get("raw_role_confidence"), 0.0) >= 0.90
     ):
         return None
-    if player_team_confidence < MIN_SAFE_TEAM_EVIDENCE_CONFIDENCE:
+    if _as_float(audit.get("player_team_confidence"), 0.0) < MIN_SAFE_TEAM_EVIDENCE_CONFIDENCE:
         return "team_lock_requires_strong_numeric_team_evidence"
     if _as_float(audit.get("max_minor_player_team_segment_ratio"), 1.0) > MAX_SAFE_MINOR_TEAM_SEGMENT_RATIO:
         return "team_lock_minor_segment_ratio_too_large"
     if _as_int(audit.get("max_minor_player_team_segment_frames"), 999999) > MAX_SAFE_MINOR_TEAM_SEGMENT_FRAMES:
         return "team_lock_minor_segment_too_long"
-    if raw_role_confidence < 0.60:
+    if _as_float(audit.get("raw_role_confidence"), 0.0) < 0.95:
         return "team_lock_requires_stable_player_role"
     return None
 
@@ -280,12 +242,6 @@ def _safe_role_lock_reason(
         return "role_lock_only_handles_visible_display_role_flicker"
     if target_role not in {"player", "referee"}:
         return "role_lock_rejects_goalkeeper_or_unknown_role"
-
-    # Allow deterministic role lock when numeric evidence is strong, even without vision
-    raw_role_confidence = _as_float(audit.get("raw_role_confidence"), 0.0)
-    if raw_role_confidence >= 0.70 and str(audit.get("dominant_raw_role") or "") == target_role:
-        return None
-
     if str(vision_result.get("status") or "") != "reviewed":
         return "role_lock_requires_reviewed_model_result"
     if _model_evidence_count(vision_result) <= 0:
@@ -300,10 +256,10 @@ def _safe_role_lock_reason(
         return "role_lock_requires_model_verdict_to_match_numeric_dominant_role"
     if (
         _as_float(vision_result.get("confidence"), 0.0) >= MIN_DISPLAY_LOCK_MODEL_CONFIDENCE
-        and raw_role_confidence >= 0.60
+        and _as_float(audit.get("raw_role_confidence"), 0.0) >= 0.85
     ):
         return None
-    if raw_role_confidence < MIN_SAFE_ROLE_EVIDENCE_CONFIDENCE:
+    if _as_float(audit.get("raw_role_confidence"), 0.0) < MIN_SAFE_ROLE_EVIDENCE_CONFIDENCE:
         return "role_lock_requires_stable_numeric_role_evidence"
     if _as_int(audit.get("max_minor_raw_role_segment_frames"), 999999) > MAX_SAFE_MINOR_ROLE_SEGMENT_FRAMES:
         return "role_lock_minor_segment_too_long"
@@ -368,7 +324,6 @@ def _review_case_ids(
             verdict != "unresolved"
             or _looks_like_segment_split(result)
             or _looks_like_identity_cluster(result)
-            or _provider_rate_limited(result)
         ):
             case_ids.add(case_id)
     return sorted(case_ids)
@@ -498,19 +453,9 @@ def _build_goalkeeper_fragmentation_proposal(
             "tracks; apply a display-only cluster guard before final render."
         )
     elif not render_safe:
-        # Allow goalkeeper merge even when render_safe is false if we have strong evidence
-        # from the audit itself (e.g. multiple GK segments with same dominant role)
-        audit = _audit_evidence(queue_case)
-        dominant_role = str(audit.get("dominant_raw_role") or "")
-        raw_gk_confidence = _as_float(audit.get("raw_role_confidence"), 0.0)
-        if dominant_role == "goalkeeper" and raw_gk_confidence >= 0.55:
-            proposal_status = READY_STATUS
-            action = MERGE_GOALKEEPER_ACTION
-            reason = "Goalkeeper merge allowed despite render_safe=false due to strong raw role confidence."
-        else:
-            proposal_status = BLOCKED_STATUS
-            action = KEEP_UNRESOLVED_ACTION
-            reason = "Render identity is not safe; resolver cannot propose identity merges."
+        proposal_status = BLOCKED_STATUS
+        action = KEEP_UNRESOLVED_ACTION
+        reason = "Render identity is not safe; resolver cannot propose identity merges."
     elif verdict == "same_player" and status == "reviewed" and confidence >= 0.80:
         proposal_status = READY_STATUS
         action = MERGE_GOALKEEPER_ACTION
@@ -725,24 +670,6 @@ def _build_display_review_proposal(
             question=question,
             queue_case=queue_case,
             vision_result=vision_result,
-            crop_case=crop_case,
-        )
-    if (
-        str(vision_result.get("verdict") or "") == "unresolved"
-        and _provider_rate_limited(vision_result)
-        and _can_protect_failed_display_case(queue_case)
-    ):
-        fallback_result = dict(vision_result)
-        fallback_result["reason"] = (
-            "segment_split_required: provider_rate_limited; applying a "
-            "display-only split guard from deterministic role/team evidence "
-            "so the final render does not show one unstable identity."
-        )
-        return _build_segment_split_required_proposal(
-            case_id=case_id,
-            question=question,
-            queue_case=queue_case,
-            vision_result=fallback_result,
             crop_case=crop_case,
         )
 

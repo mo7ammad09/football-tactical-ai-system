@@ -61,7 +61,7 @@ def main() -> None:
     args = parse_args()
     config = load_config(args.config)
 
-    input_path = args.input or config.get("video", {}).get("input_file", "input_videos/test.mp4")
+    input_path = args.input or config.get("video", {}).get("input_file", "input_videos/test_match.mp4")
     output_path = args.output or config.get("video", {}).get("output_file", "output_videos/output_video.avi")
     model_path = args.model or config.get("detection", {}).get("model_path", "models/best.pt")
     target_fps = args.target_fps or config.get("video", {}).get("analysis_fps")

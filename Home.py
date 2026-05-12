@@ -413,6 +413,25 @@ with st.sidebar:
             else "This mode starts GPU workers on demand and idles them down according to RunPod settings."
         )
 
+        with st.expander("⚙️ " + ("إعدادات التحليل" if lang == "ar" else "Analysis Settings"), expanded=False):
+            team_assignment_mode = st.selectbox(
+                "طريقة تحديد الفريق" if lang == "ar" else "Team Assignment Mode",
+                options=["kmeans", "majority_voting"],
+                index=1,  # default to majority_voting
+                help="kmeans: تجميع الألوان (قد يتأرجح) | majority_voting: الأغلبية لكل لاعب (أكثر استقراراً)"
+                if lang == "ar"
+                else "kmeans: color clustering (may drift) | majority_voting: per-player majority (more stable)",
+            )
+            vision_review_enabled = st.checkbox(
+                "تفعيل مراجعة Vision (Gemma)" if lang == "ar" else "Enable Vision Review (Gemma)",
+                value=False,
+                help="يتطلب OpenRouter/Gemma API — أبطأ لكن أكثر دقة للحالات الصعبة"
+                if lang == "ar"
+                else "Requires OpenRouter/Gemma API — slower but more accurate for edge cases",
+            )
+            os.environ["TEAM_ASSIGNMENT_MODE"] = team_assignment_mode
+            os.environ["IDENTITY_VISION_REVIEW_ENABLED"] = "true" if vision_review_enabled else "false"
+
         with st.expander("🗄️ " + ("إعدادات التخزين" if lang == "ar" else "Storage Settings"), expanded=True):
             storage_bucket = st.text_input(
                 "Bucket",

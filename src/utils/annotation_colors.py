@@ -54,18 +54,7 @@ def resolve_player_annotation_color(player: dict[str, Any]) -> tuple[int, int, i
     valid ``team_color``. This prevents corrected non-goalkeepers from falling
     back to the legacy red player color after the GK display is removed.
     """
-    # Prefer display_role, then role, then detected_role, then infer from display_label
-    display_role = str(player.get("display_role") or "")
-    if not display_role or display_role == "None":
-        display_role = str(player.get("role") or player.get("detected_role") or "player")
-    
-    # Infer role from display_label if still unknown
-    display_label = str(player.get("display_label") or "")
-    if display_label.upper() == "GK":
-        display_role = "goalkeeper"
-    elif display_label.upper() == "REF":
-        display_role = "referee"
-    
+    display_role = str(player.get("display_role") or player.get("role") or "player")
     fallback = GOALKEEPER_COLOR if display_role == "goalkeeper" else PLAYER_FALLBACK_COLOR
     color = player.get("display_color")
     if color is None:

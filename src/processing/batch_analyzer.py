@@ -43,8 +43,6 @@ from src.identity.safe_apply import (
 from src.identity.stabilizer import (
     apply_global_identity_stability_plan_to_annotation_states,
     apply_global_identity_stability_plan_to_raw_records,
-    apply_majority_voting_display_defaults,
-    apply_majority_voting_to_annotation_states,
     build_global_identity_stability_plan,
 )
 from src.team_assigner.team_assigner import TeamAssigner
@@ -1248,12 +1246,12 @@ def _reid_candidate_threshold(role_a: str, role_b: str, position_distance: float
 def _auto_reid_threshold(role_a: str, role_b: str) -> float:
     """Return the stricter ReID threshold used for automatic merges."""
     if role_a == "referee" and role_b == "referee":
-        return 0.22
+        return 0.16
     if role_a != role_b:
-        return 0.15
+        return 0.08
     if role_a in {"player", "goalkeeper"}:
-        return 0.20
-    return 0.18
+        return 0.12
+    return 0.10
 
 
 def _identity_candidate(profile_a: Dict[str, Any], profile_b: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1961,19 +1959,18 @@ def run_batch_analysis(
                 )
 
         if team_assigner.kmeans is None:
-            # Build team colors from YOLO team_color across ALL frames (more stable than single frame)
-            all_player_colors: list[np.ndarray] = []
-            for player_track in batch_tracks["players"]:
-                for track in player_track.values():
-                    if track.get("role", "player") == "player":
-                        yolo_color = track.get("team_color")
-                        if yolo_color is not None and len(yolo_color) >= 3:
-                            all_player_colors.append(np.array(yolo_color, dtype=float))
-            if len(all_player_colors) >= 2:
-                try:
-                    team_assigner.assign_team_color_from_colors(all_player_colors)
-                except Exception as exc:
-                    warnings.append(f"Team color assignment failed: {exc}")
+            for frame, player_track in zip(frames, batch_tracks["players"]):
+                field_players = {
+                    player_id: track
+                    for player_id, track in player_track.items()
+                    if track.get("role", "player") == "player"
+                }
+                if len(field_players) >= 2:
+                    try:
+                        team_assigner.assign_team_color(frame, field_players)
+                    except Exception as exc:
+                        warnings.append(f"Team color assignment failed on an early frame: {exc}")
+                    break
 
         for local_idx, (source_frame_idx, frame) in enumerate(entries):
             player_track = batch_tracks["players"][local_idx]
@@ -1998,14 +1995,7 @@ def run_batch_analysis(
                 team = 0
                 if team_assigner.kmeans is not None and role == "player":
                     try:
-                        # Prefer YOLO team_color directly (more stable than bbox color extraction)
-                        yolo_team_color = track.get("team_color")
-                        if yolo_team_color is not None and len(yolo_team_color) >= 3:
-                            team, margin = team_assigner.predict_team_from_color(
-                                np.array(yolo_team_color, dtype=float)
-                            )
-                        else:
-                            team = team_assigner.get_player_team(frame, track["bbox"], player_id)
+                        team = team_assigner.get_player_team(frame, track["bbox"], player_id)
                     except Exception:
                         team = 0
                 track["team"] = int(team)
@@ -2240,18 +2230,6 @@ def run_batch_analysis(
     else:
         identity_stability_applied["kept"] = False
         identity_stability_applied["updated_annotation_track_count"] = 0
-
-    # Always apply majority voting fallback so display fields are never None
-    majority_voting_records = apply_majority_voting_display_defaults(raw_tracklet_records)
-    raw_tracklet_records = majority_voting_records
-    majority_voting_annotation_count = apply_majority_voting_to_annotation_states(
-        annotation_states, raw_tracklet_records
-    )
-    if majority_voting_annotation_count > 0:
-        warnings.append(
-            f"Majority voting fallback applied to {majority_voting_annotation_count} "
-            "annotation state(s) to ensure stable display labels/roles/teams."
-        )
     identity_events = build_identity_events(raw_tracklet_records, render_audit_after)
     vision_review_queue = build_vision_review_queue(
         correction_plan=correction_plan,

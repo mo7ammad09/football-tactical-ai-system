@@ -106,20 +106,6 @@ class TeamAssigner:
         self.team_colors[1] = kmeans.cluster_centers_[0]
         self.team_colors[2] = kmeans.cluster_centers_[1]
 
-    def assign_team_color_from_colors(self, player_colors: list[np.ndarray]) -> None:
-        """Assign team colors by clustering pre-extracted player colors.
-
-        This is more stable than extracting colors from bbox on a single frame,
-        as it uses YOLO team_color across all frames.
-        """
-        kmeans = KMeans(n_clusters=2, init="k-means++", n_init=10, random_state=42)
-        kmeans.fit(player_colors)
-
-        self.kmeans = kmeans
-
-        self.team_colors[1] = kmeans.cluster_centers_[0]
-        self.team_colors[2] = kmeans.cluster_centers_[1]
-
     def predict_team_from_color(self, player_color: np.ndarray) -> tuple[int, float]:
         """Predict team and confidence margin from jersey color."""
         centers = np.asarray(self.kmeans.cluster_centers_, dtype=float)

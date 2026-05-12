@@ -11,7 +11,7 @@ from collections import Counter, defaultdict
 from copy import deepcopy
 from typing import Any, Iterable
 
-from src.utils.annotation_colors import GOALKEEPER_COLOR, PLAYER_FALLBACK_COLOR, is_goalkeeper_color, normalize_color
+from src.utils.annotation_colors import PLAYER_FALLBACK_COLOR, is_goalkeeper_color, normalize_color
 
 
 PERSON_OBJECT_TYPES = {"player", "referee", "goalkeeper"}
@@ -20,14 +20,14 @@ REVIEW_STATUS = "needs_review"
 APPLIED_STATUS = "applied"
 NOOP_STATUS = "no_ready_actions"
 REJECTED_STATUS = "rejected"
-MIN_PLAYER_ROLE_CONFIDENCE = 0.55
-MIN_PLAYER_TEAM_CONFIDENCE = 0.60
-MIN_STRONG_PLAYER_TEAM_CONFIDENCE = 0.75
-MAX_MINOR_ROLE_SEGMENT_FRAMES = 30
-MAX_MINOR_TEAM_SEGMENT_FRAMES = 60
-MAX_MINOR_TEAM_SEGMENT_RATIO = 0.25
-MAX_STRONG_MINOR_TEAM_SEGMENT_FRAMES = 60
-MAX_STRONG_MINOR_TEAM_SEGMENT_RATIO = 0.12
+MIN_PLAYER_ROLE_CONFIDENCE = 0.80
+MIN_PLAYER_TEAM_CONFIDENCE = 0.85
+MIN_STRONG_PLAYER_TEAM_CONFIDENCE = 0.94
+MAX_MINOR_ROLE_SEGMENT_FRAMES = 2
+MAX_MINOR_TEAM_SEGMENT_FRAMES = 12
+MAX_MINOR_TEAM_SEGMENT_RATIO = 0.08
+MAX_STRONG_MINOR_TEAM_SEGMENT_FRAMES = 30
+MAX_STRONG_MINOR_TEAM_SEGMENT_RATIO = 0.06
 RAW_FRAGMENT_COUNT_REVIEW_THRESHOLD = 8
 RAW_FRAGMENT_TRANSITION_REVIEW_THRESHOLD = 16
 VALID_ACTION_TYPES = {
@@ -820,174 +820,6 @@ def apply_global_identity_stability_plan_to_raw_records(
         "applied_actions": applied_actions,
         "validation": validation,
     }
-
-
-def apply_majority_voting_display_defaults(
-    raw_tracklet_rows: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Fill display_role, display_label, and display_team via majority voting.
-
-    This runs as a fallback when the stabilizer validator rejects actions.
-    It guarantees every track has a display decision so the renderer never
-    falls back to raw flickering tracker values.
-    """
-    from copy import deepcopy
-
-    rows = deepcopy(raw_tracklet_rows)
-    profiles = _track_profiles(rows)
-
-    for track_id, profile in profiles.items():
-        frames_seen = _as_int(profile.get("frames_seen"), 0)
-        if frames_seen < 3:
-            continue
-
-        # Role majority vote
-        raw_role_counts = profile.get("raw_role_counts") or {}
-        role_counter = Counter({str(k): int(v) for k, v in raw_role_counts.items()})
-        dominant_role, role_confidence, _, _ = _dominant(role_counter, "unknown")
-
-        # Team majority vote (only count player frames with valid teams)
-        player_team_counts = profile.get("player_team_counts") or {}
-        team_counter = Counter({int(k): int(v) for k, v in player_team_counts.items() if int(k) in {1, 2}})
-        dominant_team, team_confidence, _, _ = _dominant(team_counter, 0)
-
-        # Display label: use track_id unless already set
-        display_label = str(track_id)
-        # If dominant role is goalkeeper, label as GK
-        if str(dominant_role) == "goalkeeper" and role_confidence >= 0.30:
-            display_label = "GK"
-
-        for row in rows:
-            if _source_track_id(row) != track_id:
-                continue
-            if str(row.get("object_type", "")) not in PERSON_OBJECT_TYPES:
-                continue
-
-            # Only fill if missing or unstable
-            current_display_role = str(row.get("display_role") or "")
-            current_display_label = str(row.get("display_label") or "")
-            current_display_team = _as_int(row.get("display_team"), -1)
-
-            # Fill display_role if missing
-            if not current_display_role or current_display_role == "unknown":
-                if str(dominant_role) in PERSON_OBJECT_TYPES and role_confidence >= 0.50:
-                    row["display_role"] = str(dominant_role)
-                    row["model_confirmed_role"] = str(dominant_role)
-                    row["model_confirmed_role_source"] = "majority_voting_fallback"
-
-            # Fill display_label if missing or equals raw track_id
-            if not current_display_label or current_display_label == str(track_id):
-                row["display_label"] = display_label
-
-            # Fill display_team if missing and we have a confident team decision
-            if current_display_team not in {1, 2}:
-                if int(dominant_team) in {1, 2} and team_confidence >= 0.70:
-                    row["display_team"] = int(dominant_team)
-                    row["model_confirmed_team"] = int(dominant_team)
-                    row["model_confirmed_team_source"] = "majority_voting_fallback"
-                    # Set color from canonical color if available
-                    canonical_color = profile.get("canonical_display_color")
-                    if canonical_color and not is_goalkeeper_color(canonical_color):
-                        row["display_color"] = list(canonical_color)
-                elif int(dominant_team) in {1, 2} and team_confidence >= 0.55:
-                    # Weak confidence — fill but flag as uncertain
-                    row["display_team"] = int(dominant_team)
-                    row["model_confirmed_team"] = int(dominant_team)
-                    row["model_confirmed_team_source"] = "majority_voting_fallback_weak"
-                    row["display_team_uncertain"] = True
-                    canonical_color = profile.get("canonical_display_color")
-                    if canonical_color and not is_goalkeeper_color(canonical_color):
-                        row["display_color"] = list(canonical_color)
-
-            # Ensure goalkeeper gets GK color
-            if str(row.get("display_role")) == "goalkeeper":
-                row["display_color"] = list(GOALKEEPER_COLOR)
-                row["display_team"] = 0
-                row["display_label"] = "GK"
-
-            # Ensure referee gets neutral color
-            if str(row.get("display_role")) == "referee":
-                row["display_color"] = None
-                row["display_team"] = 0
-
-    return rows
-
-
-def apply_majority_voting_to_annotation_states(
-    annotation_states: list[dict[str, Any]],
-    raw_tracklet_rows: list[dict[str, Any]],
-) -> int:
-    """Apply majority-voting display defaults to annotation states."""
-    profiles = _track_profiles(raw_tracklet_rows)
-    updated = 0
-
-    for track_id, profile in profiles.items():
-        frames_seen = _as_int(profile.get("frames_seen"), 0)
-        if frames_seen < 3:
-            continue
-
-        raw_role_counts = profile.get("raw_role_counts") or {}
-        role_counter = Counter({str(k): int(v) for k, v in raw_role_counts.items()})
-        dominant_role, role_confidence, _, _ = _dominant(role_counter, "unknown")
-
-        player_team_counts = profile.get("player_team_counts") or {}
-        team_counter = Counter({int(k): int(v) for k, v in player_team_counts.items() if int(k) in {1, 2}})
-        dominant_team, team_confidence, _, _ = _dominant(team_counter, 0)
-
-        display_label = str(track_id)
-        if str(dominant_role) == "goalkeeper" and role_confidence >= 0.30:
-            display_label = "GK"
-
-        for state in annotation_states:
-            for bucket_name in ("players", "referees"):
-                track = (state.get(bucket_name) or {}).get(track_id)
-                if track is None:
-                    continue
-
-                current_display_role = str(track.get("display_role") or "")
-                current_display_label = str(track.get("display_label") or "")
-                current_display_team = _as_int(track.get("display_team"), -1)
-
-                if not current_display_role or current_display_role == "unknown":
-                    if str(dominant_role) in PERSON_OBJECT_TYPES and role_confidence >= 0.50:
-                        track["display_role"] = str(dominant_role)
-                        track["model_confirmed_role"] = str(dominant_role)
-                        track["model_confirmed_role_source"] = "majority_voting_fallback"
-                        updated += 1
-
-                if not current_display_label or current_display_label == str(track_id):
-                    track["display_label"] = display_label
-                    updated += 1
-
-                if current_display_team not in {1, 2}:
-                    if int(dominant_team) in {1, 2} and team_confidence >= 0.70:
-                        track["display_team"] = int(dominant_team)
-                        track["model_confirmed_team"] = int(dominant_team)
-                        track["model_confirmed_team_source"] = "majority_voting_fallback"
-                        canonical_color = profile.get("canonical_display_color")
-                        if canonical_color and not is_goalkeeper_color(canonical_color):
-                            track["display_color"] = tuple(canonical_color)
-                        updated += 1
-                    elif int(dominant_team) in {1, 2} and team_confidence >= 0.55:
-                        track["display_team"] = int(dominant_team)
-                        track["model_confirmed_team"] = int(dominant_team)
-                        track["model_confirmed_team_source"] = "majority_voting_fallback_weak"
-                        track["display_team_uncertain"] = True
-                        canonical_color = profile.get("canonical_display_color")
-                        if canonical_color and not is_goalkeeper_color(canonical_color):
-                            track["display_color"] = tuple(canonical_color)
-                        updated += 1
-
-                if str(track.get("display_role")) == "goalkeeper":
-                    track["display_color"] = tuple(GOALKEEPER_COLOR)
-                    track["display_team"] = 0
-                    track["display_label"] = "GK"
-
-                if str(track.get("display_role")) == "referee":
-                    track["display_color"] = None
-                    track["display_team"] = 0
-
-    return updated
 
 
 def apply_global_identity_stability_plan_to_annotation_states(

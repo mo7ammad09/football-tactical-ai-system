@@ -4,7 +4,7 @@
 video:
   input_path: "input_videos/"
   output_path: "output_videos/"
-  input_file: "input_videos/test.mp4"
+  input_file: "input_videos/test_match.mp4"
   output_file: "output_videos/output_video.avi"
   target_resolution: [1920, 1080]
   fps: 30
@@ -15,7 +15,7 @@ video:
 
 # Object Detection
 detection:
-  model_path: "models/yolov8m.pt"
+  model_path: "models/al_rayyan_yolo11_v2_best.pt"
   confidence_threshold: 0.5
   iou_threshold: 0.45
   classes:
@@ -33,10 +33,32 @@ tracking:
 
 # Team Assignment
 team:
+  # Switchable: "kmeans" | "yolo_color" | "majority_voting"
+  # kmeans: Uses KMeans clustering on jersey colors (legacy, can drift)
+  # yolo_color: Uses YOLO detected team colors directly (more stable)
+  # majority_voting: Uses statistical majority per track (recommended)
+  assignment_mode: "majority_voting"
   cluster_method: "kmeans"
   n_clusters: 2
   jersey_crop_ratio: [0.3, 0.6, 0.2, 0.5]  # [y_start, y_end, x_start, x_end]
   color_space: "hsv"
+
+# Identity & Player Tracking
+identity:
+  # Maximum players per team (11 field + 1 goalkeeper)
+  max_players_per_team: 12
+  # Track buffer: how many frames tracker keeps lost tracks alive
+  tracker_buffer_frames: 120
+  # ReID auto-merge threshold (lower = more merges, higher = safer)
+  auto_reid_threshold: 0.20
+  # Minimum confidence to lock team assignment
+  min_team_lock_confidence: 0.70
+  # Minimum confidence to lock role assignment
+  min_role_lock_confidence: 0.55
+  # Enable/disable vision review (Gemma/OpenRouter)
+  vision_review_enabled: false
+  # Vision provider: "openrouter" | "gemini" | "none"
+  vision_provider: "none"
 
 # Field Transformation
 field:

@@ -1,0 +1,15 @@
+[theme]
+primaryColor = "#1a5f2a"
+backgroundColor = "#0e1117"
+secondaryBackgroundColor = "#1e1e1e"
+textColor = "#fafafa"
+font = "sans serif"
+
+[server]
+maxUploadSize = 2000
+maxMessageSize = 2000
+enableCORS = true
+enableXsrfProtection = true
+
+[runner]
+fastReruns = true

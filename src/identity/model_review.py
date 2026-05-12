@@ -438,20 +438,6 @@ def _provider_failure_reason(
     )
 
 
-def _retry_delay_seconds(exc: Exception, *, fallback_delay: float, attempt: int) -> float:
-    """Return provider retry delay, honoring Retry-After when present."""
-    response = getattr(exc, "response", None)
-    retry_after = None
-    if response is not None:
-        retry_after = getattr(response, "headers", {}).get("Retry-After")
-    if retry_after:
-        try:
-            return max(0.0, float(retry_after))
-        except (TypeError, ValueError):
-            pass
-    return max(0.0, float(fallback_delay) * float(attempt))
-
-
 def _unresolved_provider_output(
     *,
     case_id: str,
@@ -539,7 +525,7 @@ def _invoke_google_gemma_case(
         except Exception as exc:  # noqa: BLE001 - provider failures must fail closed.
             last_exc = exc
             if attempt < max_attempts:
-                time.sleep(_retry_delay_seconds(exc, fallback_delay=retry_delay, attempt=attempt))
+                time.sleep(max(0.0, retry_delay * attempt))
 
     reason = (
         _provider_failure_reason(
@@ -603,7 +589,7 @@ def _invoke_openrouter_case(
         headers["X-Title"] = title
 
     max_attempts = max(1, int(max_attempts))
-    retry_delay = float(os.environ.get("IDENTITY_REVIEW_PROVIDER_RETRY_BACKOFF", "3.0"))
+    retry_delay = float(os.environ.get("IDENTITY_REVIEW_PROVIDER_RETRY_BACKOFF", "1.5"))
     last_exc: Exception | None = None
     url = os.environ.get("OPENROUTER_CHAT_COMPLETIONS_URL", OPENROUTER_CHAT_COMPLETIONS_URL)
     for attempt in range(1, max_attempts + 1):
@@ -627,7 +613,7 @@ def _invoke_openrouter_case(
         except Exception as exc:  # noqa: BLE001 - provider failures must fail closed.
             last_exc = exc
             if attempt < max_attempts:
-                time.sleep(_retry_delay_seconds(exc, fallback_delay=retry_delay, attempt=attempt))
+                time.sleep(max(0.0, retry_delay * attempt))
 
     reason = (
         _provider_failure_reason(
@@ -741,23 +727,18 @@ def invoke_identity_review_provider(
         }
 
     timeout_seconds = float(os.environ.get("IDENTITY_REVIEW_PROVIDER_TIMEOUT", "45"))
-    max_attempts = int(os.environ.get("IDENTITY_REVIEW_PROVIDER_RETRIES", "4"))
-    default_case_delay = "3.0" if uses_openrouter else "0.0"
-    case_delay = float(os.environ.get("IDENTITY_REVIEW_PROVIDER_CASE_DELAY", default_case_delay))
+    max_attempts = int(os.environ.get("IDENTITY_REVIEW_PROVIDER_RETRIES", "2"))
     invoke_case = _invoke_openrouter_case if uses_openrouter else _invoke_google_gemma_case
-    outputs = []
-    for index, case in enumerate(cases):
-        outputs.append(
-            invoke_case(
-                case=case,
-                api_key=api_key,
-                model=model_name,
-                timeout_seconds=timeout_seconds,
-                max_attempts=max_attempts,
-            )
+    outputs = [
+        invoke_case(
+            case=case,
+            api_key=api_key,
+            model=model_name,
+            timeout_seconds=timeout_seconds,
+            max_attempts=max_attempts,
         )
-        if index < len(cases) - 1 and case_delay > 0:
-            time.sleep(case_delay)
+        for case in cases
+    ]
     return {
         "status": "invoked",
         "model_outputs": outputs,

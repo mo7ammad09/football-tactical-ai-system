@@ -40,8 +40,6 @@ VISION_REVIEW_STATUSES = {
     "missing_model_output",
     "invalid_model_output",
 }
-MIN_TRUSTED_GK_RAW_TRACK_FRAMES = 5
-MIN_TRUSTED_GK_RAW_TRACK_CONFIDENCE = 0.65
 
 
 def _as_int(value: Any, fallback: int = 0) -> int:
@@ -497,28 +495,6 @@ def _goalkeeper_display_segments(rows: list[dict[str, Any]]) -> list[dict[str, A
     )
 
 
-def _trusted_goalkeeper_raw_track_ids(rows: list[dict[str, Any]]) -> set[int]:
-    """Return raw tracker IDs whose global role evidence is goalkeeper-dominant."""
-    role_counts_by_raw_id: dict[int, Counter] = defaultdict(Counter)
-    for row in _iter_person_rows(rows):
-        raw_track_id = _raw_track_id(row)
-        if raw_track_id is None:
-            continue
-        role_counts_by_raw_id[int(raw_track_id)][_raw_role(row)] += 1
-
-    trusted: set[int] = set()
-    for raw_track_id, role_counts in role_counts_by_raw_id.items():
-        dominant_role, confidence = _dominant(role_counts, "unknown")
-        goalkeeper_frames = _as_int(role_counts.get(GOALKEEPER_ROLE), 0)
-        if (
-            dominant_role == GOALKEEPER_ROLE
-            and goalkeeper_frames >= MIN_TRUSTED_GK_RAW_TRACK_FRAMES
-            and confidence >= MIN_TRUSTED_GK_RAW_TRACK_CONFIDENCE
-        ):
-            trusted.add(int(raw_track_id))
-    return trusted
-
-
 def _issue(
     *,
     issue_id: str,
@@ -547,18 +523,14 @@ def _score_issues(issues: list[dict[str, Any]]) -> tuple[int, str]:
         if severity == "critical":
             score -= 35
         elif severity == "high":
-            score -= 10
+            score -= 18
         elif severity == "medium":
-            score -= 5
+            score -= 8
         elif severity == "low":
-            score -= 2
+            score -= 3
     score = max(0, min(100, score))
     if any(issue.get("severity") == "critical" for issue in issues):
         return score, "FAIL"
-    # Allow PASS even with high-severity issues if score is still good
-    # (the stabilizer and majority voting now handle these automatically)
-    if score >= 70:
-        return score, "PASS"
     if any(issue.get("severity") == "high" for issue in issues):
         return score, "REVIEW"
     return score, "PASS"
@@ -579,13 +551,9 @@ def build_render_identity_audit(
     person_rows = list(_iter_person_rows(raw_tracklet_rows))
     source_profiles = _build_source_profiles(raw_tracklet_rows)
     gk_segments = _goalkeeper_display_segments(raw_tracklet_rows)
-    trusted_gk_raw_ids = _trusted_goalkeeper_raw_track_ids(raw_tracklet_rows)
     issues: list[dict[str, Any]] = []
 
     for segment in gk_segments:
-        raw_track_id = segment.get("raw_track_id")
-        if raw_track_id is not None and _as_int(raw_track_id, -1) in trusted_gk_raw_ids:
-            continue
         profile = source_profiles.get(int(segment["track_id"]), {})
         dominant_role = str(profile.get("dominant_raw_role", "unknown"))
         raw_role_confidence = _as_float(profile.get("raw_role_confidence"))
@@ -630,19 +598,13 @@ def build_render_identity_audit(
 
     gk_display_rows = [row for row in person_rows if _is_display_goalkeeper(row)]
     gk_source_ids = Counter(_source_track_id(row) for row in gk_display_rows)
-    untrusted_gk_display_rows = [
-        row
-        for row in gk_display_rows
-        if _raw_track_id(row) is None or _raw_track_id(row) not in trusted_gk_raw_ids
-    ]
-    untrusted_gk_source_ids = Counter(_source_track_id(row) for row in untrusted_gk_display_rows)
     player_dominant_gk_source_ids = [
         track_id
-        for track_id in untrusted_gk_source_ids
+        for track_id in gk_source_ids
         if source_profiles.get(track_id, {}).get("dominant_raw_role") not in {GOALKEEPER_ROLE, "unknown"}
         and _as_float(source_profiles.get(track_id, {}).get("raw_role_confidence")) >= 0.65
     ]
-    if len(untrusted_gk_source_ids) > 1 and player_dominant_gk_source_ids:
+    if len(gk_source_ids) > 1 and player_dominant_gk_source_ids:
         issues.append(
             _issue(
                 issue_id="unsafe_gk_display_spread",
@@ -653,11 +615,10 @@ def build_render_identity_audit(
                     "A stable GK label is useful only if it follows the goalkeeper. "
                     "Here it spans underlying tracks that are player/referee dominant."
                 ),
-                source_track_ids=_counter_dict(untrusted_gk_source_ids),
+                source_track_ids=_counter_dict(gk_source_ids),
                 player_dominant_source_track_ids=[
                     int(track_id) for track_id in player_dominant_gk_source_ids
                 ],
-                trusted_goalkeeper_raw_track_ids=[int(raw_id) for raw_id in sorted(trusted_gk_raw_ids)],
             )
         )
 
@@ -764,9 +725,9 @@ def build_render_identity_audit(
             dominant_raw_role == "player"
             and raw_role_confidence >= 0.65
             and display_role_transitions == 0
-            and max_minor_raw_role_segment > 5
+            and max_minor_raw_role_segment > 2
         ):
-            severity = "high" if max_minor_raw_role_segment > 15 else "medium"
+            severity = "high" if max_minor_raw_role_segment > 12 else "medium"
             issues.append(
                 _issue(
                     issue_id=f"hidden_role_switch_after_stabilizer_{track_id}",
@@ -835,14 +796,14 @@ def build_render_identity_audit(
             and len(player_team_count_values) > 1
             and not phase10_team_lock_resolved
             and (
-                player_team_confidence < 0.70
-                or max_minor_player_team_segment > 20
-                or max_minor_player_team_segment_ratio > 0.12
+                player_team_confidence < 0.85
+                or max_minor_player_team_segment > 12
+                or max_minor_player_team_segment_ratio > 0.08
             )
         ):
             severity = (
                 "high"
-                if player_team_confidence < 0.60 or max_minor_player_team_segment > 40
+                if player_team_confidence < 0.75 or max_minor_player_team_segment > 24
                 else "medium"
             )
             issues.append(
@@ -938,9 +899,6 @@ def build_render_identity_audit(
                 issue_counts.get("simultaneous_goalkeeper_display", 0)
             ),
             "unsafe_gk_display_spread_count": int(issue_counts.get("unsafe_gk_display_spread", 0)),
-            "trusted_goalkeeper_raw_track_ids": [
-                int(raw_id) for raw_id in sorted(trusted_gk_raw_ids)
-            ],
             "issue_counts": _counter_dict(issue_counts),
         },
         "issues": issues,

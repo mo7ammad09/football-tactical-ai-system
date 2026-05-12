@@ -1,0 +1,18 @@
+=== RunPod Endpoint Configuration ===
+
+Endpoint Name: football-analysis
+
+Container Image: (نستخدم Replicate image مؤقتاً)
+r8.im/mo7ammad09/football-analysis-v1:latest
+
+أو ننتظر البناء الجديد:
+mo7ammad09/football-analysis-runpod:latest
+
+GPU: RTX 4090 (24GB VRAM)
+Workers: 1
+FlashBoot: Enabled
+
+Advanced Settings:
+- Idle Timeout: 300 (5 دقايق)
+- Max Workers: 2
+- Execution Timeout: 3600 (1 ساعة)
